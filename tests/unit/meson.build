@@ -136,6 +136,7 @@ if have_system
     'test-bufferiszero': [],
     'test-smp-parse': [qom, meson.project_source_root() / 'hw/core/machine-smp.c'],
     'test-vmstate': [migration, io],
+    'test-sf-buffer': [meson.project_source_root() / 'sf/vmstate_replay/buffer.c', migration, io],
     'test-yank': ['socket-helpers.c', qom, io, chardev]
   }
   if config_host_data.get('CONFIG_INOTIFY1')

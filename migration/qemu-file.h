@@ -83,4 +83,8 @@ QIOChannel *qemu_file_get_ioc(QEMUFile *file);
 int qemu_file_put_fd(QEMUFile *f, int fd);
 int qemu_file_get_fd(QEMUFile *f, int *fd);
 
+/* sf (stalefuzz M0-S): input-file read cursor helpers, see qemu-file.c. */
+size_t sf_qemu_file_input_pos(QEMUFile *file);
+size_t sf_qemu_file_input_bufsize(QEMUFile *file);
+
 #endif

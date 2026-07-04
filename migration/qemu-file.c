@@ -907,6 +907,24 @@ QIOChannel *qemu_file_get_ioc(QEMUFile *file)
 }
 
 /*
+ * sf (stalefuzz M0-S): logical read cursor / fill size of an input QEMUFile's
+ * current buffer. Used by the vmstate replay pre-parser to measure how many
+ * bytes each field's info->get() consumed (so it can capture the exact stream
+ * slice for later replay). Valid only while the whole stream fits in one buffer
+ * fill (buf_size == total stream length, no refill); the pre-parser asserts
+ * this. See sf/vmstate_replay/preparse.c.
+ */
+size_t sf_qemu_file_input_pos(QEMUFile *file)
+{
+    return file->buf_index;
+}
+
+size_t sf_qemu_file_input_bufsize(QEMUFile *file)
+{
+    return file->buf_size;
+}
+
+/*
  * Read size bytes from QEMUFile f and write them to fd.
  */
 int qemu_file_get_to_fd(QEMUFile *f, int fd, size_t size)

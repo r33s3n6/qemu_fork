@@ -70,7 +70,8 @@ sf/
 3. clean-room 走流:`sf_record_vmsd`(镜像 `vmstate_load_state`)+ `sf_record_subsections`(镜像 `vmstate_subsection_load`)+ FULL-section 读头循环(`find_se` 用 Task2 迭代器建 `(idstr,inst)->(vmsd,opaque)` 查表)。
 4. 每个字段**先跑 stock `info->get`**(流→内存、端序转好、副作用发生),再按类型登记:标量/buffer→mblock;timer/tmp/…→get;跳过 unused_buffer/nullptr。pre/post_load 走一遍并记表。
 
-**回放顺序**(Task5 `sf_replay`,配方同 Nyx `fdl_fast_reload`):pre_load hooks → memcpy 所有 mblock → 重放所有 get → post_load hooks。
+**回放顺序**(Task5 `sf_replay`):pre_load hooks → memcpy 所有 mblock → **重放所有 get** → post_load hooks。
+> ⚠️ **与 Nyx 的关键差异(修它漏的链)**:Nyx 的 `fdl_fast_reload` 建了 get 表却**从不重放**(只 memcpy + pre/post hooks),等于跳过 timer 重挂。对我们不行——`QEMUTimer` 若被 memcpy 会拷进过期的 timerlist 链接指针;timer 必须走 `timer_get`→`timer_mod_ns` 重新入表。故 sf **一定重放 get**(timer 字段也因此归 get 表、不进 mblock)。
 
 ## 5. 关键设计决策(有争议 / 易踩坑,单独记)
 
@@ -96,7 +97,7 @@ sf/
 | 2 | DP-C1 un-static + handlers 迭代器 | ✅ | `d056288` |
 | 3 | buffer <-> QEMUFile helper(5 单测绿) | ✅ | `116947e` |
 | 4 | 三表预解析(microvm:mblocks=119/gets=10/posts=14) | ✅ | `07c60d2` |
-| 5 | 三表重放 + 对拍 stock load(selftest ⑤) | ⏳ 待做 | — |
+| 5 | 三表重放 + 对拍 stock load(selftest ⑤ GREEN + 负例有辨别力) | ✅ | 见下 |
 | 6 | 脏页引擎 hot/cold + ring-full | ⏳ | — |
 | 7 | restore 正确性 selftest ①–④ | ⏳ | — |
 | 8 | 微型 rig + 单VM 延迟对拍(**门槛判定**) | ⏳ | — |

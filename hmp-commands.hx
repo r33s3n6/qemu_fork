@@ -347,6 +347,30 @@ SRST
 ERST
 
     {
+        .name       = "sf_snapshot",
+        .args_type  = "",
+        .params     = "",
+        .help       = "sf (M0-S spike): create fast snapshot",
+        .cmd        = hmp_sf_snapshot,
+    },
+
+    {
+        .name       = "sf_restore",
+        .args_type  = "",
+        .params     = "",
+        .help       = "sf (M0-S spike): restore to fast snapshot",
+        .cmd        = hmp_sf_restore,
+    },
+
+    {
+        .name       = "sf_selftest",
+        .args_type  = "",
+        .params     = "",
+        .help       = "sf (M0-S spike): run restore-correctness selftest",
+        .cmd        = hmp_sf_selftest,
+    },
+
+    {
         .name       = "loadvm",
         .args_type  = "name:s",
         .params     = "tag",

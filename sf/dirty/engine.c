@@ -146,9 +146,20 @@ int sf_dirty_snapshot(Error **errp)
     return 0;
 }
 
+/* Fault injection (selftest only): a page collect() must pretend it never saw. */
+static void *g_inject_skip_page;
+
+void sf_dirty_inject_collect_skip(void *host_page)
+{
+    g_inject_skip_page = host_page;
+}
+
 static void sf_collect_cb(void *host, size_t page_size, void *user)
 {
     GHashTable *set = user;
+    if (host == g_inject_skip_page) {
+        return; /* injected loss: this dirty page is dropped on the floor */
+    }
     g_hash_table_add(set, host);
 }
 

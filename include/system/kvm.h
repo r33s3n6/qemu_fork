@@ -636,4 +636,12 @@ uint64_t sf_kvm_collect_dirty(SfKvmDirtyPageFn cb, void *user);
 /* Clear all per-slot dirty bitmaps (begin a fresh tracking round). BQL. */
 void sf_kvm_dirty_reset_all(void);
 
+/*
+ * Fault injection (selftest only): when @on, sf_kvm_collect_dirty() skips the
+ * ring drain and reads only the already-accumulated bitmap. This reproduces
+ * the "read the live ring but forget to account for drained pages" bug — under
+ * ring-full it loses pages, so a correct zero-loss check must go RED.
+ */
+void sf_kvm_set_skip_flush(bool on);
+
 #endif

@@ -51,6 +51,14 @@ void sf_dirty_mark_hot(uint64_t page_addr);
 /* Free the shadow + policy/to-restore sets. */
 void sf_dirty_destroy(void);
 
+/*
+ * Fault injection (selftest only): make the next collect() DROP this host page
+ * from the to-restore set, simulating a lost/uncaptured dirty page. Pass NULL
+ * to disable. A correct restore-correctness check must go RED when a page the
+ * guest changed is dropped here.
+ */
+void sf_dirty_inject_collect_skip(void *host_page);
+
 /* True iff a RAM snapshot is currently held. */
 bool sf_dirty_have_snapshot(void);
 

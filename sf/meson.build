@@ -4,4 +4,5 @@ system_ss.add(files(
   'vmstate_replay/preparse.c',
   'vmstate_replay/replay.c',
   'dirty/engine.c',
+  'selftest/selftest.c',
 ))

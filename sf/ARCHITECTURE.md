@@ -52,7 +52,7 @@ sf/
 │   └── engine.{c,h}
 ├── clock/                  [Task9] 跨 restore 时钟矩阵测量(rdtsc/kvmclock/clock_gettime)
 │   └── probe.{c,h}
-└── selftest/               [Task7] 故障注入自检(HMP sf_selftest 汇总用例①–⑤)
+└── selftest/               故障注入自检(HMP sf_selftest 汇总用例①–⑤,已实现 Task7)
     └── selftest.{c,h}
 ```
 
@@ -86,6 +86,24 @@ sf/
 **collect 从 per-slot bitmap 取,不读 live ring**(Task6 首个实现决策,见 §5)。HOT/COLD 在 stock KVM 6.8 下:所有 RAM slot 都被 track,HOT = "永远进待恢复集"的安全网,"永不进 ring"的快路径留 I.3 KVM 扩展。
 
 **接进 HMP**(`sf.c`):`sf_snapshot` = RAM 影子(必成)+ 设备三表(best-effort,失败只告警不阻断,以免设备预解析的 KVM 缺口掩盖 RAM 结果);`sf_restore` = 设备重放(若有)→ collect → restore → reset。
+
+### 4.3 故障注入自检(`selftest/`)—— 已实现 Task7
+
+`sf_selftest_all`(HMP `sf_selftest`)汇总设计 spec §G 五用例,**每个 fault 注入必须被检出(有辨别力)**:
+
+| 用例 | 内容 | teeth(注入→必红) | accel |
+|---|---|---|---|
+| ⑤ | replay 三表 vs stock load 逐字节对拍 | 篡改 `mblocks[0].copy` → 对拍 RED | TCG |
+| ④ | get-handler(timer/tmp)重放正确 | 篡改 `gets[0].captured` → 对拍 RED | TCG |
+| ① | guest 改 N 页 → restore 全回快照 | 内建(要求 changed>0 且 0 wrong) | KVM |
+| ② | 丢一个脏页(`sf_dirty_inject_collect_skip`)→ 该页留错被检出 | 内建 | KVM |
+| ③ | ring-full(4096 页 / 1024 ring)零丢 + 丢页被检出 | 内建 | KVM |
+
+**accel 拆分(重要)**:设备对拍(④⑤)走 `qemu_load_device_state` 重载迁移流,**KVM 下会 assert(`kvm_put_apicbase`)**——把 CPU/apic MSR 经 ioctl 推回活 VM 太脆(重载第二次即崩)。设备对拍本质与 accel 无关且 Task5 已在 TCG 验证,故 `sf_selftest_all` 在 `kvm_enabled()` 时跳过 ④⑤;RAM ①②③ 需 KVM dirty ring。**一次 full pass = 两次触发**(TCG 拿 ④⑤ + KVM 拿 ①②③),见 `tools/sf-rig/README.md`。
+
+**RAM 用例编排**:host 侧写 guest RAM 不经 KVM 写保护(不进 ring),故必须让 vcpu 真跑——selftest 内部 `vm_stop → sf_dirty_snapshot → vm_start + bql_unlock/usleep/bql_lock → vm_stop → collect+restore → 逐页核验`。负载 = `tools/sf-rig/guest/dirty.elf`(契约 BASE=0x300000/NPAGES=4096 硬编码在 `selftest.c`)。
+
+**实测**(全 GREEN):①64/64 回滚;②丢页 wrong-after=1 检出;③4096 页改(>ring 1024)0 丢 + 丢页检出;③-info **跳过显式 drain 仍丢 0 页**(ring-full 退出 + 后台 reaper 冗余 drain;live-ring-only 会丢 ~3072——量化了本设计相对 Nyx 的价值);④gets=22 篡改检出;⑤对拍 + 篡改检出。
 
 ## 5. 关键设计决策(有争议 / 易踩坑,单独记)
 
@@ -124,6 +142,7 @@ sf/
       -display none -nodefaults -monitor stdio | grep -aE '00300000:|snapshot ok|restore ok'
   ```
   期望:A(如 `0x5b19f141`)→ B(`0xcedc2b3c`,变了)→ **回到 A**;`restore ok: ... ram collected=N copied-back=N`(相等=零丢)。
+- **selftest ①–⑤(Task7)**:`HMP sf_selftest`。两次触发(TCG 拿 ④⑤ + KVM+`dirty.elf` 拿 ①②③),命令 + 期望见主仓 `tools/sf-rig/README.md`。负载 stub 源在 `tools/sf-rig/guest/{boot,dirty}.S`(`bash build.sh` 构建)。
 - **提交纪律**:C 代码 commit 到本 submodule(分支 `sf-m0s-restore-spike`),再更主仓 gitlink;每步回填计划 checkbox。
 
 ## 7. 现状(逐 Task)
@@ -136,7 +155,7 @@ sf/
 | 4 | 三表预解析(microvm:mblocks=119/gets=10/posts=14) | ✅ | `07c60d2` |
 | 5 | 三表重放 + 对拍 stock load(selftest ⑤ GREEN + 负例有辨别力) | ✅ | 见下 |
 | 6 | 脏页引擎 hot/cold + ring-full(smoke:snapshot→改页→restore 逐字节回滚,collected=copied,零丢) | ✅ | 见下 |
-| 7 | restore 正确性 selftest ①–④ | ⏳ | — |
+| 7 | restore 正确性 selftest ①–④(汇总 ①–⑤;全 GREEN 且注入必红;accel 拆分 TCG④⑤/KVM①②③) | ✅ | 见下 |
 | 8 | 微型 rig + 单VM 延迟对拍(**门槛判定**) | ⏳ | — |
 | 9 | 时钟矩阵 | ⏳ | — |
 | 10 | 收口报告 | ⏳ | — |

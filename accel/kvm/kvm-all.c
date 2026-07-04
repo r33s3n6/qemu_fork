@@ -1160,6 +1160,13 @@ bool sf_kvm_dirty_ring_enabled(void)
     return kvm_state && kvm_state->kvm_dirty_ring_size != 0;
 }
 
+static bool sf_kvm_skip_flush; /* selftest fault injection */
+
+void sf_kvm_set_skip_flush(bool on)
+{
+    sf_kvm_skip_flush = on;
+}
+
 uint64_t sf_kvm_collect_dirty(SfKvmDirtyPageFn cb, void *user)
 {
     KVMState *s = kvm_state;
@@ -1176,7 +1183,9 @@ uint64_t sf_kvm_collect_dirty(SfKvmDirtyPageFn cb, void *user)
      * reprotect the collected pages. After this, cur-dirty pages live in the
      * accumulated KVMSlot.dirty_bmap (nobody clears it until we do).
      */
-    kvm_dirty_ring_flush();
+    if (!sf_kvm_skip_flush) {
+        kvm_dirty_ring_flush();
+    }
 
     kvm_slots_lock();
     for (as_id = 0; as_id < s->nr_as; as_id++) {

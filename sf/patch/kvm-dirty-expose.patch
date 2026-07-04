@@ -1,0 +1,136 @@
+diff --git a/accel/kvm/kvm-all.c b/accel/kvm/kvm-all.c
+index 92af42503b..3619390542 100644
+--- a/accel/kvm/kvm-all.c
++++ b/accel/kvm/kvm-all.c
+@@ -1149,6 +1149,93 @@ static void kvm_dirty_ring_flush(void)
+     trace_kvm_dirty_ring_flush(1);
+ }
+ 
++/* ---- sf/ (M0-S dirty-page engine, Task 6) ------------------------------ *
++ * Hooks for the stalefuzz restore engine (sf/dirty/engine.c). Declared in
++ * include/system/kvm.h. Kept here because they need the static reap machinery
++ * and the KVMSlot layout. Clean-room: no Nyx code.
++ */
++
++bool sf_kvm_dirty_ring_enabled(void)
++{
++    return kvm_state && kvm_state->kvm_dirty_ring_size != 0;
++}
++
++uint64_t sf_kvm_collect_dirty(SfKvmDirtyPageFn cb, void *user)
++{
++    KVMState *s = kvm_state;
++    size_t psize = qemu_real_host_page_size();
++    uint64_t visited = 0;
++    int as_id;
++
++    if (!s || !s->kvm_dirty_ring_size) {
++        return 0;
++    }
++
++    /*
++     * Flush hardware buffers + drain every ring into the per-slot bitmaps and
++     * reprotect the collected pages. After this, cur-dirty pages live in the
++     * accumulated KVMSlot.dirty_bmap (nobody clears it until we do).
++     */
++    kvm_dirty_ring_flush();
++
++    kvm_slots_lock();
++    for (as_id = 0; as_id < s->nr_as; as_id++) {
++        KVMMemoryListener *kml = s->as[as_id].ml;
++        unsigned int i;
++
++        if (!kml) {
++            continue;
++        }
++        for (i = 0; i < kml->nr_slots_allocated; i++) {
++            KVMSlot *mem = &kml->slots[i];
++            unsigned long nbits, bit;
++
++            if (!mem->memory_size || !mem->dirty_bmap) {
++                continue;
++            }
++            nbits = mem->memory_size / psize;
++            for (bit = find_first_bit(mem->dirty_bmap, nbits);
++                 bit < nbits;
++                 bit = find_next_bit(mem->dirty_bmap, nbits, bit + 1)) {
++                if (cb) {
++                    cb((uint8_t *)mem->ram + bit * psize, psize, user);
++                }
++                visited++;
++            }
++        }
++    }
++    kvm_slots_unlock();
++
++    return visited;
++}
++
++void sf_kvm_dirty_reset_all(void)
++{
++    KVMState *s = kvm_state;
++    int as_id;
++
++    if (!s) {
++        return;
++    }
++    kvm_slots_lock();
++    for (as_id = 0; as_id < s->nr_as; as_id++) {
++        KVMMemoryListener *kml = s->as[as_id].ml;
++        unsigned int i;
++
++        if (!kml) {
++            continue;
++        }
++        for (i = 0; i < kml->nr_slots_allocated; i++) {
++            KVMSlot *mem = &kml->slots[i];
++
++            if (mem->dirty_bmap) {
++                kvm_slot_reset_dirty_pages(mem);
++            }
++        }
++    }
++    kvm_slots_unlock();
++}
++
+ /**
+  * kvm_physical_sync_dirty_bitmap - Sync dirty bitmap from kernel space
+  *
+diff --git a/include/system/kvm.h b/include/system/kvm.h
+index 5fa33eddda..c7c529ef63 100644
+--- a/include/system/kvm.h
++++ b/include/system/kvm.h
+@@ -607,4 +607,33 @@ void kvm_vcpufd_add_change_notifier(NotifierWithReturn *n);
+  */
+ void kvm_vcpufd_remove_change_notifier(NotifierWithReturn *n);
+ 
++/*
++ * sf/ (M0-S dirty-page engine, Task 6) — minimal hooks for the stalefuzz
++ * restore engine to collect KVM-dirtied guest pages. Implemented in
++ * accel/kvm/kvm-all.c (needs the static reap machinery + KVMSlot layout).
++ * Clean-room: no Nyx code; the engine that consumes these lives in sf/dirty/.
++ */
++
++/* Callback given each currently-dirty guest page's host address. */
++typedef void (*SfKvmDirtyPageFn)(void *host, size_t page_size, void *user);
++
++/* True iff the KVM dirty-log ring is configured (-accel kvm,dirty-ring-size). */
++bool sf_kvm_dirty_ring_enabled(void);
++
++/*
++ * Drain every vCPU dirty ring into the per-slot dirty bitmaps (stock reap +
++ * KVM_RESET_DIRTY_RINGS reprotect), then walk all per-slot bitmaps and hand
++ * each dirty guest page's host address to @cb. Draining first means pages
++ * already reaped by the background reaper or by a KVM_EXIT_DIRTY_RING_FULL
++ * exit are still visited — they live in the accumulated per-slot bitmap.
++ * This is the "ring-full is first-class, zero page loss" invariant: read the
++ * authoritative bitmap, not the live ring. Returns pages visited. Must hold
++ * BQL. Does NOT clear bitmaps — call sf_kvm_dirty_reset_all() to start a
++ * fresh tracking round.
++ */
++uint64_t sf_kvm_collect_dirty(SfKvmDirtyPageFn cb, void *user);
++
++/* Clear all per-slot dirty bitmaps (begin a fresh tracking round). BQL. */
++void sf_kvm_dirty_reset_all(void);
++
+ #endif

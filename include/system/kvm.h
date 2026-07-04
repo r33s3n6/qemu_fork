@@ -607,4 +607,33 @@ void kvm_vcpufd_add_change_notifier(NotifierWithReturn *n);
  */
 void kvm_vcpufd_remove_change_notifier(NotifierWithReturn *n);
 
+/*
+ * sf/ (M0-S dirty-page engine, Task 6) — minimal hooks for the stalefuzz
+ * restore engine to collect KVM-dirtied guest pages. Implemented in
+ * accel/kvm/kvm-all.c (needs the static reap machinery + KVMSlot layout).
+ * Clean-room: no Nyx code; the engine that consumes these lives in sf/dirty/.
+ */
+
+/* Callback given each currently-dirty guest page's host address. */
+typedef void (*SfKvmDirtyPageFn)(void *host, size_t page_size, void *user);
+
+/* True iff the KVM dirty-log ring is configured (-accel kvm,dirty-ring-size). */
+bool sf_kvm_dirty_ring_enabled(void);
+
+/*
+ * Drain every vCPU dirty ring into the per-slot dirty bitmaps (stock reap +
+ * KVM_RESET_DIRTY_RINGS reprotect), then walk all per-slot bitmaps and hand
+ * each dirty guest page's host address to @cb. Draining first means pages
+ * already reaped by the background reaper or by a KVM_EXIT_DIRTY_RING_FULL
+ * exit are still visited — they live in the accumulated per-slot bitmap.
+ * This is the "ring-full is first-class, zero page loss" invariant: read the
+ * authoritative bitmap, not the live ring. Returns pages visited. Must hold
+ * BQL. Does NOT clear bitmaps — call sf_kvm_dirty_reset_all() to start a
+ * fresh tracking round.
+ */
+uint64_t sf_kvm_collect_dirty(SfKvmDirtyPageFn cb, void *user);
+
+/* Clear all per-slot dirty bitmaps (begin a fresh tracking round). BQL. */
+void sf_kvm_dirty_reset_all(void);
+
 #endif

@@ -1149,6 +1149,93 @@ static void kvm_dirty_ring_flush(void)
     trace_kvm_dirty_ring_flush(1);
 }
 
+/* ---- sf/ (M0-S dirty-page engine, Task 6) ------------------------------ *
+ * Hooks for the stalefuzz restore engine (sf/dirty/engine.c). Declared in
+ * include/system/kvm.h. Kept here because they need the static reap machinery
+ * and the KVMSlot layout. Clean-room: no Nyx code.
+ */
+
+bool sf_kvm_dirty_ring_enabled(void)
+{
+    return kvm_state && kvm_state->kvm_dirty_ring_size != 0;
+}
+
+uint64_t sf_kvm_collect_dirty(SfKvmDirtyPageFn cb, void *user)
+{
+    KVMState *s = kvm_state;
+    size_t psize = qemu_real_host_page_size();
+    uint64_t visited = 0;
+    int as_id;
+
+    if (!s || !s->kvm_dirty_ring_size) {
+        return 0;
+    }
+
+    /*
+     * Flush hardware buffers + drain every ring into the per-slot bitmaps and
+     * reprotect the collected pages. After this, cur-dirty pages live in the
+     * accumulated KVMSlot.dirty_bmap (nobody clears it until we do).
+     */
+    kvm_dirty_ring_flush();
+
+    kvm_slots_lock();
+    for (as_id = 0; as_id < s->nr_as; as_id++) {
+        KVMMemoryListener *kml = s->as[as_id].ml;
+        unsigned int i;
+
+        if (!kml) {
+            continue;
+        }
+        for (i = 0; i < kml->nr_slots_allocated; i++) {
+            KVMSlot *mem = &kml->slots[i];
+            unsigned long nbits, bit;
+
+            if (!mem->memory_size || !mem->dirty_bmap) {
+                continue;
+            }
+            nbits = mem->memory_size / psize;
+            for (bit = find_first_bit(mem->dirty_bmap, nbits);
+                 bit < nbits;
+                 bit = find_next_bit(mem->dirty_bmap, nbits, bit + 1)) {
+                if (cb) {
+                    cb((uint8_t *)mem->ram + bit * psize, psize, user);
+                }
+                visited++;
+            }
+        }
+    }
+    kvm_slots_unlock();
+
+    return visited;
+}
+
+void sf_kvm_dirty_reset_all(void)
+{
+    KVMState *s = kvm_state;
+    int as_id;
+
+    if (!s) {
+        return;
+    }
+    kvm_slots_lock();
+    for (as_id = 0; as_id < s->nr_as; as_id++) {
+        KVMMemoryListener *kml = s->as[as_id].ml;
+        unsigned int i;
+
+        if (!kml) {
+            continue;
+        }
+        for (i = 0; i < kml->nr_slots_allocated; i++) {
+            KVMSlot *mem = &kml->slots[i];
+
+            if (mem->dirty_bmap) {
+                kvm_slot_reset_dirty_pages(mem);
+            }
+        }
+    }
+    kvm_slots_unlock();
+}
+
 /**
  * kvm_physical_sync_dirty_bitmap - Sync dirty bitmap from kernel space
  *

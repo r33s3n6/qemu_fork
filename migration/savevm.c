@@ -271,6 +271,21 @@ static SaveState savevm_state = {
 
 static SaveStateEntry *find_se(const char *idstr, uint32_t instance_id);
 
+/*
+ * sf/ (M0-S spike, DP-C1) — iterate registered save-state sections, handing the
+ * pre-parse replay engine each section's VMSD + opaque without leaking the
+ * SaveStateEntry layout. Sections with vmsd==NULL (ops-based, e.g. "ram") are
+ * still visited; the caller decides what to skip.
+ */
+void sf_savevm_for_each_vmsd(SfVmsdVisitor visit, void *user)
+{
+    SaveStateEntry *se;
+
+    QTAILQ_FOREACH(se, &savevm_state.handlers, entry) {
+        visit(se->idstr, se->instance_id, se->vmsd, se->opaque, user);
+    }
+}
+
 static bool should_validate_capability(int capability)
 {
     assert(capability >= 0 && capability < MIGRATION_CAPABILITY__MAX);

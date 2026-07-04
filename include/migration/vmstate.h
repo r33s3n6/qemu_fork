@@ -1313,4 +1313,18 @@ void vmstate_register_ram_global(struct MemoryRegion *memory);
 
 bool vmstate_check_only_migratable(const VMStateDescription *vmsd);
 
+/*
+ * sf/ (M0-S spike, DP-C1) — expose vmstate internals for the pre-parse replay
+ * engine. See research/plans/2026-07-04-02-m0s-restore-spike-design.md.
+ * un-static'd from migration/vmstate.c; iterator implemented in migration/savevm.c.
+ */
+int vmstate_n_elems(void *opaque, const VMStateField *field);
+int vmstate_size(void *opaque, const VMStateField *field);
+void vmstate_handle_alloc(void *ptr, const VMStateField *field, void *opaque);
+
+typedef void (*SfVmsdVisitor)(const char *idstr, uint32_t instance_id,
+                              const VMStateDescription *vmsd, void *opaque,
+                              void *user);
+void sf_savevm_for_each_vmsd(SfVmsdVisitor visit, void *user);
+
 #endif

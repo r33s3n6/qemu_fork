@@ -81,7 +81,7 @@ vmsd_create_fake_nullptr_field(const VMStateField *field)
     return (const VMStateField *)fake;
 }
 
-static int vmstate_n_elems(void *opaque, const VMStateField *field)
+int vmstate_n_elems(void *opaque, const VMStateField *field)
 {
     int n_elems = 1;
 
@@ -105,7 +105,7 @@ static int vmstate_n_elems(void *opaque, const VMStateField *field)
     return n_elems;
 }
 
-static int vmstate_size(void *opaque, const VMStateField *field)
+int vmstate_size(void *opaque, const VMStateField *field)
 {
     int size = field->size;
 
@@ -119,8 +119,8 @@ static int vmstate_size(void *opaque, const VMStateField *field)
     return size;
 }
 
-static void vmstate_handle_alloc(void *ptr, const VMStateField *field,
-                                 void *opaque)
+void vmstate_handle_alloc(void *ptr, const VMStateField *field,
+                          void *opaque)
 {
     if (field->flags & VMS_POINTER && field->flags & VMS_ALLOC) {
         gsize size = vmstate_size(opaque, field);

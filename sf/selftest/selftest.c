@@ -26,7 +26,12 @@
 #include "system/address-spaces.h"
 #include "system/runstate.h"
 #include "system/kvm.h"
+#include "system/hw_accel.h"
+#include "hw/core/cpu.h"
+#include "migration/savevm.h"
+#include "migration/qemu-file.h"
 #include "sf/dirty/engine.h"
+#include "sf/vmstate_replay/buffer.h"
 #include "sf/vmstate_replay/preparse.h"
 #include "sf/vmstate_replay/replay.h"
 #include "sf/selftest/selftest.h"
@@ -298,6 +303,107 @@ static void sf_selftest_ram(Monitor *mon, bool *all_ok)
     g_free(exp);
 }
 
+/* ---- CPU-state case (⑥) ------------------------------------------------- */
+
+/* Force CPUState to reflect the real KVM vCPU: clear vcpu_dirty so
+ * cpu_synchronize_state re-reads via ioctl instead of trusting QEMU's cache
+ * (which sf_replay writes into). kvm_arch_get_registers isn't visible in
+ * system_ss; go through the generic hw_accel wrapper. */
+static void sf_pull_vcpu_from_kvm(CPUState *cpu)
+{
+    cpu->vcpu_dirty = false;
+    cpu_synchronize_state(cpu);
+}
+
+/* Serialize current device+CPU state into a fresh owned buffer. */
+static uint8_t *sf_save_dev(size_t *len, Error **errp)
+{
+    QEMUFile *wf = sf_qemufile_from_buffer_output();
+    if (qemu_save_device_state(wf, errp) != 0) {
+        qemu_fclose(wf);
+        return NULL;
+    }
+    const uint8_t *b;
+    size_t l;
+    sf_qemufile_get_output(wf, &b, &l);
+    uint8_t *dup = g_memdup2(b, l);
+    *len = l;
+    qemu_fclose(wf);
+    return dup;
+}
+
+/*
+ * ⑥ CPU-state rollback. Snapshot the device+CPU stream, run the guest so CPU
+ * state advances (dirty.S bumps EBX every pass; TSC advances too), then sf-
+ * restore and re-serialize — reading the vCPU straight from KVM. A correct
+ * restore reproduces the snapshot stream. sf_restore currently doesn't push CPU
+ * state back into the vCPU (no kvm_arch_put_registers), so the restored stream
+ * still carries the run-time EBX/TSC and this goes RED — the gap it guards. PC
+ * alone is useless (tight loop pins it), so compare the whole CPU section via
+ * the device stream.
+ */
+static void sf_selftest_cpu(Monitor *mon, bool *all_ok)
+{
+    Error *err = NULL;
+    SfReplayTables t;
+    CPUState *cpu = first_cpu;
+    uint8_t *s_snap = NULL, *s_ran = NULL, *s_rest = NULL, *s_replay = NULL;
+    size_t l_snap = 0, l_ran = 0, l_rest = 0, l_replay = 0;
+    char buf[192];
+
+    if (!kvm_enabled() || !sf_kvm_dirty_ring_enabled()) {
+        monitor_printf(mon, "sf: selftest[6 cpu-state]: SKIPPED "
+                       "(needs KVM + dirty ring + running guest)\n");
+        return;
+    }
+    if (sf_preparse(&t, &err) < 0) {
+        report(mon, all_ok, "6 cpu-state", false, error_get_pretty(err));
+        error_free(err);
+        return;
+    }
+    if (sf_dirty_snapshot(&err) < 0) {
+        report(mon, all_ok, "6 cpu-state", false, error_get_pretty(err));
+        error_free(err);
+        sf_replay_tables_destroy(&t);
+        return;
+    }
+
+    sf_pull_vcpu_from_kvm(cpu);
+    s_snap = sf_save_dev(&l_snap, &err); error_free(err); err = NULL;
+
+    sf_run_guest_ms(20);
+    sf_pull_vcpu_from_kvm(cpu);
+    s_ran = sf_save_dev(&l_ran, &err); error_free(err); err = NULL;
+
+    /* Full sf restore path: device replay -> RAM rollback -> push CPU to KVM. */
+    sf_replay(&t);
+    /* Diagnostic: did sf_replay restore the QEMU CPUState? Read it back before
+     * any KVM pull (vcpu_dirty still true from vm_stop, so save reads CPUState). */
+    s_replay = sf_save_dev(&l_replay, &err); error_free(err); err = NULL;
+    sf_dirty_collect();
+    sf_dirty_restore();
+    sf_dirty_reset_ring();
+    cpu_synchronize_post_init(cpu);   /* push replayed CPUState into KVM vCPU */
+
+    sf_pull_vcpu_from_kvm(cpu);   /* read real vCPU */
+    s_rest = sf_save_dev(&l_rest, &err); error_free(err); err = NULL;
+
+    bool saved = s_snap && s_ran && s_rest && s_replay;
+    bool moved = saved && (l_ran != l_snap || memcmp(s_ran, s_snap, l_snap) != 0);
+    bool replay_ok = saved && l_replay == l_snap && memcmp(s_replay, s_snap, l_snap) == 0;
+    bool back  = saved && l_rest == l_snap && memcmp(s_rest, s_snap, l_snap) == 0;
+    snprintf(buf, sizeof(buf),
+             "snap=%zuB (moved=%d replay_restored_cpustate=%d back=%d)",
+             l_snap, moved, replay_ok, back);
+    report(mon, all_ok, "6 cpu-state rollback", saved && moved && back, buf);
+
+    g_free(s_snap);
+    g_free(s_ran);
+    g_free(s_rest);
+    g_free(s_replay);
+    sf_replay_tables_destroy(&t);
+}
+
 bool sf_selftest_all(Monitor *mon, Error **errp)
 {
     bool all_ok = true;
@@ -323,6 +429,7 @@ bool sf_selftest_all(Monitor *mon, Error **errp)
         sf_selftest_device(mon, &all_ok);
     }
     sf_selftest_ram(mon, &all_ok);
+    sf_selftest_cpu(mon, &all_ok);
 
     monitor_printf(mon, "sf: selftest overall: %s\n",
                    all_ok ? "GREEN (all cases as expected)" : "RED");

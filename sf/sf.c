@@ -7,6 +7,8 @@
 #include "monitor/monitor.h"
 #include "monitor/hmp.h"
 #include "migration/vmstate.h"
+#include "system/hw_accel.h"
+#include "hw/core/cpu.h"
 #include "sf/sf.h"
 #include "sf/vmstate_replay/preparse.h"
 #include "sf/vmstate_replay/replay.h"
@@ -76,6 +78,21 @@ void hmp_sf_restore(Monitor *mon, const QDict *qdict)
     collected = sf_dirty_collect();
     copied = sf_dirty_restore();
     sf_dirty_reset_ring();
+
+    /*
+     * Push the replayed CPUState back into the KVM vCPU. sf_replay only touched
+     * QEMU-side structs; without this the vCPU keeps its run-time registers/MSRs
+     * while RAM is rolled back, so the guest resumes with CPU/RAM mismatched and
+     * faults (GP -> panic). Generic hw_accel wrapper -> kvm_arch_put_registers
+     * (KVM_PUT_FULL_STATE); mirrors Nyx fast_vm_reload cpu_synchronize_all_post_init.
+     * CPU_FOREACH is future-proof for multi-vCPU (DP-A); M0-S is single-vCPU.
+     */
+    {
+        CPUState *cpu;
+        CPU_FOREACH(cpu) {
+            cpu_synchronize_post_init(cpu);
+        }
+    }
 
     monitor_printf(mon, "sf: restore ok: device=%s ram collected=%" PRIu64
                    " copied-back=%" PRIu32 "\n",

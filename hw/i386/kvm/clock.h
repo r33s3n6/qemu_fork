@@ -15,5 +15,6 @@
 
 void kvmclock_create(bool create_always);
 bool kvmclock_sf_guard_clock_reliable(void *opaque);
+void kvmclock_sf_restore(void *opaque);
 
 #endif

@@ -819,6 +819,30 @@ bool vapic_sf_guard_inactive(void *opaque)
     return s->state == VAPIC_INACTIVE && s->rom_state_paddr == 0;
 }
 
+/*
+ * sf terminal restore: re-activate vapic TPR acceleration the way the resume
+ * handler (vapic_vm_state_change running branch) would, minus its one-shot
+ * handler teardown (sf restores repeatedly). Inert for the sf hot profile —
+ * G-VAPIC asserts state != ACTIVE at capture, so this returns immediately —
+ * kept faithful to the design minimal set for a future TPR-active profile.
+ */
+void vapic_sf_reactivate(void *opaque)
+{
+    VAPICROMState *s = opaque;
+    MachineState *ms = MACHINE(qdev_get_machine());
+
+    if (s->state != VAPIC_ACTIVE) {
+        return;
+    }
+    if (ms->smp.cpus == 1) {
+        run_on_cpu(first_cpu, do_vapic_enable, RUN_ON_CPU_HOST_PTR(s));
+    } else {
+        uint8_t *zero = g_malloc0(s->rom_state.vapic_size);
+        cpu_physical_memory_write(s->vapic_paddr, zero, s->rom_state.vapic_size);
+        g_free(zero);
+    }
+}
+
 static const VMStateDescription vmstate_handlers = {
     .name = "kvmvapic-handlers",
     .version_id = 1,

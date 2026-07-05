@@ -45,6 +45,19 @@ static bool sf_parse_index(const char *arg, const char *prefix, size_t *out)
     return true;
 }
 
+/* Opaque of the named vmstate entry (pre or post) in the replay table, or NULL.
+ * Used to reach a device instance for restore side effects that have no
+ * post_load (kvmclock KVM_SET_CLOCK) or live outside the migration stream. */
+static void *sf_find_opaque(const SfReplayTables *t, const char *name)
+{
+    for (size_t i = 0; i < t->n_posts; i++) {
+        if (!strcmp(t->posts[i].vmsd->name, name)) {
+            return t->posts[i].opaque;
+        }
+    }
+    return NULL;
+}
+
 static size_t sf_count_pre_posts(const SfReplayTables *t, bool is_pre)
 {
     size_t n = 0;
@@ -342,6 +355,33 @@ static void sf_restore_core(Monitor *mon, SfReplayDebug *debug)
                    collected, copied);
 }
 
+/*
+ * Minimal-set tail (ARCHITECTURE §4.4) that vm_start's vm_change_state_handlers
+ * used to provide. The HMP crutch path still calls vm_start and gets these for
+ * free; the terminal vcpu-boundary path has no vm_start, so it must apply them
+ * explicitly here — AFTER sf_restore_core has rolled back RAM (kvmclock re-derives
+ * the clock from the rolled-back pvclock page). kvmclock has no post_load: without
+ * KVM_SET_CLOCK the KVM master clock keeps advancing past the snapshot and the
+ * guest's time jumps on the next pvclock refresh. vapic re-activation preserves
+ * TPR acceleration (inert while G-VAPIC keeps vapic inactive at capture).
+ */
+static void sf_apply_clock_tail(void)
+{
+    void *kc, *vp;
+
+    if (!g_sf_have_snapshot) {
+        return;
+    }
+    kc = sf_find_opaque(&g_sf_tables, "kvmclock");
+    vp = sf_find_opaque(&g_sf_tables, "kvm-tpr-opt");
+    if (kc) {
+        kvmclock_sf_restore(kc);
+    }
+    if (vp) {
+        vapic_sf_reactivate(vp);
+    }
+}
+
 void hmp_sf_restore(Monitor *mon, const QDict *qdict)
 {
     const char *debug_arg = qdict_get_try_str(qdict, "debug");
@@ -408,6 +448,7 @@ void sf_checkpoint_restore(void)
         }
     }
     sf_restore_core(NULL, dbgp);
+    sf_apply_clock_tail();   /* explicit KVM_SET_CLOCK + vapic (no vm_start here) */
     fprintf(stderr, "sf-cp: restore applied%s%s\n",
             dbgp ? " skip=" : "", dbgp ? skip : "");
 }

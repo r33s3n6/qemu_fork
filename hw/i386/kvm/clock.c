@@ -319,6 +319,46 @@ bool kvmclock_sf_guard_clock_reliable(void *opaque)
 }
 
 /*
+ * sf terminal restore: re-apply the KVM host-side master clock the way the
+ * resume vm_change_state_handler (running branch above) would — but without a
+ * vm_start, which the terminal vcpu-boundary restore path does not perform.
+ * kvmclock has no post_load, so device replay alone leaves KVM's master clock
+ * advancing past the snapshot; the next pvclock refresh would then jump the
+ * guest forward by the elapsed wall time (ARCHITECTURE §4.4, the "唯一缺口").
+ * The sf hot profile forces clock_is_reliable=false in pre_load, so re-derive
+ * the clock from the rolled-back pvclock page, KVM_SET_CLOCK it, then
+ * KVMCLOCK_CTRL to keep soft-lockup relief armed. Best-effort (no abort): a
+ * failure here is a restore-correctness bug to surface, not a reason to kill VM.
+ */
+void kvmclock_sf_restore(void *opaque)
+{
+    KVMClockState *s = opaque;
+    struct kvm_clock_data data = {};
+    CPUState *cpu;
+    int ret;
+
+    if (!s->clock_is_reliable) {
+        uint64_t pvclock_via_mem = kvmclock_current_nsec(s);
+        if (pvclock_via_mem) {
+            s->clock = pvclock_via_mem;
+        }
+    }
+    s->clock_valid = false;
+    data.clock = s->clock;
+    ret = kvm_vm_ioctl(kvm_state, KVM_SET_CLOCK, &data);
+    if (ret < 0) {
+        fprintf(stderr, "sf: kvmclock KVM_SET_CLOCK failed: %s\n", strerror(-ret));
+        return;
+    }
+    if (!kvm_check_extension(kvm_state, KVM_CAP_KVMCLOCK_CTRL)) {
+        return;
+    }
+    CPU_FOREACH(cpu) {
+        run_on_cpu(cpu, do_kvmclock_ctrl, RUN_ON_CPU_NULL);
+    }
+}
+
+/*
  * When migrating a running guest, read the clock just
  * before migration, so that the guest clock counts
  * during the events between:

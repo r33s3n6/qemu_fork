@@ -1,5 +1,6 @@
 system_ss.add(files(
   'sf.c',
+  'checkpoint.c',
   'vmstate_replay/buffer.c',
   'vmstate_replay/preparse.c',
   'vmstate_replay/replay.c',

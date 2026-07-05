@@ -194,36 +194,25 @@ static bool sf_validate_hot_profile(Monitor *mon, const SfReplayTables *t)
     return true;
 }
 
-void hmp_sf_snapshot(Monitor *mon, const QDict *qdict)
+/*
+ * Snapshot core — RAM shadow + device three-table preparse + hot-profile guard,
+ * at ONE coherent instant. The caller owns quiescence: it must be called while
+ * the guest is stopped, either under HMP vm_stop (crutch baseline) or at the
+ * vcpu I/O-exit CHECKPOINT boundary (terminal, single vCPU already out of
+ * KVM_RUN with the BQL held). Does NOT itself stop/start the VM. mon may be NULL
+ * (checkpoint path) — monitor_printf is NULL-safe, so all output just no-ops.
+ * Returns true iff a usable snapshot was taken (RAM always; device best-effort).
+ */
+static bool sf_snapshot_core(Monitor *mon)
 {
     Error *err = NULL;
-
-    /*
-     * Quiesce the whole VM for the duration of the snapshot. The snapshot must
-     * capture CPU + RAM + device state at ONE coherent instant: sf_dirty_snapshot
-     * shadows all of guest RAM and sf_preparse serializes the CPU/device state.
-     * Under a running vCPU those are captured at different moments (RAM smeared
-     * across the multi-second shadow, CPU from its stale cache) — an internally
-     * inconsistent snapshot that corrupts the guest when restored, regardless of
-     * how clean the restore is. Nyx creates its in-memory root snapshot the same
-     * way: vm_stop(RUN_STATE_SAVE_VM) -> fast_reload_create_in_memory -> vm_start
-     * (QEMU-Nyx nyx/fast_vm_reload_sync.c). vm_stop also cpu_synchronize_all_states,
-     * so QEMU's CPUState reflects the live KVM vCPU before we serialize it.
-     */
-    bool was_running = runstate_is_running();
-    if (was_running) {
-        vm_stop(RUN_STATE_SAVE_VM);
-    }
 
     /* RAM side (Task 6) — the subject of this task; must succeed. */
     if (sf_dirty_snapshot(&err) < 0) {
         monitor_printf(mon, "sf: snapshot failed (RAM): %s\n",
                        error_get_pretty(err));
         error_free(err);
-        if (was_running) {
-            vm_start();
-        }
-        return;
+        return false;
     }
 
     /*
@@ -244,10 +233,7 @@ void hmp_sf_snapshot(Monitor *mon, const QDict *qdict)
         if (!sf_validate_hot_profile(mon, &g_sf_tables)) {
             sf_replay_tables_destroy(&g_sf_tables);
             sf_dirty_destroy();
-            if (was_running) {
-                vm_start();
-            }
-            return;
+            return false;
         }
         g_sf_have_snapshot = true;
     }
@@ -275,46 +261,60 @@ void hmp_sf_snapshot(Monitor *mon, const QDict *qdict)
                        p->is_pre ? "pre" : "post", i, p->vmsd->name);
     }
 
+    return true;
+}
+
+void hmp_sf_snapshot(Monitor *mon, const QDict *qdict)
+{
+    /*
+     * HMP crutch baseline: the vCPU is running on another thread, so quiesce the
+     * whole VM around the capture. vm_stop(SAVE_VM) also cpu_synchronize_all_states
+     * so CPUState reflects the live KVM vCPU before we serialize it. The terminal
+     * path (sf_checkpoint_snapshot) drops this — the vcpu boundary is quiescent.
+     */
+    bool was_running = runstate_is_running();
+    if (was_running) {
+        vm_stop(RUN_STATE_SAVE_VM);
+    }
+    sf_snapshot_core(mon);
     if (was_running) {
         vm_start();
     }
 }
 
-void hmp_sf_restore(Monitor *mon, const QDict *qdict)
+/*
+ * Terminal snapshot entry — called from the CHECKPOINT ioport handler on the
+ * vcpu thread (checkpoint.c). No vm_stop: the single vCPU is already parked out
+ * of KVM_RUN at the outl boundary. Pull its live registers into CPUState first
+ * so the serialized snapshot reflects the exact boundary RIP/regs.
+ */
+void sf_checkpoint_snapshot(void)
+{
+    if (current_cpu) {
+        cpu_synchronize_state(current_cpu);
+    }
+    if (sf_snapshot_core(NULL)) {
+        fprintf(stderr, "sf-cp: snapshot ok (mblocks=%zu gets=%zu posts=%zu)\n",
+                g_sf_tables.n_mblocks, g_sf_tables.n_gets, g_sf_tables.n_posts);
+    } else {
+        fprintf(stderr, "sf-cp: snapshot FAILED\n");
+    }
+}
+
+/*
+ * Restore core — device replay + RAM rollback + push CPU regs into the vcpu.
+ * Caller owns quiescence (HMP vm_stop crutch, or the vcpu CHECKPOINT boundary).
+ * @debug optional (NULL = no skip-knob injection). mon may be NULL.
+ */
+static void sf_restore_core(Monitor *mon, SfReplayDebug *debug)
 {
     uint64_t collected;
     uint32_t copied;
-    const char *debug_arg = qdict_get_try_str(qdict, "debug");
-    SfReplayDebug debug;
-
-    if (!sf_dirty_have_snapshot()) {
-        monitor_printf(mon, "sf: no snapshot; run sf_snapshot first\n");
-        return;
-    }
-    if (g_sf_have_snapshot &&
-        !sf_parse_restore_debug(mon, debug_arg, &g_sf_tables, &debug)) {
-        return;
-    }
-
-    /*
-     * Quiesce the vCPUs across the rollback. sf_restore mutates guest RAM +
-     * device state in place; doing that under a running vCPU races the guest
-     * (torn RAM / stale regs -> control-flow corruption -> #PF at a random RIP).
-     * The vCPU is confirmed 'running' at restore time (HMP fires on the main-loop
-     * thread, not a hypercall boundary). Stock loadvm restores with the VM
-     * stopped, then vm_start() resumes AND fires every vm_change_state_handler
-     * (kvmclock KVM_SET_CLOCK, cpu, ...) that our in-place restore otherwise
-     * skips. Mirror that: stop -> restore -> put CPU regs -> start.
-     */
-    bool was_running = runstate_is_running();
-    if (was_running) {
-        vm_stop(RUN_STATE_RESTORE_VM);
-    }
 
     /* Device state first (registers), then RAM contents. */
     if (g_sf_have_snapshot) {
-        if (debug_arg && *debug_arg) {
-            sf_replay_with_debug(&g_sf_tables, &debug);
+        if (debug) {
+            sf_replay_with_debug(&g_sf_tables, debug);
         } else {
             sf_replay(&g_sf_tables);
         }
@@ -326,8 +326,7 @@ void hmp_sf_restore(Monitor *mon, const QDict *qdict)
 
     /*
      * Push the replayed CPUState back into the KVM vCPU. sf_replay only touched
-     * QEMU-side structs; vm_start() does not push registers (only cpu_update_state
-     * / tsc invalidation). Generic hw_accel wrapper -> kvm_arch_put_registers
+     * QEMU-side structs. Generic hw_accel wrapper -> kvm_arch_put_registers
      * (KVM_PUT_FULL_STATE). CPU_FOREACH is future-proof for multi-vCPU (DP-A).
      */
     {
@@ -337,16 +336,80 @@ void hmp_sf_restore(Monitor *mon, const QDict *qdict)
         }
     }
 
+    monitor_printf(mon, "sf: restore ok: device=%s ram collected=%" PRIu64
+                   " copied-back=%" PRIu32 "\n",
+                   g_sf_have_snapshot ? "replayed" : "SKIPPED",
+                   collected, copied);
+}
+
+void hmp_sf_restore(Monitor *mon, const QDict *qdict)
+{
+    const char *debug_arg = qdict_get_try_str(qdict, "debug");
+    SfReplayDebug debug;
+    bool have_debug = debug_arg && *debug_arg;
+
+    if (!sf_dirty_have_snapshot()) {
+        monitor_printf(mon, "sf: no snapshot; run sf_snapshot first\n");
+        return;
+    }
+    if (g_sf_have_snapshot &&
+        !sf_parse_restore_debug(mon, debug_arg, &g_sf_tables, &debug)) {
+        return;
+    }
+
+    /*
+     * HMP crutch baseline: the vCPU is running on another thread, so quiesce it
+     * across the rollback (sf_restore mutates guest RAM + device state in place;
+     * racing a live vCPU tears RAM/regs -> #PF at a random RIP). Stock loadvm
+     * restores stopped, then vm_start() fires every vm_change_state_handler
+     * (kvmclock KVM_SET_CLOCK, ...). Mirror that: stop -> restore -> put -> start.
+     * The terminal path (sf_checkpoint_restore) drops this — the vcpu boundary is
+     * already quiescent and re-enters KVM directly.
+     */
+    bool was_running = runstate_is_running();
+    if (was_running) {
+        vm_stop(RUN_STATE_RESTORE_VM);
+    }
+    sf_restore_core(mon, have_debug ? &debug : NULL);
     if (was_running) {
         vm_start(); /* resume vCPUs + fire change handlers (incl. kvmclock) */
     }
+    if (have_debug) {
+        monitor_printf(mon, "sf: (debug=%s)\n", debug_arg);
+    }
+}
 
-    monitor_printf(mon, "sf: restore ok: device=%s ram collected=%" PRIu64
-                   " copied-back=%" PRIu32 "%s%s\n",
-                   g_sf_have_snapshot ? "replayed" : "SKIPPED",
-                   collected, copied,
-                   debug_arg && *debug_arg ? " debug=" : "",
-                   debug_arg && *debug_arg ? debug_arg : "");
+/*
+ * Terminal restore entry — called from the CHECKPOINT ioport handler on the vcpu
+ * thread. No vm_stop. cpu_synchronize_post_init pushes the replayed regs (incl.
+ * RIP = the snapshot's outl site) into the vcpu; on return KVM re-enters and the
+ * pending fast-PIO completion advances RIP consistently — but only because
+ * SNAPSHOT and RESTORE are issued from the identical outl address (single-site
+ * rule, design doc §CHECKPOINT). Empirically validated in Step C.
+ */
+void sf_checkpoint_restore(void)
+{
+    SfReplayDebug debug;
+    SfReplayDebug *dbgp = NULL;
+    /* M3 skip-knob for the terminal path: run.sh sets SF_CP_SKIP=<knob> to force
+     * one restore path to be omitted, proving the guest probe goes RED (teeth).
+     * Same knob grammar as HMP sf_restore debug= (skip-mblock/get/pre/post=N). */
+    const char *skip = getenv("SF_CP_SKIP");
+
+    if (!sf_dirty_have_snapshot()) {
+        fprintf(stderr, "sf-cp: restore with no snapshot — ignored\n");
+        return;
+    }
+    if (skip && *skip && g_sf_have_snapshot) {
+        if (sf_parse_restore_debug(NULL, skip, &g_sf_tables, &debug)) {
+            dbgp = &debug;
+        } else {
+            fprintf(stderr, "sf-cp: bad SF_CP_SKIP='%s' — ignored\n", skip);
+        }
+    }
+    sf_restore_core(NULL, dbgp);
+    fprintf(stderr, "sf-cp: restore applied%s%s\n",
+            dbgp ? " skip=" : "", dbgp ? skip : "");
 }
 
 void hmp_sf_selftest(Monitor *mon, const QDict *qdict)

@@ -10,6 +10,12 @@
 #ifndef SF_SF_H
 #define SF_SF_H
 
-/* Populated by later tasks: vmstate replay tables, dirty engine. */
+/*
+ * Terminal CHECKPOINT entry points (sf.c), called from the guest→host ioport
+ * handler (sf/checkpoint.c) on the vcpu thread at an I/O-exit boundary. No
+ * vm_stop — the single vCPU is already parked out of KVM_RUN with the BQL held.
+ */
+void sf_checkpoint_snapshot(void);
+void sf_checkpoint_restore(void);
 
 #endif /* SF_SF_H */

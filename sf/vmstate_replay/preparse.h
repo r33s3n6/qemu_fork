@@ -32,6 +32,7 @@ typedef struct {
 typedef struct {
     const VMStateInfo   *info;         /* the stock get to replay */
     const VMStateField  *field;        /* field arg for info->get */
+    const char          *vmsd_name;    /* owning (innermost) VMSD, for dumps */
     void                *ptr;          /* target device memory (curr_elem) */
     void                *captured;     /* owned raw stream slice this get read */
     size_t               captured_len; /* bytes in captured */

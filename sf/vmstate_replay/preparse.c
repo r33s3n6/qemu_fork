@@ -80,7 +80,8 @@ static void add_mblock(SfCtx *c, void *ptr, size_t size)
 /* The info->get already ran and advanced the stream from @pos0 to @pos1; grab
  * that exact slice (rewind + re-read) so replay can re-run info->get on it. */
 static bool add_get(SfCtx *c, const VMStateInfo *info, const VMStateField *field,
-                    void *ptr, size_t size, size_t pos0, size_t pos1)
+                    const char *vmsd_name, void *ptr, size_t size,
+                    size_t pos0, size_t pos1)
 {
     size_t len = pos1 - pos0;
     void *cap = len ? g_malloc(len) : NULL;
@@ -94,7 +95,7 @@ static bool add_get(SfCtx *c, const VMStateInfo *info, const VMStateField *field
             return false;
         }
     }
-    SfGet g = { .info = info, .field = field, .ptr = ptr,
+    SfGet g = { .info = info, .field = field, .vmsd_name = vmsd_name, .ptr = ptr,
                 .captured = cap, .captured_len = len, .size = size };
     g_array_append_val(c->gets, g);
     return true;
@@ -266,8 +267,8 @@ static int sf_record_vmsd(SfCtx *c, const VMStateDescription *vmsd,
                     } else if (info_is_skip(field->info)) {
                         /* no device state to restore */
                     } else {
-                        if (!add_get(c, field->info, field, curr_elem, size,
-                                     pos0, pos1)) {
+                        if (!add_get(c, field->info, field, vmsd->name,
+                                     curr_elem, size, pos0, pos1)) {
                             return -EIO;
                         }
                     }

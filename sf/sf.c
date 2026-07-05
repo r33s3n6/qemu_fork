@@ -80,6 +80,19 @@ void hmp_sf_snapshot(Monitor *mon, const QDict *qdict)
                    g_sf_tables.n_mblocks, mbytes,
                    g_sf_tables.n_gets, g_sf_tables.n_posts);
 
+    /* Name-level dump: gets/posts are the audit-critical tables (which side
+     * effects exist in this device set) — print identities, not just counts. */
+    for (size_t i = 0; i < g_sf_tables.n_gets; i++) {
+        const SfGet *g = &g_sf_tables.gets[i];
+        monitor_printf(mon, "sf:   get[%zu] %s/%s info=%s size=%zu\n",
+                       i, g->vmsd_name, g->field->name, g->info->name, g->size);
+    }
+    for (size_t i = 0; i < g_sf_tables.n_posts; i++) {
+        const SfPost *p = &g_sf_tables.posts[i];
+        monitor_printf(mon, "sf:   %s[%zu] %s\n",
+                       p->is_pre ? "pre" : "post", i, p->vmsd->name);
+    }
+
     if (was_running) {
         vm_start();
     }

@@ -20,6 +20,7 @@
 #include "system/runstate.h"
 #include "system/address-spaces.h"
 #include "hw/i386/apic_internal.h"
+#include "hw/i386/vapic.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/boards.h"
 #include "exec/cpu-common.h"
@@ -809,6 +810,13 @@ static int vapic_post_load(void *opaque, int version_id)
             qemu_add_vm_change_state_handler(vapic_vm_state_change, s);
     }
     return 0;
+}
+
+bool vapic_sf_guard_inactive(void *opaque)
+{
+    VAPICROMState *s = opaque;
+
+    return s->state == VAPIC_INACTIVE && s->rom_state_paddr == 0;
 }
 
 static const VMStateDescription vmstate_handlers = {

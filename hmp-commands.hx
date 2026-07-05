@@ -356,8 +356,8 @@ ERST
 
     {
         .name       = "sf_restore",
-        .args_type  = "",
-        .params     = "",
+        .args_type  = "debug:s?",
+        .params     = "[skip-mblock=N|skip-get=N|skip-pre=N|skip-post=N]",
         .help       = "sf (M0-S spike): restore to fast snapshot",
         .cmd        = hmp_sf_restore,
     },

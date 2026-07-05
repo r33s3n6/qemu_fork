@@ -14,5 +14,6 @@
 #define HW_I386_KVM_CLOCK_H
 
 void kvmclock_create(bool create_always);
+bool kvmclock_sf_guard_clock_reliable(void *opaque);
 
 #endif

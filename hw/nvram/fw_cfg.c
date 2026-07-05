@@ -631,6 +631,48 @@ static void fw_cfg_update_mr(FWCfgState *s, uint16_t key, size_t size)
     memory_region_ram_resize(mr, size, &error_abort);
 }
 
+static bool fw_cfg_entry_mr_size_matches(FWCfgState *s, int file_index,
+                                         uint64_t expected)
+{
+    MemoryRegion *mr;
+    ram_addr_t offset;
+    int key = FW_CFG_FILE_FIRST + file_index;
+    int arch;
+    void *ptr;
+
+    arch = !!(key & FW_CFG_ARCH_LOCAL);
+    key &= FW_CFG_ENTRY_MASK;
+    assert(key < fw_cfg_max_entry(s));
+
+    ptr = s->entries[arch][key].data;
+    mr = memory_region_from_host(ptr, &offset);
+    return mr && memory_region_size(mr) == expected;
+}
+
+bool fw_cfg_acpi_mr_restore_sizes_match(void *opaque)
+{
+    FWCfgState *s = opaque;
+    bool saw_table = false, saw_loader = false, saw_rsdp = false;
+    int index;
+
+    if (!s->files) {
+        return false;
+    }
+
+    index = be32_to_cpu(s->files->count);
+    for (int i = 0; i < index; i++) {
+        if (!strcmp(s->files->f[i].name, ACPI_BUILD_TABLE_FILE)) {
+            saw_table = fw_cfg_entry_mr_size_matches(s, i, s->table_mr_size);
+        } else if (!strcmp(s->files->f[i].name, ACPI_BUILD_LOADER_FILE)) {
+            saw_loader = fw_cfg_entry_mr_size_matches(s, i, s->linker_mr_size);
+        } else if (!strcmp(s->files->f[i].name, ACPI_BUILD_RSDP_FILE)) {
+            saw_rsdp = fw_cfg_entry_mr_size_matches(s, i, s->rsdp_mr_size);
+        }
+    }
+
+    return saw_table && saw_loader && saw_rsdp;
+}
+
 static int fw_cfg_acpi_mr_restore_post_load(void *opaque, int version_id)
 {
     FWCfgState *s = opaque;

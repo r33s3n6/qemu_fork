@@ -93,6 +93,25 @@ static void report(Monitor *mon, bool *all_ok, const char *name, bool ok,
 
 /* ---- Device cases (④⑤) -------------------------------------------------- */
 
+static bool sf_selftest_poke_mblocks(const SfReplayTables *t, bool skip_first)
+{
+    for (size_t i = 0; i < t->n_mblocks; i++) {
+        memset(t->mblocks[i].ptr, 0xA5, t->mblocks[i].size);
+    }
+    for (size_t i = skip_first ? 1 : 0; i < t->n_mblocks; i++) {
+        memcpy(t->mblocks[i].ptr, t->mblocks[i].copy, t->mblocks[i].size);
+    }
+
+    bool all_restored = true;
+    for (size_t i = 0; i < t->n_mblocks; i++) {
+        if (memcmp(t->mblocks[i].ptr, t->mblocks[i].copy,
+                   t->mblocks[i].size) != 0) {
+            all_restored = false;
+        }
+    }
+    return all_restored;
+}
+
 static void sf_selftest_device(Monitor *mon, bool *all_ok)
 {
     Error *err = NULL;
@@ -111,6 +130,21 @@ static void sf_selftest_device(Monitor *mon, bool *all_ok)
     error_free(err);
     err = NULL;
 
+    /* P1 positive: every recorded mblock can be poisoned and byte-restored. */
+    if (good && t.n_mblocks) {
+        bool restored = sf_selftest_poke_mblocks(&t, false);
+        report(mon, all_ok, "P1 poke-rollback", restored,
+               restored ? "all mblocks restored" : "BUG: poison remained");
+    }
+
+    /* P1 teeth: if one mblock is omitted, poison must remain observable. */
+    if (good && t.n_mblocks) {
+        bool restored = sf_selftest_poke_mblocks(&t, true);
+        report(mon, all_ok, "P1-neg poke-skip", !restored,
+               !restored ? "detected" : "BUG: omitted mblock hidden");
+        sf_selftest_poke_mblocks(&t, false);
+    }
+
     /* ⑤ neg: corrupt one mblock.copy -> the cross-check must diverge (RED). */
     if (good && t.n_mblocks && t.mblocks[0].size) {
         uint8_t *copy = t.mblocks[0].copy;
@@ -121,6 +155,19 @@ static void sf_selftest_device(Monitor *mon, bool *all_ok)
         error_free(err);
         err = NULL;
         report(mon, all_ok, "5-neg mblock-corruption", !matched,
+               !matched ? "detected" : "BUG: undetected");
+    }
+
+    /* M3/P1 teeth: skip one recorded mblock -> stock cross-check must diverge. */
+    if (good && t.n_mblocks) {
+        SfReplayDebug dbg = {
+            .skip_mblock = true,
+            .skip_mblock_index = 0,
+        };
+        bool matched = sf_replay_matches_stock_with_debug(&t, &dbg, &err);
+        error_free(err);
+        err = NULL;
+        report(mon, all_ok, "P1-neg skip-mblock", !matched,
                !matched ? "detected" : "BUG: undetected");
     }
 
@@ -140,6 +187,35 @@ static void sf_selftest_device(Monitor *mon, bool *all_ok)
     } else {
         report(mon, all_ok, "4 get-handler-corruption", true,
                "SKIPPED (no get-handlers on this machine)");
+    }
+
+    if (good && t.n_gets) {
+        SfReplayDebug dbg = {
+            .skip_get = true,
+            .skip_get_index = 0,
+        };
+        bool matched = sf_replay_matches_stock_with_debug(&t, &dbg, &err);
+        error_free(err);
+        err = NULL;
+        snprintf(buf, sizeof(buf), "%s (%zu gets, info=%s)",
+                 !matched ? "detected" : "BUG: undetected",
+                 t.n_gets, t.gets[0].info->name);
+        report(mon, all_ok, "M3-neg skip-get", !matched, buf);
+    } else {
+        report(mon, all_ok, "M3-neg skip-get", true,
+               "SKIPPED (no get-handlers on this machine)");
+    }
+
+    if (good && t.n_posts) {
+        SfReplayDebug dbg = {
+            .skip_post = true,
+            .skip_post_index = 0,
+        };
+        bool matched = sf_replay_matches_stock_with_debug(&t, &dbg, &err);
+        error_free(err);
+        err = NULL;
+        report(mon, all_ok, "M3-neg skip-post", !matched,
+               !matched ? "detected" : "BUG: undetected");
     }
 
     sf_replay_tables_destroy(&t);

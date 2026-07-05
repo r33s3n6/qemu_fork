@@ -311,6 +311,13 @@ static int kvmclock_pre_load(void *opaque)
     return 0;
 }
 
+bool kvmclock_sf_guard_clock_reliable(void *opaque)
+{
+    KVMClockState *s = opaque;
+
+    return s->clock_is_reliable;
+}
+
 /*
  * When migrating a running guest, read the clock just
  * before migration, so that the guest clock counts

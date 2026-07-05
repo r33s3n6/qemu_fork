@@ -315,6 +315,7 @@ FWCfgState *fw_cfg_init_mem_dma(hwaddr ctl_addr,
 
 FWCfgState *fw_cfg_find(void);
 bool fw_cfg_dma_enabled(void *opaque);
+bool fw_cfg_acpi_mr_restore_sizes_match(void *opaque);
 
 /**
  * fw_cfg_arch_key_name:

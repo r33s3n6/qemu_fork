@@ -29,27 +29,51 @@ static void run_post_load(const SfPost *p)
     }
 }
 
-void sf_replay(const SfReplayTables *t)
+void sf_replay_with_debug(const SfReplayTables *t, const SfReplayDebug *debug)
 {
+    size_t pre_seen = 0;
+    size_t post_seen = 0;
+
     for (size_t i = 0; i < t->n_posts; i++) {
         if (t->posts[i].is_pre) {
+            if (debug && debug->skip_pre &&
+                pre_seen++ == debug->skip_pre_index) {
+                continue;
+            }
             run_pre_load(&t->posts[i]);
         }
     }
     for (size_t i = 0; i < t->n_mblocks; i++) {
+        if (debug && debug->skip_mblock &&
+            i == debug->skip_mblock_index) {
+            continue;
+        }
         memcpy(t->mblocks[i].ptr, t->mblocks[i].copy, t->mblocks[i].size);
     }
     for (size_t i = 0; i < t->n_gets; i++) {
         const SfGet *g = &t->gets[i];
+        if (debug && debug->skip_get && i == debug->skip_get_index) {
+            memset(g->ptr, 0xA5, g->size);
+            continue;
+        }
         QEMUFile *f = sf_qemufile_from_buffer_input(g->captured, g->captured_len);
         g->info->get(f, g->ptr, g->size, g->field);
         qemu_fclose(f);
     }
     for (size_t i = 0; i < t->n_posts; i++) {
         if (!t->posts[i].is_pre) {
+            if (debug && debug->skip_post &&
+                post_seen++ == debug->skip_post_index) {
+                continue;
+            }
             run_post_load(&t->posts[i]);
         }
     }
+}
+
+void sf_replay(const SfReplayTables *t)
+{
+    sf_replay_with_debug(t, NULL);
 }
 
 /* ---- selftest ⑤: cross-check against stock load ---- */
@@ -71,7 +95,9 @@ static uint8_t *save_device_bytes(size_t *len_out, Error **errp)
     return dup;
 }
 
-bool sf_replay_matches_stock(const SfReplayTables *t, Error **errp)
+bool sf_replay_matches_stock_with_debug(const SfReplayTables *t,
+                                        const SfReplayDebug *debug,
+                                        Error **errp)
 {
     bool ok = false;
     uint8_t *snap = NULL, *stock_bytes = NULL, *sf_bytes = NULL;
@@ -111,7 +137,7 @@ bool sf_replay_matches_stock(const SfReplayTables *t, Error **errp)
     if (tgt) {
         memset(tgt, 0xA5, tsz);
     }
-    sf_replay(t);
+    sf_replay_with_debug(t, debug);
     sf_bytes = save_device_bytes(&sf_len, errp);
     if (!sf_bytes) {
         goto out;
@@ -131,4 +157,9 @@ out:
     g_free(stock_bytes);
     g_free(sf_bytes);
     return ok;
+}
+
+bool sf_replay_matches_stock(const SfReplayTables *t, Error **errp)
+{
+    return sf_replay_matches_stock_with_debug(t, NULL, errp);
 }

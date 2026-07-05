@@ -8,6 +8,7 @@
 #include "monitor/hmp.h"
 #include "migration/vmstate.h"
 #include "system/hw_accel.h"
+#include "system/runstate.h"
 #include "hw/core/cpu.h"
 #include "sf/sf.h"
 #include "sf/vmstate_replay/preparse.h"
@@ -23,11 +24,31 @@ void hmp_sf_snapshot(Monitor *mon, const QDict *qdict)
 {
     Error *err = NULL;
 
+    /*
+     * Quiesce the whole VM for the duration of the snapshot. The snapshot must
+     * capture CPU + RAM + device state at ONE coherent instant: sf_dirty_snapshot
+     * shadows all of guest RAM and sf_preparse serializes the CPU/device state.
+     * Under a running vCPU those are captured at different moments (RAM smeared
+     * across the multi-second shadow, CPU from its stale cache) — an internally
+     * inconsistent snapshot that corrupts the guest when restored, regardless of
+     * how clean the restore is. Nyx creates its in-memory root snapshot the same
+     * way: vm_stop(RUN_STATE_SAVE_VM) -> fast_reload_create_in_memory -> vm_start
+     * (QEMU-Nyx nyx/fast_vm_reload_sync.c). vm_stop also cpu_synchronize_all_states,
+     * so QEMU's CPUState reflects the live KVM vCPU before we serialize it.
+     */
+    bool was_running = runstate_is_running();
+    if (was_running) {
+        vm_stop(RUN_STATE_SAVE_VM);
+    }
+
     /* RAM side (Task 6) — the subject of this task; must succeed. */
     if (sf_dirty_snapshot(&err) < 0) {
         monitor_printf(mon, "sf: snapshot failed (RAM): %s\n",
                        error_get_pretty(err));
         error_free(err);
+        if (was_running) {
+            vm_start();
+        }
         return;
     }
 
@@ -58,6 +79,10 @@ void hmp_sf_snapshot(Monitor *mon, const QDict *qdict)
                    g_sf_have_snapshot ? "ok" : "SKIPPED",
                    g_sf_tables.n_mblocks, mbytes,
                    g_sf_tables.n_gets, g_sf_tables.n_posts);
+
+    if (was_running) {
+        vm_start();
+    }
 }
 
 void hmp_sf_restore(Monitor *mon, const QDict *qdict)
@@ -68,6 +93,21 @@ void hmp_sf_restore(Monitor *mon, const QDict *qdict)
     if (!sf_dirty_have_snapshot()) {
         monitor_printf(mon, "sf: no snapshot; run sf_snapshot first\n");
         return;
+    }
+
+    /*
+     * Quiesce the vCPUs across the rollback. sf_restore mutates guest RAM +
+     * device state in place; doing that under a running vCPU races the guest
+     * (torn RAM / stale regs -> control-flow corruption -> #PF at a random RIP).
+     * The vCPU is confirmed 'running' at restore time (HMP fires on the main-loop
+     * thread, not a hypercall boundary). Stock loadvm restores with the VM
+     * stopped, then vm_start() resumes AND fires every vm_change_state_handler
+     * (kvmclock KVM_SET_CLOCK, cpu, ...) that our in-place restore otherwise
+     * skips. Mirror that: stop -> restore -> put CPU regs -> start.
+     */
+    bool was_running = runstate_is_running();
+    if (was_running) {
+        vm_stop(RUN_STATE_RESTORE_VM);
     }
 
     /* Device state first (registers), then RAM contents. */
@@ -81,17 +121,19 @@ void hmp_sf_restore(Monitor *mon, const QDict *qdict)
 
     /*
      * Push the replayed CPUState back into the KVM vCPU. sf_replay only touched
-     * QEMU-side structs; without this the vCPU keeps its run-time registers/MSRs
-     * while RAM is rolled back, so the guest resumes with CPU/RAM mismatched and
-     * faults (GP -> panic). Generic hw_accel wrapper -> kvm_arch_put_registers
-     * (KVM_PUT_FULL_STATE); mirrors Nyx fast_vm_reload cpu_synchronize_all_post_init.
-     * CPU_FOREACH is future-proof for multi-vCPU (DP-A); M0-S is single-vCPU.
+     * QEMU-side structs; vm_start() does not push registers (only cpu_update_state
+     * / tsc invalidation). Generic hw_accel wrapper -> kvm_arch_put_registers
+     * (KVM_PUT_FULL_STATE). CPU_FOREACH is future-proof for multi-vCPU (DP-A).
      */
     {
         CPUState *cpu;
         CPU_FOREACH(cpu) {
             cpu_synchronize_post_init(cpu);
         }
+    }
+
+    if (was_running) {
+        vm_start(); /* resume vCPUs + fire change handlers (incl. kvmclock) */
     }
 
     monitor_printf(mon, "sf: restore ok: device=%s ram collected=%" PRIu64

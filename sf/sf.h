@@ -10,6 +10,6 @@
 #ifndef SF_SF_H
 #define SF_SF_H
 
-/* Populated by later tasks: vmstate replay tables, dirty engine, clock probe. */
+/* Populated by later tasks: vmstate replay tables, dirty engine. */
 
 #endif /* SF_SF_H */

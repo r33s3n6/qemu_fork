@@ -105,8 +105,30 @@ sf/
 
 **实测**(全 GREEN):①64/64 回滚;②丢页 wrong-after=1 检出;③4096 页改(>ring 1024)0 丢 + 丢页检出;③-info **跳过显式 drain 仍丢 0 页**(ring-full 退出 + 后台 reaper 冗余 drain;live-ring-only 会丢 ~3072——量化了本设计相对 Nyx 的价值);④gets=22 篡改检出;⑤对拍 + 篡改检出。
 
+### 4.4 restore 正确性:in-kernel 状态恢复矩阵 —— 定案 2026-07-05
+
+**真凶(2026-07-05 真实 TiDB rig 实测)**:不是"缺某个状态",而是**捕获/回放非自洽**。HMP 触发下 vcpu 在跑,10GB RAM 影子横跨数秒 + CPU 取自陈旧 CPUState 缓存 → 存下内部矛盾的快照,restore 一喂必崩(`#PF`/栈腐化,落点全在 timer/RCU/scheduler:`__hrtimer_run_queues`/`try_to_wake_up`/`rcu_core`)。**只 quiesce restore 不够**(仍崩);snapshot 与 restore 两侧都静止才活。→ coherence 是第一必需,机制见 §5。
+
+**状态恢复矩阵**(microvm 实测 section:`apic/ioapic×2/kvmclock/kvm-tpr-opt/cpu/cpu_common/serial/fw_cfg/acpi-ged/timer/globalstate`):
+
+| in-kernel 状态 | ① QEMU stock | ② Nyx fast_reload | ③ sf 最小集 |
+|---|---|---|---|
+| vCPU 寄存器/MSR/xsave/events/mp_state/nested | `cpu_synchronize_all_post_init`→`kvm_arch_put_registers(FULL_STATE)` | 同,`FULL_STATE_FAST`(略 `set_tsc_khz`)+ 略 debugregs + 单独 `set_tsc` | `cpu_synchronize_post_init` ✅ |
+| **LAPIC**(每vCPU中断控制器/定时器/IRR·ISR) | `apic` post_load→`KVM_SET_LAPIC` | 同(post_fptr 回放) | replay `apic` post_load ✅ |
+| **IOAPIC×2** | `ioapic` post_load→`KVM_SET_IRQCHIP` | 同 | replay `ioapic` post_load ✅ |
+| **kvmclock**(KVM 宿主 master clock) | `vm_start`→handler→`KVM_SET_CLOCK`+`KVMCLOCK_CTRL` | `call_fast_change_handlers` 显式 | **显式 `KVM_SET_CLOCK`**(kvmclock 无 post_load,唯一缺口) |
+| **vapic/TPR 加速** | `kvm-tpr-opt` post_load + vapic handler(resume 重激活) | post_load | replay post_load + **保留 vapic handler 重激活**(TPR 性能,人类定 2026-07-05) |
+| guest pvclock 页 | 随 RAM 回滚(+KVM 重刷) | 同 | 随 RAM 回滚 ✅ |
+| PIT | `vm_start`→`KVM_SET_PIT2` | 显式 | N/A(`pit=off`) |
+| CPU内部fixup / serial / fw_cfg / globalstate | 各自 post_load | 同 | replay post_load ✅ |
+
+**pre_load(3个:kvmclock/apic/serial)**:纯 QEMU 结构体"设默认值"(`clock_is_reliable=false` / `wait_for_sipi=0` / `thr_ipending=-1`),无 KVM 副作用、幂等,重放保留。kvmclock 的含义 = "别信存下的 clock 标量,从内存 pvclock 页重推",与 RAM 回滚一致。
+
+**为什么不用 `vm_start` 全 handler 扫**:实际注册的 handler 只有——kvmclock(补)、`cpu_update_state`(仅 `tsc_valid=false`,可忽略,TSC 已由 cpu_sync 推)、vapic(保留,TPR 性能)、`memory` dirty-log-stop(迁移用,与我方 dirty 引擎无关)、`blk`(无块设备)。故 **sf 最小集 = replay post_load + `cpu_synchronize_post_init` + 显式 `KVM_SET_CLOCK` + vapic 重激活**,正确性等价全扫、更清晰更快。`KVM_SET_CLOCK` 恢复的是 KVM 宿主侧 master clock(否则下次刷 pvclock 时 guest 时间基于"现在"→大跳变),不是 guest 可见态。
+
 ## 5. 关键设计决策(有争议 / 易踩坑,单独记)
 
+- **coherence / 静止机制 = vcpu 线程 hypercall CHECKPOINT 边界(定案 2026-07-05,类 Nyx,不走 vm_stop)**:snapshot 与 restore 都必须在 guest 完全静止的自洽瞬间完成(见 §4.4 真凶)。Nyx 靠 guest 的 acquire/CHECKPOINT hypercall 把 vcpu 泊在 KVM run loop 的 exit handler 里——`fast_reload_restore` 在 **vcpu 线程**跑(QEMU-Nyx `nyx/synchronization.c:1767`;主线程只置 flag+signal、绝不碰 VM/vCPU 态,`:1783`),天然静止、在正确线程、免 `vm_stop` 的 pause/resume 与全 handler 扫开销。sf 采同法:CHECKPOINT hypercall 边界做 snapshot;host 请求 restore 经 flag 交 vcpu 线程在下一个 hypercall 边界应用 §4.4 最小集。**当前 `hmp_sf_snapshot/_restore` 的 `vm_stop`/`vm_start` 包裹是过渡拐杖**(2026-07-05 验证:两侧都包才能正确 restore 真实 TiDB),仅为在 hypercall 通道就位前拿正确性/延迟基线;终态删 `vm_stop`,走 §4.4 显式最小集。
 - **端序**:迁移流是**大端**编码,设备内存是**主机端序**;`info->get` 同时做反序列化+端序转换+副作用。故 **mblock.copy 一律从 get 之后的内存取**(不是流字节),端序天然正确。这也是"mblock = 跳过 get 直接 memcpy"的唯一自洽读法。证据:Nyx `state_reallocation.c:416`。
 - **走流方式 = 带记录的真加载**(人类 2026-07-04 定):不自己啃流字节的分帧,而是跑一遍真 load 顺手记表。代价:snapshot 时刻会把设备副作用(如 `timer_mod`)以相同值再触发一次;M0-S 接受。
   - **[PLANNED FEATURE / 提速方向,人类提]**:未来若要压 snapshot 延迟,研究**绕开 save→load 往返**,直接就地从设备内存 + VMSD 元数据取三表(免序列化/反序列化)。后置优化,依赖先跑通正确路径。

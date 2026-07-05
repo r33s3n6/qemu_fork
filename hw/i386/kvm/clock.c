@@ -330,6 +330,43 @@ bool kvmclock_sf_guard_clock_reliable(void *opaque)
  * KVMCLOCK_CTRL to keep soft-lockup relief armed. Best-effort (no abort): a
  * failure here is a restore-correctness bug to surface, not a reason to kill VM.
  */
+/*
+ * sf snapshot time-freeze (kvmclock half). The terminal snapshot shadows all
+ * guest RAM on the vcpu thread with no vm_stop, so guest time advances by the
+ * shadow duration and the guest perceives a multi-second stall (crashes
+ * lease-sensitive workloads). Bracket the shadow: kvmclock_sf_clock_get() before,
+ * kvmclock_sf_clock_set() after with that value, so the master clock rewinds to
+ * the snapshot instant. The TSC half is done by the caller re-putting the vcpu's
+ * saved TSC (cpu_synchronize_post_init) — kvmclock alone is not enough because
+ * the guest derives it as base + (rdtsc - tsc_timestamp)*mult and rdtsc jumped.
+ */
+uint64_t kvmclock_sf_clock_get(void)
+{
+    struct kvm_clock_data data = {};
+
+    if (kvm_vm_ioctl(kvm_state, KVM_GET_CLOCK, &data) < 0) {
+        return 0;
+    }
+    return data.clock;
+}
+
+void kvmclock_sf_clock_set(uint64_t clock)
+{
+    struct kvm_clock_data data = { .clock = clock };
+    CPUState *cpu;
+
+    if (kvm_vm_ioctl(kvm_state, KVM_SET_CLOCK, &data) < 0) {
+        fprintf(stderr, "sf: kvmclock freeze KVM_SET_CLOCK failed\n");
+        return;
+    }
+    if (!kvm_check_extension(kvm_state, KVM_CAP_KVMCLOCK_CTRL)) {
+        return;
+    }
+    CPU_FOREACH(cpu) {
+        run_on_cpu(cpu, do_kvmclock_ctrl, RUN_ON_CPU_NULL);
+    }
+}
+
 void kvmclock_sf_restore(void *opaque)
 {
     KVMClockState *s = opaque;

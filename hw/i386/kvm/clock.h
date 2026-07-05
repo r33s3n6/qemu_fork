@@ -16,5 +16,7 @@
 void kvmclock_create(bool create_always);
 bool kvmclock_sf_guard_clock_reliable(void *opaque);
 void kvmclock_sf_restore(void *opaque);
+uint64_t kvmclock_sf_clock_get(void);
+void kvmclock_sf_clock_set(uint64_t clock);
 
 #endif

@@ -9,6 +9,7 @@
 #include "monitor/hmp.h"
 #include "migration/vmstate.h"
 #include "system/hw_accel.h"
+#include "system/kvm.h"
 #include "system/runstate.h"
 #include "hw/core/cpu.h"
 #include "hw/i386/kvm/clock.h"
@@ -303,10 +304,39 @@ void hmp_sf_snapshot(Monitor *mon, const QDict *qdict)
  */
 void sf_checkpoint_snapshot(void)
 {
+    uint64_t clock0 = 0;
+    bool ok;
+
+    /*
+     * Freeze guest time across the shadow so the guest resumes at the snapshot
+     * instant T0 instead of perceiving the (multi-second, RAM-proportional) shadow
+     * as a stall — which crashes lease-sensitive workloads (TiKV/PD). This is what
+     * vm_stop provided; the terminal path has no vm_stop, so do it explicitly, both
+     * clocks together:
+     *   - kvmclock: read master clock at T0, write it back after the shadow.
+     *   - TSC: cpu_synchronize_state captures env->tsc=T0 now; after the shadow
+     *     cpu_synchronize_post_init re-puts it (KVM_PUT_FULL_STATE -> KVM_SET_MSRS
+     *     TSC), rewinding the vcpu TSC to T0. The guest was frozen (never read the
+     *     TSC mid-shadow), so the rewind stays monotonic. kvmclock alone is not
+     *     enough: the guest derives it from the (jumped) TSC.
+     * The restore path already rewinds both (sf_replay restores env->tsc +
+     * cpu_synchronize_post_init; sf_apply_clock_tail's KVM_SET_CLOCK) — snapshot is
+     * the only gap.
+     */
+    if (kvm_enabled()) {
+        clock0 = kvmclock_sf_clock_get();
+    }
     if (current_cpu) {
         cpu_synchronize_state(current_cpu);
     }
-    if (sf_snapshot_core(NULL)) {
+    ok = sf_snapshot_core(NULL);
+    if (current_cpu && kvm_enabled()) {
+        cpu_synchronize_post_init(current_cpu);   /* re-put env (rewinds TSC to T0) */
+    }
+    if (clock0) {
+        kvmclock_sf_clock_set(clock0);            /* rewind kvmclock to T0 */
+    }
+    if (ok) {
         fprintf(stderr, "sf-cp: snapshot ok (mblocks=%zu gets=%zu posts=%zu)\n",
                 g_sf_tables.n_mblocks, g_sf_tables.n_gets, g_sf_tables.n_posts);
     } else {

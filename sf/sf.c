@@ -26,6 +26,21 @@
 static SfReplayTables g_sf_tables;
 static bool g_sf_have_snapshot;
 
+/* Machinery-latency probe (gated on SF_TIME=<non-empty>): prints per-phase ns of
+ * snapshot/restore to stderr so the M0-S 止损闸 and snapshot-opt priority get real
+ * numbers instead of guesses. Zero overhead when off. See sf ARCHITECTURE §6. */
+static bool sf_timing(void)
+{
+    const char *s = getenv("SF_TIME");
+    return s && *s;
+}
+static inline uint64_t sf_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
 /* Test knob: SF_CP_SKIP_TSC=<non-empty> omits the forced TSC refreeze so the
  * phase1.5 gate can prove the T-TSC probe has teeth. Empty/unset -> fix active. */
 static bool sf_skip_tsc(void)
@@ -237,7 +252,12 @@ static bool sf_validate_hot_profile(Monitor *mon, const SfReplayTables *t)
 static bool sf_snapshot_core(Monitor *mon)
 {
     Error *err = NULL;
+    bool timing = sf_timing();
+    uint64_t ta = 0, tb = 0, tc = 0;
 
+    if (timing) {
+        ta = sf_now_ns();
+    }
     /* RAM side (Task 6) — the subject of this task; must succeed. */
     if (sf_dirty_snapshot(&err) < 0) {
         monitor_printf(mon, "sf: snapshot failed (RAM): %s\n",
@@ -255,6 +275,9 @@ static bool sf_snapshot_core(Monitor *mon)
         sf_replay_tables_destroy(&g_sf_tables);
         g_sf_have_snapshot = false;
     }
+    if (timing) {
+        tb = sf_now_ns();
+    }
     if (sf_preparse(&g_sf_tables, &err) < 0) {
         monitor_printf(mon, "sf: WARNING device preparse failed: %s "
                        "(RAM snapshot still taken)\n", error_get_pretty(err));
@@ -267,6 +290,14 @@ static bool sf_snapshot_core(Monitor *mon)
             return false;
         }
         g_sf_have_snapshot = true;
+    }
+
+    if (timing) {
+        tc = sf_now_ns();
+        fprintf(stderr,
+                "sf-time: snapshot ram-shadow=%.1fus device-preparse=%.1fus "
+                "(this is the per-snapshot serialize+discovery cost we could reuse)\n",
+                (tb - ta) / 1000.0, (tc - tb) / 1000.0);
     }
 
     size_t mbytes = 0;
@@ -376,7 +407,12 @@ static void sf_restore_core(Monitor *mon, SfReplayDebug *debug)
 {
     uint64_t collected;
     uint32_t copied;
+    bool timing = sf_timing();
+    uint64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0;
 
+    if (timing) {
+        t0 = sf_now_ns();
+    }
     /* Device state first (registers), then RAM contents. */
     if (g_sf_have_snapshot) {
         if (debug) {
@@ -385,10 +421,19 @@ static void sf_restore_core(Monitor *mon, SfReplayDebug *debug)
             sf_replay(&g_sf_tables);
         }
     }
+    if (timing) {
+        t1 = sf_now_ns();
+    }
 
     collected = sf_dirty_collect();
+    if (timing) {
+        t2 = sf_now_ns();
+    }
     copied = sf_dirty_restore();
     sf_dirty_reset_ring();
+    if (timing) {
+        t3 = sf_now_ns();
+    }
 
     /*
      * Push the replayed CPUState back into the KVM vCPU. sf_replay only touched
@@ -410,6 +455,15 @@ static void sf_restore_core(Monitor *mon, SfReplayDebug *debug)
                 sf_kvm_refreeze_tsc(cpu);
             }
         }
+    }
+
+    if (timing) {
+        t4 = sf_now_ns();
+        fprintf(stderr,
+                "sf-time: restore device=%.1fus collect=%.1fus copy+reset=%.1fus "
+                "cpusync=%.1fus total=%.1fus (collected=%" PRIu64 " copied=%" PRIu32 ")\n",
+                (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (t3 - t2) / 1000.0,
+                (t4 - t3) / 1000.0, (t4 - t0) / 1000.0, collected, copied);
     }
 
     monitor_printf(mon, "sf: restore ok: device=%s ram collected=%" PRIu64

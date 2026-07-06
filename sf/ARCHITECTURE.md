@@ -167,6 +167,7 @@ sf/
   ```
   期望:A(如 `0x5b19f141`)→ B(`0xcedc2b3c`,变了)→ **回到 A**;`restore ok: ... ram collected=N copied-back=N`(相等=零丢)。
 - **selftest ①–⑤(Task7)**:`HMP sf_selftest`。两次触发(TCG 拿 ④⑤ + KVM+`dirty.elf` 拿 ①②③),命令 + 期望见主仓 `tools/sf-rig/README.md`。负载 stub 源在 `tools/sf-rig/guest/{boot,dirty}.S`(`bash build.sh` 构建)。
+- **延迟探针 `SF_TIME=1`**(env,平时零开销):`sf_snapshot_core`/`sf_restore_core` 按阶段打 ns 到 stderr——`sf-time: snapshot ram-shadow=… device-preparse=…`、`sf-time: restore device=… collect=… copy+reset=… cpusync=… total=…`。用来给 M0-S 止损闸与快照优化优先级摆真数(见主仓 `log/2026-07-06-01`:phase2 真 TiDB 稳态 restore ≈1.4ms、ram-shadow 8.9s/10GB、device-preparse ≈211µs)。
 - **提交纪律**:C 代码 commit 到本 submodule(分支 `sf-m0s-restore-spike`),再更主仓 gitlink;每步回填计划 checkbox。
 
 ## 7. 现状(逐 Task)

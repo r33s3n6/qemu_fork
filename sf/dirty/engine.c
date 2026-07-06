@@ -36,9 +36,20 @@ static size_t       g_n_shadows;
 static bool         g_have_snapshot;
 static bool         g_log_started;
 
-/* Sets keyed by host page address (aligned). Values unused. */
-static GHashTable  *g_hot;         /* pages with HOT policy */
-static GHashTable  *g_to_restore;  /* pages dirtied this round */
+/* HOT policy set: keyed by host page address, queried for membership → hash set. */
+static GHashTable  *g_hot;
+
+/* Pages dirtied this generation → a flat, append-only vector of host page
+ * addresses. The KVM dirty ring logs each page at most once per generation (a
+ * page enters the ring on its clean->dirty write fault, then stays writable
+ * until the next reset), so there are no intra-generation duplicates to dedup.
+ * Only add/iterate/clear are ever needed (never membership) → a plain vector
+ * beats both a hash set (was ~150ns/page of hashing, ~500us/3000 pages) and a
+ * bitmap+stack (no bitmap memory, no per-append bit test). A duplicate (a HOT
+ * page also dirtied) at worst costs one redundant, harmless memcpy. */
+static void   **g_dirty;      /* host page addresses, this generation */
+static size_t   g_dirty_n;    /* count */
+static size_t   g_dirty_cap;  /* capacity (kept across generations) */
 
 static inline size_t sf_page_size(void)
 {
@@ -48,6 +59,15 @@ static inline size_t sf_page_size(void)
 static GHashTable *sf_set(void)
 {
     return g_hash_table_new(g_direct_hash, g_direct_equal);
+}
+
+static inline void sf_dirty_push(void *host)
+{
+    if (g_dirty_n == g_dirty_cap) {
+        g_dirty_cap = g_dirty_cap ? g_dirty_cap * 2 : 4096;
+        g_dirty = g_renew(void *, g_dirty, g_dirty_cap);
+    }
+    g_dirty[g_dirty_n++] = host;
 }
 
 /* Locate the shadow that owns host page @p; return its shadow ptr + bytes
@@ -73,10 +93,9 @@ void sf_dirty_destroy(void)
     g_free(g_shadows);
     g_shadows = NULL;
     g_n_shadows = 0;
-    if (g_to_restore) {
-        g_hash_table_destroy(g_to_restore);
-        g_to_restore = NULL;
-    }
+    g_free(g_dirty);
+    g_dirty = NULL;
+    g_dirty_n = g_dirty_cap = 0;
     /* g_hot (policy) intentionally persists across snapshots. */
     g_have_snapshot = false;
 }
@@ -129,7 +148,6 @@ int sf_dirty_snapshot(Error **errp)
 
     g_shadows = shadows;
     g_n_shadows = n;
-    g_to_restore = sf_set();
     if (!g_hot) {
         g_hot = sf_set();
     }
@@ -156,11 +174,12 @@ void sf_dirty_inject_collect_skip(void *host_page)
 
 static void sf_collect_cb(void *host, size_t page_size, void *user)
 {
-    GHashTable *set = user;
+    (void)page_size;
+    (void)user;
     if (host == g_inject_skip_page) {
         return; /* injected loss: this dirty page is dropped on the floor */
     }
-    g_hash_table_add(set, host);
+    sf_dirty_push(host);
 }
 
 uint64_t sf_dirty_collect(void)
@@ -168,40 +187,46 @@ uint64_t sf_dirty_collect(void)
     if (!g_have_snapshot) {
         return 0;
     }
-    return sf_kvm_collect_dirty(sf_collect_cb, g_to_restore);
+    return sf_kvm_collect_dirty(sf_collect_cb, NULL);
+}
+
+static inline uint32_t sf_restore_one(void *page, size_t psize)
+{
+    uint64_t remain = 0;
+    uint8_t *src = sf_shadow_for(page, &remain);
+    if (!src) {
+        return 0; /* page outside any shadowed block */
+    }
+    memcpy(page, src, MIN(psize, remain));
+    return 1;
 }
 
 uint32_t sf_dirty_restore(void)
 {
     size_t psize = sf_page_size();
-    GHashTableIter it;
-    gpointer key;
     uint32_t copied = 0;
 
     if (!g_have_snapshot) {
         return 0;
     }
 
-    /* HOT pages are restored unconditionally: fold them into the set. */
+    /* Pages dirtied this generation (flat vector, O(dirty), no hashing). */
+    for (size_t i = 0; i < g_dirty_n; i++) {
+        copied += sf_restore_one(g_dirty[i], psize);
+    }
+
+    /* HOT pages: restored unconditionally. May overlap the dirtied set (HOT is
+     * opt-in and small) → a redundant but correct recopy, not deduped. */
     if (g_hot) {
+        GHashTableIter it;
+        gpointer key;
         g_hash_table_iter_init(&it, g_hot);
         while (g_hash_table_iter_next(&it, &key, NULL)) {
-            g_hash_table_add(g_to_restore, key);
+            copied += sf_restore_one(key, psize);
         }
     }
 
-    g_hash_table_iter_init(&it, g_to_restore);
-    while (g_hash_table_iter_next(&it, &key, NULL)) {
-        uint64_t remain = 0;
-        uint8_t *src = sf_shadow_for(key, &remain);
-        if (!src) {
-            continue; /* page outside any shadowed block */
-        }
-        memcpy(key, src, MIN(psize, remain));
-        copied++;
-    }
-
-    g_hash_table_remove_all(g_to_restore);
+    g_dirty_n = 0; /* clear for next generation, keep capacity */
     return copied;
 }
 

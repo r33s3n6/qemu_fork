@@ -78,7 +78,7 @@ sf/
 
 **模型**(设计 spec §C,`engine.c`):
 - `sf_dirty_snapshot`:开全局 dirty logging(一次)→ 遍历所有 RAMBlock 存**全量影子**(每块 `memcpy` 一份)→ drain + reset 起干净一轮。
-- `sf_dirty_collect`:`sf_kvm_collect_dirty` 把脏页 host 地址并入待恢复集(GHashTable 去重)。
+- `sf_dirty_collect`:`sf_kvm_collect_dirty` 把脏页 host 地址 append 进**扁平 vector `g_dirty`**(非 hashtable——KVM dirty ring 每页每代只入一次,无需去重;从不查 membership,只 add/iterate/clear)。**实测:collect ~370µs 大头是 `kvm_dirty_ring_flush()` 的 drain+reprotect(∝脏页的内核活),vector 相对旧 GHashTable 只省 ~135µs 哈希那部分——reprotect 才是待治项(blind/keep-writable KVM 扩展)。**
 - `sf_dirty_restore`:待恢复集 ∪ **所有 HOT 页**(无条件回拷)逐页 `memcpy(影子→host)`,返回回拷页数;清空待恢复集。
 - `sf_dirty_reset_ring`:清 per-slot bitmap 起新一轮。
 - `sf_reprotect_policy` / `sf_dirty_mark_hot`:hot/cold 策略表(默认 cold;key = host 页地址)。

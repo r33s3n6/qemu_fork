@@ -197,5 +197,6 @@ void hmp_sf_snapshot(Monitor *mon, const QDict *qdict);
 void hmp_sf_restore(Monitor *mon, const QDict *qdict);
 void hmp_sf_selftest(Monitor *mon, const QDict *qdict);
 void hmp_sf_tree(Monitor *mon, const QDict *qdict);
+void hmp_sf_r3_spike(Monitor *mon, const QDict *qdict);
 
 #endif

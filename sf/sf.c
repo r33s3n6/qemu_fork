@@ -208,6 +208,20 @@ void hmp_sf_tree(Monitor *mon, const QDict *qdict)
     sf_snap_tree(mon);
 }
 
+/* R3 spike (plan 2026-07-06-07 §3): research-only — verify EPT rebuild after a
+ * MAP_PRIVATE|MAP_FIXED remap of a guest RAM page. Run under KVM with a guest
+ * that writes @gpa (e.g. `sf_r3_spike 0x300000` with the sf-rig dirty workload).
+ * A process crash means the mmu-notifier did NOT fire (R3 fails). */
+void hmp_sf_r3_spike(Monitor *mon, const QDict *qdict)
+{
+    const char *arg = qdict_get_try_str(qdict, "gpa");
+    uint64_t gpa = 0x300000;
+    if (arg && *arg) {
+        gpa = (uint64_t)g_ascii_strtoull(arg, NULL, 0);
+    }
+    sf_r3_spike_run(mon, (hwaddr)gpa);
+}
+
 /* ---- Terminal CHECKPOINT entries (vcpu thread, no vm_stop) ---- */
 
 /*

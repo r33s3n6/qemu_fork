@@ -379,6 +379,14 @@ ERST
     },
 
     {
+        .name       = "sf_r3_spike",
+        .args_type  = "gpa:s?",
+        .params     = "[gpa]",
+        .help       = "sf (M3 R3 spike): remap a guest RAM page MAP_PRIVATE|MAP_FIXED, verify EPT rebuild (research)",
+        .cmd        = hmp_sf_r3_spike,
+    },
+
+    {
         .name       = "loadvm",
         .args_type  = "name:s",
         .params     = "tag",

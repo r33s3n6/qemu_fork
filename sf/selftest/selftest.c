@@ -24,6 +24,9 @@
 #include "exec/cpu-common.h"
 #include "system/memory.h"
 #include "system/address-spaces.h"
+#include <sys/mman.h>
+#include <unistd.h>
+#include <fcntl.h>
 #include "system/runstate.h"
 #include "system/kvm.h"
 #include "system/hw_accel.h"
@@ -854,6 +857,87 @@ static void sf_selftest_tripwire(Monitor *mon, bool *all_ok)
         report(mon, all_ok, "7c mid-chain exclude", kept, buf);
         sf_exclude_clear();
     }
+}
+
+/* ---- R3 spike (plan 2026-07-06-07 §3): EPT rebuild after RAM remap -------- */
+bool sf_r3_spike_run(Monitor *mon, hwaddr gpa)
+{
+    size_t psize = qemu_real_host_page_size();
+    Error *err = NULL;
+    char buf[256];
+
+    if (!kvm_enabled() || !sf_kvm_dirty_ring_enabled()) {
+        monitor_printf(mon, "sf-r3: SKIPPED (needs KVM + dirty ring)\n");
+        return false;
+    }
+    void *host = sf_gpa_to_host(gpa);
+    if (!host) {
+        monitor_printf(mon, "sf-r3: gpa 0x%" HWADDR_PRIx " not in RAM\n", gpa);
+        return false;
+    }
+
+    /* Start dirty logging so the post-remap guest write is trackable. */
+    if (sf_dirty_snapshot(&err) < 0) {
+        monitor_printf(mon, "sf-r3: snapshot failed: %s\n", error_get_pretty(err));
+        error_free(err);
+        return false;
+    }
+    /* Snapshot the page before remap (also what we write to the file). */
+    g_autofree uint8_t *before = g_malloc(psize);
+    memcpy(before, host, psize);
+
+    /* File holding the page contents; remap it MAP_PRIVATE|MAP_FIXED over the
+     * exact host page. This is the Nyx cold-start move (shadow_memory.c:299). */
+    char tmpl[] = "/tmp/sf_r3_XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0) {
+        monitor_printf(mon, "sf-r3: mkstemp failed: %s\n", strerror(errno));
+        return false;
+    }
+    unlink(tmpl);
+    if (write(fd, before, psize) != (ssize_t)psize) {
+        monitor_printf(mon, "sf-r3: write failed\n");
+        close(fd);
+        return false;
+    }
+    lseek(fd, 0, SEEK_SET);
+
+    if (munmap(host, psize) != 0) {
+        monitor_printf(mon, "sf-r3: munmap failed: %s\n", strerror(errno));
+        close(fd);
+        return false;
+    }
+    void *p = mmap(host, psize, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_FIXED, fd, 0);
+    if (p != host) {
+        monitor_printf(mon, "sf-r3: mmap MAP_FIXED returned %p (want %p): %s\n",
+                       p, host, strerror(errno));
+        close(fd);
+        return false;
+    }
+
+    /* QEMU's host view now sees the file mapping. If KVM's mmu-notifier fired,
+     * the EPT entry for this GPA was invalidated; the next guest access rebuilds
+     * it to the new physical page. Run the guest — if the notifier did NOT fire,
+     * the guest access to this page hits a stale EPT → SIGSEGV/corruption → the
+     * process crashes here (R3 FAIL, observed by the caller). */
+    uint32_t pre = sf_rd32(gpa);
+    sf_run_guest_ms(60);
+    uint32_t post = sf_rd32(gpa);
+    uint64_t collected = sf_dirty_collect();
+
+    bool survived = true;   /* we're here → guest did not crash */
+    bool advanced = (post != pre);          /* guest write reached the new page */
+    bool tracked = (collected > 0);         /* dirty ring saw the write */
+    snprintf(buf, sizeof(buf),
+             "survived=%d advanced=%d tracked=%d (pre=%u post=%u collected=%llu)",
+             survived, advanced, tracked, pre, post,
+             (unsigned long long)collected);
+    monitor_printf(mon, "sf-r3: %s\n", buf);
+    report(mon, NULL, "R3 remap EPT-rebuild", survived && advanced && tracked, buf);
+
+    close(fd);
+    return survived && advanced && tracked;
 }
 
 bool sf_selftest_all(Monitor *mon, Error **errp)

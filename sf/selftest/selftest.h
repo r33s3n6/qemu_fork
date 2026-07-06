@@ -8,6 +8,7 @@
 
 #include "qapi/error.h"
 #include "monitor/monitor.h"
+#include "exec/hwaddr.h"
 
 /*
  * Run every restore-correctness case, printing per-case GREEN/RED to @mon.
@@ -17,5 +18,19 @@
  * workload running (skipped with a note otherwise).
  */
 bool sf_selftest_all(Monitor *mon, Error **errp);
+
+/*
+ * R3 spike (plan 2026-07-06-07 §3, hard prerequisite for cold start): verify
+ * that munmap+mmap(MAP_PRIVATE|MAP_FIXED, fd) over a guest RAM page AFTER KVM
+ * memslots are registered rebuilds the EPT (via the mmu-notifier) so the guest
+ * can still read/write the page and the dirty ring still tracks it. @gpa is the
+ * guest-physical page to remap (page-aligned). Run under KVM with a guest that
+ * writes @gpa (e.g. the sf-rig dirty workload). Returns true if the guest
+ * survived the remap (EPT rebuilt) AND the dirty ring tracked the post-remap
+ * write. If the process crashes (SIGSEGV in the guest), the mmu-notifier did NOT
+ * fire — R3 fails, observed by the caller as a crash. Research-only; not part of
+ * sf_selftest_all.
+ */
+bool sf_r3_spike_run(Monitor *mon, hwaddr gpa);
 
 #endif /* SF_SELFTEST_H */

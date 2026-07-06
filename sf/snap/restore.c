@@ -34,6 +34,8 @@
 #include "sf/vmstate_replay/preparse.h"
 #include "sf/vmstate_replay/replay.h"
 #include "sf/snap/node.h"
+#include "sf/snap/exclude.h"
+#include "sf/snap/tripwire.h"
 #include "sf/sf.h"          /* sf_skip_tsc declaration (defined here) */
 
 /* ---- timing probe (SF_TIME) ---- */
@@ -251,6 +253,22 @@ static size_t sf_w_sort_uniq(SfWAcc *a)
     return u;
 }
 
+/* W -= NO_RESTORE 排除区 (plan 2026-07-06-06 §1 接入点): drop keys whose host
+ * page is excluded. Empty table → no-op (one branch per key). */
+static size_t sf_w_filter_excluded(SfWAcc *a, size_t n)
+{
+    size_t psize = qemu_real_host_page_size();
+    size_t u = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t *host = sf_key_to_host(a->keys[i]);
+        if (host && sf_excluded_range(host, psize)) {
+            continue;   /* NO_RESTORE: not saved, not restored */
+        }
+        a->keys[u++] = a->keys[i];
+    }
+    return u;
+}
+
 /* Push every index key of a diff node into W (for the restore path union). */
 static void sf_w_push_index(SfWAcc *a, const SfRamStore *s)
 {
@@ -303,6 +321,10 @@ SfSnapNode *sf_snap_ram_root(Error **errp)
         node->kvm.tsc = sf_kvm_read_tsc(current_cpu);
     }
     sf_active = node;
+    /* Arm the tripwire: a snapshot tree now exists, host writes to its RAM
+     * must be caught. Stays armed until the tree is torn down (sf_node_destroy
+     * on the root disarms). */
+    sf_tripwire_arm(true);
     return node;
 }
 
@@ -347,6 +369,7 @@ SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, Error **errp
     /* Step 3: W -= NO_RESTORE 排除区 (plan 2026-07-06-06; table empty → no-op). */
 
     n_uniq = sf_w_sort_uniq(&acc);
+    n_uniq = sf_w_filter_excluded(&acc, n_uniq);
 
     node = sf_node_new(parent, kind);
     if (sf_ramstore_create_anon(&node->ram, (uint32_t)n_uniq) < 0) {
@@ -399,7 +422,7 @@ static size_t sf_build_restore_w(SfSnapNode *src, SfSnapNode *dst, SfSnapNode *L
         sf_w_push_index(acc, &n->ram);
     }
     /* W -= NO_RESTORE 排除区 (plan 06; table empty → no-op). */
-    return sf_w_sort_uniq(acc);
+    return sf_w_filter_excluded(acc, sf_w_sort_uniq(acc));
 }
 
 /* Apply W: for each key, memcpy(store→live) from the ≤dst nearest owner. */

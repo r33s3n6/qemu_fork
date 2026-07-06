@@ -13,6 +13,7 @@
 #include "system/ramlist.h"
 #include "sf/dirty/engine.h"
 #include "sf/snap/node.h"
+#include "sf/snap/tripwire.h"   /* disarm on root teardown */
 
 SfSnapNode  *sf_active;
 SfBlockDesc *sf_blocks;
@@ -77,6 +78,11 @@ void sf_node_destroy(SfSnapNode *n)
 {
     if (!n) {
         return;
+    }
+    /* Tearing down the root (no parent) ends the snapshot tree → disarm the
+     * tripwire (no snapshot RAM to protect anymore). */
+    if (n->parent == NULL) {
+        sf_tripwire_arm(false);
     }
     sf_node_destroy_rec(n);
 }

@@ -91,6 +91,7 @@
 #endif
 
 #include "memory-internal.h"
+#include "sf/snap/tripwire.h"   /* host-write-to-snapshot-RAM enforcement (sf M3) */
 
 /* ram_list is read under rcu_read_lock()/rcu_read_unlock().  Writes
  * are protected by the ramlist lock.
@@ -3130,6 +3131,13 @@ MemoryRegion *get_system_io(void)
 static void invalidate_and_set_dirty(MemoryRegion *mr, hwaddr addr,
                                      hwaddr length)
 {
+    /* sf tripwire (M3): every host-side write to guest RAM funnels through
+     * here; catch writes that bypass the KVM dirty ring and would silently
+     * corrupt a snapshot. One predicted branch when disarmed. */
+    if (unlikely(sf_tripwire_armed())) {
+        sf_tripwire_hit(mr, addr, length);
+    }
+
     uint8_t dirty_log_mask = memory_region_get_dirty_log_mask(mr);
     ram_addr_t ramaddr = memory_region_get_ram_addr(mr);
 

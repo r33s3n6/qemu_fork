@@ -36,6 +36,8 @@
 #include "sf/vmstate_replay/preparse.h"
 #include "sf/vmstate_replay/replay.h"
 #include "sf/snap/node.h"
+#include "sf/snap/exclude.h"
+#include "sf/snap/tripwire.h"
 #include "sf/selftest/selftest.h"
 
 /* Must match the sf-rig dirty workload (ARCHITECTURE.md §6): a spin loop that
@@ -770,9 +772,98 @@ static void sf_selftest_snap(Monitor *mon, bool *all_ok)
     }
 }
 
+/* ---- M3 NO_RESTORE + tripwire (T5, plan 2026-07-06-06 §3 case 7) -------- */
+
+static void sf_selftest_tripwire(Monitor *mon, bool *all_ok)
+{
+    char buf[192];
+    Error *err = NULL;
+    void *host0;
+    uint32_t v0, h = 0xDEADBEEFu;
+
+    if (!kvm_enabled() || !sf_kvm_dirty_ring_enabled()) {
+        monitor_printf(mon, "sf: selftest[7 NO_RESTORE+tripwire]: SKIPPED "
+                       "(needs KVM + dirty ring)\n");
+        return;
+    }
+
+    host0 = sf_gpa_to_host(SF_ST_BASE);
+
+    /* ---- (a) excluded page: host write does NOT trip; restore keeps host val ---- */
+    {
+        if (!sf_snap_root(mon)) { *all_ok = false; return; }
+        v0 = sf_rd32(SF_ST_BASE);
+        sf_exclude_clear();
+        sf_exclude_add((uint64_t)(uintptr_t)host0, SF_ST_PAGE, 1);
+
+        sf_tripwire_reset_count();
+        cpu_physical_memory_write(SF_ST_BASE, &h, sizeof(h));   /* host write via API */
+        bool no_trip = (sf_tripwire_count() == 0);              /* excluded → 放行 */
+
+        sf_snap_delta_restore(sf_active->id, &err); error_free(err); err = NULL;
+        uint32_t got = sf_rd32(SF_ST_BASE);
+        bool kept = (got == h) && (h != v0);                    /* not rolled back */
+        snprintf(buf, sizeof(buf), "no-trip=%d kept-host=%d (got=%u H=%u v0=%u)",
+                 no_trip, kept, got, h, v0);
+        report(mon, all_ok, "7a NO_RESTORE exempt+keep", no_trip && kept, buf);
+        sf_exclude_clear();
+    }
+
+    /* ---- (b) host write to snapshot RAM trips;摘钩子 → 静默通过(牙齿) ---- */
+    {
+        if (!sf_snap_root(mon)) { *all_ok = false; return; }
+        sf_exclude_clear();   /* P0 NOT excluded now */
+        sf_tripwire_reset_count();
+        cpu_physical_memory_write(SF_ST_BASE, &h, sizeof(h));
+        bool tripped = (sf_tripwire_count() >= 1);
+
+        /* teeth: disable the hook → the same write goes undetected (proves the
+         * tripwire itself is what catches it). */
+        sf_tripwire_inject_disable(true);
+        sf_tripwire_reset_count();
+        cpu_physical_memory_write(SF_ST_BASE, &h, sizeof(h));
+        bool silent = (sf_tripwire_count() == 0);
+        sf_tripwire_inject_disable(false);
+
+        snprintf(buf, sizeof(buf), "tripped=%d silent-when-disabled=%d",
+                 tripped, silent);
+        report(mon, all_ok, "7b tripwire teeth", tripped && silent, buf);
+    }
+
+    /* ---- (c) exclude registered mid-chain: old diff has the page, restore
+     *      still must NOT roll it back (接入点 2 牙齿) ---- */
+    {
+        if (!sf_snap_root(mon)) { *all_ok = false; return; }
+        v0 = sf_rd32(SF_ST_BASE);
+        sf_run_guest_ms(20);
+        uint32_t v1 = sf_rd32(SF_ST_BASE);
+        SfSnapNode *L1 = sf_make_layer(mon, all_ok);   /* L1's diff contains P0 */
+        if (!L1) { return; }
+        sf_exclude_clear();
+        sf_exclude_add((uint64_t)(uintptr_t)host0, SF_ST_PAGE, 1); /* register mid-chain */
+
+        sf_run_guest_ms(20);
+        uint32_t v2 = sf_rd32(SF_ST_BASE);
+        sf_snap_delta_restore(L1->id, &err); error_free(err); err = NULL;
+        uint32_t got = sf_rd32(SF_ST_BASE);
+        /* excluded ⇒ P0 not rolled back ⇒ stays live v2, not L1's v1. */
+        bool kept = (got == v2) && (v2 != v1);
+        snprintf(buf, sizeof(buf), "%s (got=%u v2=%u v1=%u)",
+                 kept ? "excluded overrides old diff" : "BUG: rolled back old diff",
+                 got, v2, v1);
+        report(mon, all_ok, "7c mid-chain exclude", kept, buf);
+        sf_exclude_clear();
+    }
+}
+
 bool sf_selftest_all(Monitor *mon, Error **errp)
 {
     bool all_ok = true;
+
+    /* Tripwire: run in count mode for the whole selftest so a stray trigger
+     * never aborts the process; case 7 reads the counter. */
+    sf_tripwire_set_mode(false);
+    sf_tripwire_reset_count();
 
     /* Device work needs a stable state. */
     if (runstate_is_running()) {
@@ -798,6 +889,7 @@ bool sf_selftest_all(Monitor *mon, Error **errp)
     sf_selftest_cpu(mon, &all_ok);
     sf_selftest_tsc(mon, &all_ok);
     sf_selftest_snap(mon, &all_ok);
+    sf_selftest_tripwire(mon, &all_ok);
 
     monitor_printf(mon, "sf: selftest overall: %s\n",
                    all_ok ? "GREEN (all cases as expected)" : "RED");

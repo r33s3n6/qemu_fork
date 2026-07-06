@@ -7,5 +7,7 @@ system_ss.add(files(
   'dirty/engine.c',
   'snap/node.c',
   'snap/restore.c',
+  'snap/exclude.c',
+  'snap/tripwire.c',
   'selftest/selftest.c',
 ))

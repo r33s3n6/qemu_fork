@@ -485,13 +485,14 @@ int sf_snap_save(SfSnapKind kind, Error **errp)
     bool timing = sf_timing();
     uint64_t ta = 0, tb = 0, tc = 0;
 
-    /* First-version chain policy (plan -04 §4): active already has a child ->
-     * refuse; caller must delete the old leaf first. */
-    if (sf_active && !QLIST_EMPTY(&sf_active->children)) {
-        error_setg(errp, "sf_snap_save: active node already has a child; "
-                   "delete the old leaf first (chain policy)");
-        return -EPERM;
-    }
+    /*
+     * T8: the tree is no longer restricted to a chain — save() may branch off
+     * the active node (build a sibling of an existing child). The data
+     * structure, LCA, and delta-restore have been tree-shaped since T1; the
+     * first-version chain check (plan -04 §4) is dropped now that tree selftest
+     * E covers cross-sibling restore. delete() still protects the active node
+     * and its ancestors.
+     */
 
     if (kind == SF_SNAP_ROOT) {
         if (timing) { ta = sf_now_ns(); }

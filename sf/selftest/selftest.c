@@ -730,6 +730,44 @@ static void sf_selftest_snap(Monitor *mon, bool *all_ok)
                  got, v1b);
         report(mon, all_ok, "D HOT blind-spot (pos+teeth)", pos && teeth, buf);
     }
+
+    /* ---- Case E (T8): tree fork + cross-sibling restore + resolve teeth ---- */
+    {
+        if (!sf_snap_root(mon)) { *all_ok = false; return; }
+        uint32_t v0 = sf_rd32(SF_ST_BASE);
+        sf_run_guest_ms(20);
+        uint32_t v1 = sf_rd32(SF_ST_BASE);
+        SfSnapNode *L1 = sf_make_layer(mon, all_ok);   /* branch 1: P0 = v1 */
+        if (!L1) { return; }
+        SfSnapNode *root = sf_active;
+        while (root->parent) { root = root->parent; }
+
+        /* back to root, build a sibling L2 (fork). */
+        sf_snap_delta_restore(root->id, &err); error_free(err); err = NULL;
+        sf_run_guest_ms(20);
+        uint32_t v2 = sf_rd32(SF_ST_BASE);
+        SfSnapNode *L2 = sf_make_layer(mon, all_ok);   /* branch 2: P0 = v2 */
+        if (!L2) { return; }
+
+        /* cross-sibling: active=L2 → restore L1 ⇒ P0 must be L1's v1 (not L2's
+         * v2, not root's v0). This exercises the dst-side path union + resolve
+         * walking across the fork. */
+        sf_snap_delta_restore(L1->id, &err); error_free(err); err = NULL;
+        bool cross = (sf_rd32(SF_ST_BASE) == v1) && (v1 != v2) && (v1 != v0);
+
+        /* teeth: resolve skips L1 → restore L1 yields root's v0, not v1. */
+        sf_snap_delta_restore(L2->id, &err); error_free(err); err = NULL; /* active=L2 */
+        sf_resolve_inject_skip_node(L1->id);
+        sf_snap_delta_restore(L1->id, &err); error_free(err); err = NULL;
+        uint32_t got = sf_rd32(SF_ST_BASE);
+        bool teeth = (got != v1);
+        sf_resolve_inject_skip_node(0xFFFFFFFFU);
+        (void)v2;
+        snprintf(buf, sizeof(buf), "cross-sibling=%d teeth=%s (got=%u want=%u v0=%u)",
+                 cross, teeth ? "RED detected" : "BUG: resolve skip hidden",
+                 got, v1, v0);
+        report(mon, all_ok, "E tree fork cross-sibling", cross && teeth, buf);
+    }
 }
 
 bool sf_selftest_all(Monitor *mon, Error **errp)

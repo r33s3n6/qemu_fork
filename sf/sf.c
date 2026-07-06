@@ -34,6 +34,14 @@ static bool sf_skip_tsc(void)
     return s && *s;
 }
 
+/* Test knob: SF_CP_SKIP_KVMCLOCK=<non-empty> omits the restore-tail kvmclock
+ * re-anchor (KVM_SET_CLOCK + KVMCLOCK_CTRL) so the gate can prove T-CLK teeth. */
+static bool sf_skip_kvmclock(void)
+{
+    const char *s = getenv("SF_CP_SKIP_KVMCLOCK");
+    return s && *s;
+}
+
 static bool sf_parse_index(const char *arg, const char *prefix, size_t *out)
 {
     const char *s;
@@ -429,7 +437,9 @@ static void sf_apply_clock_tail(void)
     }
     kc = sf_find_opaque(&g_sf_tables, "kvmclock");
     vp = sf_find_opaque(&g_sf_tables, "kvm-tpr-opt");
-    if (kc) {
+    /* SF_CP_SKIP_KVMCLOCK=<non-empty> omits the KVM_SET_CLOCK/KVMCLOCK_CTRL so the
+     * phase1.5 gate can prove the T-CLK probe has teeth (guest clock jumps). */
+    if (kc && !sf_skip_kvmclock()) {
         kvmclock_sf_restore(kc);
     }
     if (vp) {

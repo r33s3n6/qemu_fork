@@ -61,6 +61,8 @@
 #include "hw/i386/x86-iommu.h"
 #include "hw/i386/e820_memory_layout.h"
 
+#include "sf/kvm_tsc.h"
+
 #include "hw/xen/xen.h"
 
 #include "hw/pci/pci.h"
@@ -3890,6 +3892,48 @@ static int kvm_get_one_msr(X86CPU *cpu, int index, uint64_t *value)
     *value = msr_data.entries[0].data;
     return ret;
 }
+
+/*
+ * stalefuzz TSC re-freeze. See sf/kvm_tsc.h for the full rationale. A plain
+ * host TSC write (cpu_synchronize_post_init) can be swallowed by KVM's
+ * kvm_synchronize_tsc "synchronizing" heuristic (a write within ~1s of the
+ * free-running value keeps the old offset). Poison last_tsc_write with a bogus
+ * first entry so the real second entry can't look like a sync-up and takes a
+ * fresh offset. Both land atomically with the vcpu parked -> guest never sees
+ * the bogus value. Stock-KVM behavior, not a patched sentinel.
+ */
+#define SF_TSC_POISON 0x00004e59584e5958ULL
+
+int sf_kvm_force_tsc(CPUState *cs, uint64_t value)
+{
+    X86CPU *cpu = X86_CPU(cs);
+    int ret;
+
+    kvm_msr_buf_reset(cpu);
+    kvm_msr_entry_add(cpu, MSR_IA32_TSC, SF_TSC_POISON);
+    kvm_msr_entry_add(cpu, MSR_IA32_TSC, value);
+
+    ret = kvm_vcpu_ioctl(cs, KVM_SET_MSRS, cpu->kvm_msr_buf);
+    if (ret < 0) {
+        return ret;
+    }
+    cpu->env.tsc = value;
+    return ret == 2 ? 0 : -1;
+}
+
+uint64_t sf_kvm_read_tsc(CPUState *cs)
+{
+    uint64_t value = 0;
+
+    kvm_get_one_msr(X86_CPU(cs), MSR_IA32_TSC, &value);
+    return value;
+}
+
+void sf_kvm_refreeze_tsc(CPUState *cs)
+{
+    sf_kvm_force_tsc(cs, X86_CPU(cs)->env.tsc);
+}
+
 void kvm_put_apicbase(X86CPU *cpu, uint64_t value)
 {
     int ret;

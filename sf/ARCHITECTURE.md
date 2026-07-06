@@ -113,7 +113,7 @@ sf/
 
 | in-kernel 状态 | ① QEMU stock | ② Nyx fast_reload | ③ sf 最小集 |
 |---|---|---|---|
-| vCPU 寄存器/MSR/xsave/events/mp_state/nested | `cpu_synchronize_all_post_init`→`kvm_arch_put_registers(FULL_STATE)` | 同,`FULL_STATE_FAST`(略 `set_tsc_khz`)+ 略 debugregs + 单独 `set_tsc` | `cpu_synchronize_post_init` ✅ |
+| vCPU 寄存器/MSR/xsave/events/mp_state/nested | `cpu_synchronize_all_post_init`→`kvm_arch_put_registers(FULL_STATE)` | 同,`FULL_STATE_FAST`(略 `set_tsc_khz`)+ 略 debugregs + 单独 `set_tsc` | `cpu_synchronize_post_init` + **TSC 单独强制回拨**(见下)✅ |
 | **LAPIC**(每vCPU中断控制器/定时器/IRR·ISR) | `apic` post_load→`KVM_SET_LAPIC` | 同(post_fptr 回放) | replay `apic` post_load ✅ |
 | **IOAPIC×2** | `ioapic` post_load→`KVM_SET_IRQCHIP` | 同 | replay `ioapic` post_load ✅ |
 | **kvmclock**(KVM 宿主 master clock) | `vm_start`→handler→`KVM_SET_CLOCK`+`KVMCLOCK_CTRL` | `call_fast_change_handlers` 显式 | **显式 `KVM_SET_CLOCK`**(kvmclock 无 post_load,唯一缺口) |
@@ -124,7 +124,9 @@ sf/
 
 **pre_load(3个:kvmclock/apic/serial)**:纯 QEMU 结构体"设默认值"(`clock_is_reliable=false` / `wait_for_sipi=0` / `thr_ipending=-1`),无 KVM 副作用、幂等,重放保留。kvmclock 的含义 = "别信存下的 clock 标量,从内存 pvclock 页重推",与 RAM 回滚一致。
 
-**为什么不用 `vm_start` 全 handler 扫**:实际注册的 handler 只有——kvmclock(补)、`cpu_update_state`(仅 `tsc_valid=false`,可忽略,TSC 已由 cpu_sync 推)、vapic(保留,TPR 性能)、`memory` dirty-log-stop(迁移用,与我方 dirty 引擎无关)、`blk`(无块设备)。故 **sf 最小集 = replay post_load + `cpu_synchronize_post_init` + 显式 `KVM_SET_CLOCK` + vapic 重激活**,正确性等价全扫、更清晰更快。`KVM_SET_CLOCK` 恢复的是 KVM 宿主侧 master clock(否则下次刷 pvclock 时 guest 时间基于"现在"→大跳变),不是 guest 可见态。
+**为什么不用 `vm_start` 全 handler 扫**:实际注册的 handler 只有——kvmclock(补)、`cpu_update_state`(仅 `tsc_valid=false`,可忽略)、vapic(保留,TPR 性能)、`memory` dirty-log-stop(迁移用,与我方 dirty 引擎无关)、`blk`(无块设备)。故 **sf 最小集 = replay post_load + `cpu_synchronize_post_init` + TSC 强制回拨 + 显式 `KVM_SET_CLOCK` + vapic 重激活**,正确性等价全扫、更清晰更快。`KVM_SET_CLOCK` 恢复的是 KVM 宿主侧 master clock(否则下次刷 pvclock 时 guest 时间基于"现在"→大跳变),不是 guest 可见态。
+
+**TSC 强制回拨(`sf_kvm_force_tsc`,2026-07-06)**:`cpu_synchronize_post_init` 的 `KVM_SET_MSRS(MSR_IA32_TSC=T0)` **不可靠**——stock KVM `kvm_synchronize_tsc`(`arch/x86/kvm/x86.c`)把落在自由前进值 ±1s 内的 host TSC 写当成 CPU sync-up、保留旧 offset、**不回拨**,于是 guest TSC 停在墙钟而 kvmclock 冻在 T0 → guest clocksource watchdog 报 `cs`(kvmclock)≈快照 vs `wd`(TSC)≈墙钟 的偏斜。修法:restore 与 snapshot 冻结两处在 post_init 后调 `sf_kvm_force_tsc()`——一次 `KVM_SET_MSRS` 双写 MSR_IA32_TSC(先 bogus 值毒化 `last_tsc_write` 使真值不再像 sync-up,再写真值取新 offset),vcpu 泊住时原子落、guest 不见 bogus 值。**stock-KVM 行为,非 patched sentinel**(QEMU-Nyx magic 同招,不绑 KVM-Nyx)。双层验证:host `sf_selftest` ⑦ + guest phase1.5 **T-TSC**(`SF_CP_SKIP_TSC=1` 证牙齿)。
 
 ## 5. 关键设计决策(有争议 / 易踩坑,单独记)
 

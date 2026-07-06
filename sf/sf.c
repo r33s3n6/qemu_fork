@@ -16,6 +16,7 @@
 #include "hw/i386/vapic.h"
 #include "hw/nvram/fw_cfg.h"
 #include "sf/sf.h"
+#include "sf/kvm_tsc.h"
 #include "sf/vmstate_replay/preparse.h"
 #include "sf/vmstate_replay/replay.h"
 #include "sf/dirty/engine.h"
@@ -24,6 +25,14 @@
 /* Single snapshot slot for the M0-S spike (one snapshot, many restores). */
 static SfReplayTables g_sf_tables;
 static bool g_sf_have_snapshot;
+
+/* Test knob: SF_CP_SKIP_TSC=<non-empty> omits the forced TSC refreeze so the
+ * phase1.5 gate can prove the T-TSC probe has teeth. Empty/unset -> fix active. */
+static bool sf_skip_tsc(void)
+{
+    const char *s = getenv("SF_CP_SKIP_TSC");
+    return s && *s;
+}
 
 static bool sf_parse_index(const char *arg, const char *prefix, size_t *out)
 {
@@ -315,13 +324,14 @@ void sf_checkpoint_snapshot(void)
      * clocks together:
      *   - kvmclock: read master clock at T0, write it back after the shadow.
      *   - TSC: cpu_synchronize_state captures env->tsc=T0 now; after the shadow
-     *     cpu_synchronize_post_init re-puts it (KVM_PUT_FULL_STATE -> KVM_SET_MSRS
-     *     TSC), rewinding the vcpu TSC to T0. The guest was frozen (never read the
-     *     TSC mid-shadow), so the rewind stays monotonic. kvmclock alone is not
-     *     enough: the guest derives it from the (jumped) TSC.
-     * The restore path already rewinds both (sf_replay restores env->tsc +
-     * cpu_synchronize_post_init; sf_apply_clock_tail's KVM_SET_CLOCK) — snapshot is
-     * the only gap.
+     *     sf_kvm_refreeze_tsc() forces the vcpu TSC back to T0. A plain post_init
+     *     KVM_SET_MSRS(TSC) is NOT enough — KVM's sync heuristic swallows it (see
+     *     sf/kvm_tsc.h); the guest was frozen (never read the TSC mid-shadow), so
+     *     the forced rewind stays monotonic. kvmclock alone is not enough either:
+     *     the guest derives it from the (jumped) TSC.
+     * The restore path rewinds both the same way (sf_replay restores env->tsc,
+     * then sf_restore_core forces the TSC; sf_apply_clock_tail's KVM_SET_CLOCK
+     * re-anchors kvmclock).
      */
     if (kvm_enabled()) {
         clock0 = kvmclock_sf_clock_get();
@@ -331,7 +341,12 @@ void sf_checkpoint_snapshot(void)
     }
     ok = sf_snapshot_core(NULL);
     if (current_cpu && kvm_enabled()) {
-        cpu_synchronize_post_init(current_cpu);   /* re-put env (rewinds TSC to T0) */
+        cpu_synchronize_post_init(current_cpu);   /* re-put env (T0 back into vcpu) */
+        if (!sf_skip_tsc()) {
+            sf_kvm_refreeze_tsc(current_cpu);     /* force the TSC rewind (post_init's
+                                                     plain MSR write is unreliable; see
+                                                     sf/kvm_tsc.h) */
+        }
     }
     if (clock0) {
         kvmclock_sf_clock_set(clock0);            /* rewind kvmclock to T0 */
@@ -376,6 +391,16 @@ static void sf_restore_core(Monitor *mon, SfReplayDebug *debug)
         CPUState *cpu;
         CPU_FOREACH(cpu) {
             cpu_synchronize_post_init(cpu);
+            /*
+             * Force the TSC rewind. post_init's plain KVM_SET_MSRS(MSR_IA32_TSC)
+             * can be silently swallowed by KVM's kvm_synchronize_tsc sync
+             * heuristic, leaving the guest TSC at wall clock while kvmclock
+             * freezes -> clocksource skew. See sf/kvm_tsc.h. SF_CP_SKIP_TSC omits
+             * the force so the phase1.5 gate can prove the T-TSC probe has teeth.
+             */
+            if (kvm_enabled() && !sf_skip_tsc()) {
+                sf_kvm_refreeze_tsc(cpu);
+            }
         }
     }
 

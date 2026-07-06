@@ -31,6 +31,7 @@
 #include "migration/savevm.h"
 #include "migration/qemu-file.h"
 #include "sf/dirty/engine.h"
+#include "sf/kvm_tsc.h"
 #include "sf/vmstate_replay/buffer.h"
 #include "sf/vmstate_replay/preparse.h"
 #include "sf/vmstate_replay/replay.h"
@@ -480,6 +481,84 @@ static void sf_selftest_cpu(Monitor *mon, bool *all_ok)
     sf_replay_tables_destroy(&t);
 }
 
+/* ---- TSC-freeze case (⑦) ----------------------------------------------- */
+
+/*
+ * ⑦ TSC frozen across the boundary. Snapshot T0, run the guest briefly so its
+ * TSC free-runs, then restore. A plain cpu_synchronize_post_init writes
+ * MSR_IA32_TSC=T0, but stock KVM's kvm_synchronize_tsc treats a host TSC write
+ * within ~1s of the free-running value as a CPU sync-up and keeps the old offset
+ * (see sf/kvm_tsc.h) — so at a sub-1s gap the plain write is SWALLOWED and the
+ * guest TSC stays at wall clock while kvmclock (explicit KVM_SET_CLOCK) freezes,
+ * which is the clocksource skew the guest reports (cs vs wd). This case measures
+ * both: the plain read (must show the swallow = teeth) and the forced read after
+ * sf_kvm_refreeze_tsc (must be back at T0 = the fix). Host-side gate; the
+ * authoritative check is the guest reading its own TSC across the boundary.
+ */
+static void sf_selftest_tsc(Monitor *mon, bool *all_ok)
+{
+    Error *err = NULL;
+    SfReplayTables t;
+    CPUState *cpu = first_cpu;
+    char buf[224];
+    /* ~30-50ms of TSC cycles at 1-3GHz: a frozen TSC sits well under this, a
+     * 500ms free-run sits well over — so the threshold cleanly separates the two
+     * without needing the guest's exact tsc_khz. */
+    const uint64_t tol = 100000000ULL;
+
+    if (!kvm_enabled() || !sf_kvm_dirty_ring_enabled()) {
+        monitor_printf(mon, "sf: selftest[7 tsc-freeze]: SKIPPED "
+                       "(needs KVM + dirty ring + running guest)\n");
+        return;
+    }
+    if (sf_preparse(&t, &err) < 0) {
+        report(mon, all_ok, "7 tsc-freeze", false, error_get_pretty(err));
+        error_free(err);
+        return;
+    }
+    if (sf_dirty_snapshot(&err) < 0) {
+        report(mon, all_ok, "7 tsc-freeze", false, error_get_pretty(err));
+        error_free(err);
+        sf_replay_tables_destroy(&t);
+        return;
+    }
+
+    uint64_t tsc_snap = sf_kvm_read_tsc(cpu);   /* T0 */
+
+    sf_run_guest_ms(500);                        /* free-run the TSC (sub-1s gap) */
+
+    /* Restore inline, plain path first (no forced rewind). */
+    sf_replay(&t);
+    sf_dirty_collect();
+    sf_dirty_restore();
+    sf_dirty_reset_ring();
+    cpu_synchronize_post_init(cpu);              /* plain KVM_SET_MSRS(TSC=T0) */
+    uint64_t tsc_plain = sf_kvm_read_tsc(cpu);
+
+    /* The fix: forced double-write. Aim at the same value we measured (tsc_snap)
+     * so this isolates the KVM mechanism (does force_tsc make the guest read the
+     * requested value?) from whether env->tsc was replayed exactly — the latter
+     * is ⑥'s job. */
+    sf_kvm_force_tsc(cpu, tsc_snap);
+    uint64_t tsc_forced = sf_kvm_read_tsc(cpu);
+
+    uint64_t d_plain = tsc_plain > tsc_snap ? tsc_plain - tsc_snap
+                                            : tsc_snap - tsc_plain;
+    uint64_t d_forced = tsc_forced > tsc_snap ? tsc_forced - tsc_snap
+                                              : tsc_snap - tsc_forced;
+
+    bool teeth = d_plain > tol;    /* plain post_init did NOT rewind (bug visible) */
+    bool frozen = d_forced < tol;  /* forced write rewound the TSC to T0 (fix works) */
+
+    snprintf(buf, sizeof(buf),
+             "gap=500ms d_plain=%" PRIu64 " d_forced=%" PRIu64
+             " (teeth=%d frozen=%d)", d_plain, d_forced, teeth, frozen);
+    report(mon, all_ok, "7 tsc-freeze (forced rewind)", frozen, buf);
+    report(mon, all_ok, "7-neg tsc-sync-teeth (plain swallowed)", teeth, buf);
+
+    sf_replay_tables_destroy(&t);
+}
+
 bool sf_selftest_all(Monitor *mon, Error **errp)
 {
     bool all_ok = true;
@@ -506,6 +585,7 @@ bool sf_selftest_all(Monitor *mon, Error **errp)
     }
     sf_selftest_ram(mon, &all_ok);
     sf_selftest_cpu(mon, &all_ok);
+    sf_selftest_tsc(mon, &all_ok);
 
     monitor_printf(mon, "sf: selftest overall: %s\n",
                    all_ok ? "GREEN (all cases as expected)" : "RED");

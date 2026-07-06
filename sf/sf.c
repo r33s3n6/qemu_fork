@@ -230,7 +230,10 @@ void sf_checkpoint_snapshot(void)
     if (current_cpu) {
         cpu_synchronize_state(current_cpu);   /* env->tsc = T0 for the node capture */
     }
-    ok = (sf_snap_save(SF_SNAP_ROOT, &err) == 0);
+    /* save() builds a child of the active node (plan -04 §2): the first
+     * CHECKPOINT builds root, subsequent ones build RUN diff layers on top. */
+    SfSnapKind kind = sf_active ? SF_SNAP_RUN : SF_SNAP_ROOT;
+    ok = (sf_snap_save(kind, &err) == 0);
     if (!ok) {
         fprintf(stderr, "sf-cp: snapshot FAILED: %s\n", error_get_pretty(err));
         error_free(err);
@@ -245,7 +248,9 @@ void sf_checkpoint_snapshot(void)
     if (clock0) {
         kvmclock_sf_clock_set(clock0);            /* rewind kvmclock to T0 */
     }
-    fprintf(stderr, "sf-cp: snapshot ok (root id=%u)\n", sf_active ? sf_active->id : 0);
+    fprintf(stderr, "sf-cp: snapshot ok (id=%u %s)\n",
+            sf_active ? sf_active->id : 0,
+            sf_active && sf_active->kind == SF_SNAP_ROOT ? "root" : "layer");
 }
 
 /*

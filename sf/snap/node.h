@@ -134,6 +134,7 @@ SfSnapNode *sf_node_lca(SfSnapNode *a, SfSnapNode *b);
 int        sf_blocks_enumerate(Error **errp);    /* RAMBLOCK_FOREACH → sf_blocks */
 void       sf_blocks_destroy(void);
 SfPageKey  sf_host_to_key(void *host_page);      /* host page addr → key; 0 if unknown */
+bool       sf_host_to_key_safe(void *host_page, SfPageKey *out);  /* false if unknown */
 uint8_t   *sf_key_to_host(SfPageKey key);        /* key → live host page base; NULL if bad */
 
 /* ---- Ramstore ---- */
@@ -147,6 +148,23 @@ uint8_t *sf_resolve(SfSnapNode *dst, SfPageKey key);
 /* ---- Top-level save/restore (HMP + terminal route here) ---- */
 int   sf_snap_save(SfSnapKind kind, Error **errp);
 int   sf_snap_restore(uint32_t dst_id, Error **errp);
+
+/* ---- RAM-only cores (selftest / building blocks; no device, no guard) ----
+ * Production save/restore wrap these with device capture (T4) + clock tail.
+ * Exposed so the RAM diff/delta mechanics are testable under pc KVM (where the
+ * microvm hot-profile guard refuses the full preparse). */
+SfSnapNode *sf_snap_ram_root(Error **errp);   /* engine shadow + blocks + root node, sets sf_active */
+SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind,
+                               Error **errp);  /* collect ∪ HOT → non-root diff node (RAM only) */
+int   sf_snap_delta_restore(uint32_t dst_id, Error **errp);  /* RAM delta-restore (no device/clock) */
+
+/* ---- selftest fault injection (test-only; production never calls these) ----
+ * Each forces the RAM diff/delta machinery down a wrong path so a correctness
+ * check goes RED — proving the mechanism has teeth. Pass id=0xFFFFFFFF / false
+ * to disable. */
+void sf_resolve_inject_skip_node(uint32_t node_id);   /* sf_resolve skips this node */
+void sf_snap_inject_skip_hot(bool skip);              /* build_diff omits the HOT union */
+
 /* Restore with a device-replay skip-knob (HMP debug=/terminal SF_CP_SKIP). */
 int   sf_snap_restore_debug(uint32_t dst_id, const SfReplayDebug *debug,
                             Error **errp);

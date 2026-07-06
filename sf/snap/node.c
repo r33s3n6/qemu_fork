@@ -20,6 +20,15 @@ size_t       sf_n_blocks;
 
 static uint32_t g_next_id;
 
+/* selftest fault injection: sf_resolve skips the node with this id (0xFFFFFFFF
+ * = none). Test-only — production never sets it. */
+static uint32_t g_inject_skip_node = 0xFFFFFFFFU;
+
+void sf_resolve_inject_skip_node(uint32_t node_id)
+{
+    g_inject_skip_node = node_id;
+}
+
 static inline size_t sf_page_size(void)
 {
     return qemu_real_host_page_size();
@@ -164,6 +173,13 @@ void sf_blocks_destroy(void)
 
 SfPageKey sf_host_to_key(void *host_page)
 {
+    SfPageKey key = 0;
+    sf_host_to_key_safe(host_page, &key);
+    return key;
+}
+
+bool sf_host_to_key_safe(void *host_page, SfPageKey *out)
+{
     size_t psize = sf_page_size();
 
     for (size_t i = 0; i < sf_n_blocks; i++) {
@@ -171,11 +187,11 @@ SfPageKey sf_host_to_key(void *host_page)
         if (host_page >= b->host &&
             (uint8_t *)host_page < (uint8_t *)b->host + b->len) {
             uint64_t off = (uint8_t *)host_page - (uint8_t *)b->host;
-            return SF_KEY((uint32_t)i, off / psize);
+            *out = SF_KEY((uint32_t)i, off / psize);
+            return true;
         }
     }
-    return 0;  /* unknown; key 0 is a valid key for block 0 pfn 0 — callers must
-                * only feed host pages known to be in a registered block */
+    return false;
 }
 
 uint8_t *sf_key_to_host(SfPageKey key)
@@ -264,6 +280,9 @@ uint8_t *sf_resolve(SfSnapNode *dst, SfPageKey key)
     size_t psize = sf_page_size();
 
     for (SfSnapNode *n = dst; n; n = n->parent) {
+        if (n->id == g_inject_skip_node) {
+            continue;   /* test injection: pretend this layer doesn't own key */
+        }
         int idx = sf_ramstore_lookup(&n->ram, key);
         if (idx >= 0 && n->ram.data) {
             return n->ram.data + (size_t)idx * psize;

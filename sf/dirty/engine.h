@@ -71,4 +71,24 @@ bool sf_dirty_have_snapshot(void);
  */
 uint8_t *sf_dirty_shadow_for(void *host_page, uint64_t *remain);
 
+/*
+ * Read-only access to the last collect() vector: the dirtied host page
+ * addresses (g_dirty, g_dirty_n entries). The snap layer's non-root diff save
+ * reads this to build the W key set. Valid until the next collect/clear.
+ */
+void *const *sf_dirty_collected(size_t *n);
+
+/*
+ * Iterate the HOT policy set (host page addresses restored unconditionally).
+ * @cb is called for each HOT page; the snap layer unions these into W.
+ */
+void sf_dirty_iter_hot(void (*cb)(void *host_page, void *user), void *user);
+
+/*
+ * Clear the collected vector (g_dirty_n = 0; capacity kept). The snap layer's
+ * non-root save reads the vector then clears it so the next collect starts fresh
+ * (collect appends; without a clear, consecutive collects accumulate).
+ */
+void sf_dirty_clear_collected(void);
+
 #endif /* SF_DIRTY_ENGINE_H */

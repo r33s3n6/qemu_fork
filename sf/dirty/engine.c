@@ -106,6 +106,30 @@ bool sf_dirty_have_snapshot(void)
     return g_have_snapshot;
 }
 
+void *const *sf_dirty_collected(size_t *n)
+{
+    *n = g_dirty_n;
+    return g_dirty;
+}
+
+void sf_dirty_iter_hot(void (*cb)(void *host_page, void *user), void *user)
+{
+    if (!g_hot || !cb) {
+        return;
+    }
+    GHashTableIter it;
+    gpointer key;
+    g_hash_table_iter_init(&it, g_hot);
+    while (g_hash_table_iter_next(&it, &key, NULL)) {
+        cb(key, user);
+    }
+}
+
+void sf_dirty_clear_collected(void)
+{
+    g_dirty_n = 0;
+}
+
 int sf_dirty_snapshot(Error **errp)
 {
     RAMBlock *block;

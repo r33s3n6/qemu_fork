@@ -35,6 +35,7 @@
 #include "sf/vmstate_replay/buffer.h"
 #include "sf/vmstate_replay/preparse.h"
 #include "sf/vmstate_replay/replay.h"
+#include "sf/snap/node.h"
 #include "sf/selftest/selftest.h"
 
 /* Must match the sf-rig dirty workload (ARCHITECTURE.md §6): a spin loop that
@@ -559,6 +560,178 @@ static void sf_selftest_tsc(Monitor *mon, bool *all_ok)
     sf_replay_tables_destroy(&t);
 }
 
+/* ---- M3 multi-level snap cases (T2/T3, plan -04 §7 cases 1-4) ------------
+ * RAM-only cores (sf_snap_ram_root / build_diff / delta_restore) — no device,
+ * no hot-profile guard — so they run under pc KVM like ①②③. dirty.elf writes
+ * every page each pass, so we watch P0 (0x300000) and rely on it changing.
+ */
+
+/* Build a RUN diff layer on top of sf_active and make it active. */
+static SfSnapNode *sf_make_layer(Monitor *mon, bool *all_ok)
+{
+    Error *err = NULL;
+    SfSnapNode *n = sf_snap_build_diff(sf_active, SF_SNAP_RUN, &err);
+    if (!n) {
+        monitor_printf(mon, "sf: selftest[snap] build_diff FAILED: %s\n",
+                       error_get_pretty(err));
+        error_free(err);
+        *all_ok = false;
+        return NULL;
+    }
+    sf_active = n;
+    return n;
+}
+
+static bool sf_snap_root(Monitor *mon)
+{
+    Error *err = NULL;
+    SfSnapNode *r = sf_snap_ram_root(&err);
+    if (!r) {
+        monitor_printf(mon, "sf: selftest[snap] ram_root FAILED: %s\n",
+                       error_get_pretty(err));
+        error_free(err);
+        return false;
+    }
+    return true;
+}
+
+static void sf_selftest_snap(Monitor *mon, bool *all_ok)
+{
+    char buf[192];
+    Error *err = NULL;
+
+    if (!kvm_enabled() || !sf_kvm_dirty_ring_enabled()) {
+        monitor_printf(mon, "sf: selftest[snap 1-4]: SKIPPED "
+                       "(needs KVM + dirty ring + running guest)\n");
+        return;
+    }
+
+    /* ---- Case A: cross-layer resolve + same-layer loop + resolve teeth ---- */
+    {
+        if (!sf_snap_root(mon)) { *all_ok = false; return; }
+        uint32_t v0 = sf_rd32(SF_ST_BASE);
+        sf_run_guest_ms(20);
+        uint32_t v1 = sf_rd32(SF_ST_BASE);
+        SfSnapNode *L1 = sf_make_layer(mon, all_ok);
+        sf_run_guest_ms(20);
+        uint32_t v2 = sf_rd32(SF_ST_BASE);
+        SfSnapNode *L2 = sf_make_layer(mon, all_ok);
+        if (!L1 || !L2) { return; }
+
+        /* cross-layer: active=L2 → restore L1 ⇒ P0 must be L1's value v1. */
+        sf_snap_delta_restore(L1->id, &err); error_free(err); err = NULL;
+        bool cross = (sf_rd32(SF_ST_BASE) == v1);
+
+        /* same-layer loop: active=L1, dirty, restore L1 ⇒ P0 stays v1. */
+        sf_run_guest_ms(20);
+        uint32_t v3 = sf_rd32(SF_ST_BASE);
+        sf_snap_delta_restore(L1->id, &err); error_free(err); err = NULL;
+        bool same = (sf_rd32(SF_ST_BASE) == v1) && (v3 != v1);
+        (void)v0; (void)v2;
+
+        snprintf(buf, sizeof(buf), "cross=%d same-layer=%d (v1=%u v3=%u -> %u)",
+                 cross, same, v1, v3, sf_rd32(SF_ST_BASE));
+        report(mon, all_ok, "A cross+same-layer resolve", cross && same, buf);
+
+        /* teeth: resolve skips L1 → restore L1 gives root's v0, not v1. */
+        sf_resolve_inject_skip_node(L1->id);
+        /* re-run to rebuild a leaf above L1 so src != dst. */
+        sf_run_guest_ms(20);
+        SfSnapNode *L2b = sf_make_layer(mon, all_ok);
+        if (L2b) {
+            sf_snap_delta_restore(L1->id, &err); error_free(err); err = NULL;
+            uint32_t got = sf_rd32(SF_ST_BASE);
+            bool teeth = (got != v1);
+            snprintf(buf, sizeof(buf), "%s (got=%u want=%u v0=%u)",
+                     teeth ? "RED detected" : "BUG: resolve skip hidden",
+                     got, v1, v0);
+            report(mon, all_ok, "A-neg resolve-skip teeth", teeth, buf);
+        }
+        sf_resolve_inject_skip_node(0xFFFFFFFFU);
+    }
+
+    /* ---- Case B: save-integrity teeth (collect_skip drops a diff page) ---- */
+    {
+        if (!sf_snap_root(mon)) { *all_ok = false; return; }
+        uint32_t v0 = sf_rd32(SF_ST_BASE);
+        sf_run_guest_ms(20);
+        uint32_t v1 = sf_rd32(SF_ST_BASE);
+        void *host0 = sf_gpa_to_host(SF_ST_BASE);
+        sf_dirty_inject_collect_skip(host0);   /* build_diff's collect drops P0 */
+        SfSnapNode *L1 = sf_make_layer(mon, all_ok);
+        sf_dirty_inject_collect_skip(NULL);
+        if (!L1) { return; }
+        sf_run_guest_ms(20);
+        sf_snap_delta_restore(L1->id, &err); error_free(err); err = NULL;
+        uint32_t got = sf_rd32(SF_ST_BASE);
+        /* L1 missed P0 ⇒ restore resolves to root v0, not the saved v1. */
+        bool teeth = (got != v1);
+        snprintf(buf, sizeof(buf), "%s (got=%u v0=%u saved-v1=%u)",
+                 teeth ? "RED detected" : "BUG: dropped page hidden",
+                 got, v0, v1);
+        report(mon, all_ok, "B save-integrity teeth", teeth, buf);
+    }
+
+    /* ---- Case C: multi-level undo (chain → root) ---- */
+    {
+        if (!sf_snap_root(mon)) { *all_ok = false; return; }
+        uint32_t v0 = sf_rd32(SF_ST_BASE);
+        sf_run_guest_ms(20); sf_make_layer(mon, all_ok);
+        sf_run_guest_ms(20); sf_make_layer(mon, all_ok);
+        sf_run_guest_ms(20); SfSnapNode *L3 = sf_make_layer(mon, all_ok);
+        if (!L3) { return; }
+        sf_run_guest_ms(20);
+        /* restore all the way back to root ⇒ P0 == v0. */
+        SfSnapNode *root = sf_active;
+        while (root->parent) { root = root->parent; }
+        sf_snap_delta_restore(root->id, &err); error_free(err); err = NULL;
+        uint32_t got = sf_rd32(SF_ST_BASE);
+        bool ok = (got == v0);
+        snprintf(buf, sizeof(buf), "%s (got=%u v0=%u)",
+                 ok ? "rolled back to root" : "BUG: not root value", got, v0);
+        report(mon, all_ok, "C multi-level undo", ok, buf);
+    }
+
+    /* ---- Case D: HOT blind-spot teeth (HOT∪ saves a blind page) ---- */
+    {
+        void *host0 = sf_gpa_to_host(SF_ST_BASE);
+        sf_dirty_mark_hot((uint64_t)(uintptr_t)host0);
+
+        /* positive: P0 HOT + collect_skip (blind) ⇒ build_diff still saves P0. */
+        if (!sf_snap_root(mon)) { *all_ok = false; return; }
+        uint32_t v0 = sf_rd32(SF_ST_BASE);
+        sf_run_guest_ms(20);
+        uint32_t v1 = sf_rd32(SF_ST_BASE);
+        sf_dirty_inject_collect_skip(host0);
+        SfSnapNode *L1 = sf_make_layer(mon, all_ok);
+        sf_dirty_inject_collect_skip(NULL);
+        if (!L1) { return; }
+        sf_run_guest_ms(20);
+        sf_snap_delta_restore(L1->id, &err); error_free(err); err = NULL;
+        bool pos = (sf_rd32(SF_ST_BASE) == v1);
+
+        /* teeth: same but skip the HOT union ⇒ P0 not saved ⇒ restore misses it. */
+        if (!sf_snap_root(mon)) { *all_ok = false; return; }
+        sf_run_guest_ms(20);
+        uint32_t v1b = sf_rd32(SF_ST_BASE);
+        sf_dirty_inject_collect_skip(host0);
+        sf_snap_inject_skip_hot(true);
+        SfSnapNode *L1b = sf_make_layer(mon, all_ok);
+        sf_snap_inject_skip_hot(false);
+        sf_dirty_inject_collect_skip(NULL);
+        if (!L1b) { return; }
+        sf_run_guest_ms(20);
+        sf_snap_delta_restore(L1b->id, &err); error_free(err); err = NULL;
+        uint32_t got = sf_rd32(SF_ST_BASE);
+        bool teeth = (got != v1b);
+        (void)v0;
+        snprintf(buf, sizeof(buf), "pos=%d teeth=%s (got=%u saved=%u)",
+                 pos, teeth ? "RED detected" : "BUG: HOT skip hidden",
+                 got, v1b);
+        report(mon, all_ok, "D HOT blind-spot (pos+teeth)", pos && teeth, buf);
+    }
+}
+
 bool sf_selftest_all(Monitor *mon, Error **errp)
 {
     bool all_ok = true;
@@ -586,6 +759,7 @@ bool sf_selftest_all(Monitor *mon, Error **errp)
     sf_selftest_ram(mon, &all_ok);
     sf_selftest_cpu(mon, &all_ok);
     sf_selftest_tsc(mon, &all_ok);
+    sf_selftest_snap(mon, &all_ok);
 
     monitor_printf(mon, "sf: selftest overall: %s\n",
                    all_ok ? "GREEN (all cases as expected)" : "RED");

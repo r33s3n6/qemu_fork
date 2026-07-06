@@ -41,15 +41,22 @@
 ```
 sf/
 ├── ARCHITECTURE.md          本文件
-├── sf.h / sf.c              HMP 入口(hmp_sf_snapshot / _restore / _selftest),粘合各模块
+├── sf.h / sf.c              HMP + terminal 入口(hmp_sf_snapshot / _restore / _selftest /
+│                            _tree + sf_checkpoint_snapshot / _restore),薄胶水:vm_stop 拐杖 +
+│                            debug-knob 解析;核心在 snap/
 ├── meson.build             sf 源集,并入 system_ss
 ├── patch/unstatic-vmstate.patch   DP-C1:对 stock 的全部暴露改动(rebase 用)
 ├── vmstate_replay/         设备状态:预解析一次 / 回放多次
 │   ├── buffer.{c,h}        内存 buffer <-> QEMUFile(QIOChannelBuffer,替代 v11 已删的 qemu_fopen_ops)
 │   ├── preparse.{c,h}      带记录的真加载 → 三表(SfMblock / SfGet / SfPost)
 │   └── replay.{c,h}        [Task5] 重放三表 + 对拍 stock qemu_load_device_state
-├── dirty/                  RAM 脏页引擎:hot/cold 策略 + collect/restore/reset + ring-full(已实现 Task6)
-│   └── engine.{c,h}
+├── dirty/                  RAM 脏页引擎(机制层):collect/restore/reset + hot/cold + ring-full
+│   └── engine.{c,h}        (已实现 Task6;M3 起影子由 root 节点经 sf_dirty_shadow_for 引用)
+├── snap/                   [M3] 多层快照树(策略 + 存储层;设计 plans/2026-07-06-03)
+│   ├── node.{c,h}          SfSnapNode 树生命周期 + SfBlockDesc 块表 + SfPageKey +
+│   │                       SfRamStore(diff 存储) + sf_resolve(owner 解析,≤dst 最近 owner)
+│   └── restore.{c,h}       sf_snap_save / sf_snap_restore / _delete / _tree + 时钟收尾
+│                            (T1:只 root,RAM/device 委托 engine+preparse;T2/T3 上 diff+delta)
 ├── clock/                  [Task9] 跨 restore 时钟矩阵测量(rdtsc/kvmclock/clock_gettime)
 │   └── probe.{c,h}
 └── selftest/               故障注入自检(HMP sf_selftest 汇总用例①–⑤,已实现 Task7)

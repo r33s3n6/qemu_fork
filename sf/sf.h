@@ -18,4 +18,9 @@
 void sf_checkpoint_snapshot(void);
 void sf_checkpoint_restore(void);
 
+/* Test knob (defined in sf/snap/restore.c): true iff SF_CP_SKIP_TSC is set, so
+ * the terminal snapshot path can omit the forced TSC refreeze and the phase1.5
+ * T-TSC gate proves teeth. */
+bool sf_skip_tsc(void);
+
 #endif /* SF_SF_H */

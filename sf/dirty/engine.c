@@ -71,8 +71,9 @@ static inline void sf_dirty_push(void *host)
 }
 
 /* Locate the shadow that owns host page @p; return its shadow ptr + bytes
- * remaining from @p to the block end, or NULL. */
-static uint8_t *sf_shadow_for(void *p, uint64_t *remain)
+ * remaining from @p to the block end, or NULL. Exposed (sf_dirty_shadow_for)
+ * for the snap layer's root owner-resolution; the shadow stays engine-owned. */
+uint8_t *sf_dirty_shadow_for(void *p, uint64_t *remain)
 {
     for (size_t i = 0; i < g_n_shadows; i++) {
         SfRamShadow *s = &g_shadows[i];
@@ -193,7 +194,7 @@ uint64_t sf_dirty_collect(void)
 static inline uint32_t sf_restore_one(void *page, size_t psize)
 {
     uint64_t remain = 0;
-    uint8_t *src = sf_shadow_for(page, &remain);
+    uint8_t *src = sf_dirty_shadow_for(page, &remain);
     if (!src) {
         return 0; /* page outside any shadowed block */
     }

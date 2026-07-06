@@ -371,6 +371,14 @@ ERST
     },
 
     {
+        .name       = "sf_tree",
+        .args_type  = "",
+        .params     = "",
+        .help       = "sf (M3): dump the snapshot node tree (id/kind/state/active)",
+        .cmd        = hmp_sf_tree,
+    },
+
+    {
         .name       = "loadvm",
         .args_type  = "name:s",
         .params     = "tag",

@@ -62,4 +62,13 @@ void sf_dirty_inject_collect_skip(void *host_page);
 /* True iff a RAM snapshot is currently held. */
 bool sf_dirty_have_snapshot(void);
 
+/*
+ * Locate the shadow copy that owns host page @p (the root snapshot's per-block
+ * shadow). Returns the shadow pointer + bytes remaining to the block end, or
+ * NULL if @p is outside any shadowed block. Used by the snap layer's root
+ * owner-resolution (sf_resolve root兜底). The shadow stays owned by the engine
+ * (the RAM mechanism layer); snap/ only reads it.
+ */
+uint8_t *sf_dirty_shadow_for(void *host_page, uint64_t *remain);
+
 #endif /* SF_DIRTY_ENGINE_H */

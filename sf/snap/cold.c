@@ -95,6 +95,12 @@ int sf_cold_start(const char *dir, uint32_t dst_id, Error **errp)
     if (sf_snap_load(dir, &loaded, errp) < 0) {
         goto out;
     }
+    /* Rebuild the NO_RESTORE table from the manifest before restore, else a
+     * worker resuming from a snapshot (guest not re-running REGISTER_BUF) has an
+     * empty exclude table and restore rolls back its task buffer (§4.2-3). */
+    if (sf_exclude_reload(dir, errp) < 0) {
+        goto out;
+    }
     if (sf_rootstore_open_file(&loaded->ram, root_path, errp) < 0) {
         goto out;
     }

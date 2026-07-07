@@ -29,6 +29,18 @@ size_t sf_exclude_count(void)
     return g_excl_n;
 }
 
+bool sf_exclude_get(size_t i, uint64_t *host_start, uint64_t *size,
+                    uint32_t *buf_id)
+{
+    if (i >= g_excl_n) {
+        return false;
+    }
+    *host_start = g_excl[i].host_start;
+    *size = g_excl[i].host_end - g_excl[i].host_start;
+    *buf_id = g_excl[i].buf_id;
+    return true;
+}
+
 void sf_exclude_add(uint64_t host_start, uint64_t size, uint32_t buf_id)
 {
     size_t psize = qemu_real_host_page_size();

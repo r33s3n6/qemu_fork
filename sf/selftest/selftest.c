@@ -1399,6 +1399,16 @@ static void sf_selftest_cold_start(Monitor *mon, bool *all_ok)
     while (root->parent) {
         root = root->parent;
     }
+    /* §4.2-3 teeth: a NO_RESTORE range must survive persist → cold-start. Use a
+     * page other than the marker page so it does not perturb the RAM
+     * equivalence assert below. */
+    sf_exclude_clear();
+    {
+        void *hx = sf_gpa_to_host(SF_ST_BASE + SF_ST_PAGE);
+        if (hx) {
+            sf_exclude_add((uint64_t)(uintptr_t)hx, SF_ST_PAGE, 7);
+        }
+    }
     if (sf_snap_persist(root, dir, &err) < 0) {
         report(mon, all_ok, "8 cold-start", false, error_get_pretty(err));
         error_free(err);
@@ -1423,6 +1433,16 @@ static void sf_selftest_cold_start(Monitor *mon, bool *all_ok)
     report(mon, all_ok, "8 cold-start equivalence",
            hot == v1 && cold == hot, buf);
 
+    /* §4.2-3 teeth: cold-start rebuilt the NO_RESTORE table from the manifest
+     * (block-relative → this process's live host base). */
+    {
+        void *hx = sf_gpa_to_host(SF_ST_BASE + SF_ST_PAGE);
+        bool excl_ok = (sf_exclude_count() == 1) && hx && sf_excluded(hx);
+        snprintf(buf, sizeof(buf), "count=%zu hit=%d",
+                 sf_exclude_count(), (hx && sf_excluded(hx)));
+        report(mon, all_ok, "8 exclude-zone rebuilt from manifest", excl_ok, buf);
+    }
+
     {
         bool rejected = (sf_cold_start(dir, 0x7ffffffeU, &err) < 0);
         snprintf(buf, sizeof(buf), "invalid-id rejected=%d", rejected);
@@ -1432,6 +1452,7 @@ static void sf_selftest_cold_start(Monitor *mon, bool *all_ok)
     }
 
 out:
+    sf_exclude_clear();
     sf_rmrf_persist_dir(dir);
     g_free(dir);
 }

@@ -33,4 +33,9 @@ void sf_exclude_clear(void);
 /* Number of registered ranges (diagnostics / selftest). */
 size_t sf_exclude_count(void);
 
+/* Read range @i (0-based, i < sf_exclude_count) as host_start/size/buf_id.
+ * Used to persist the table into the manifest as block-relative offsets. */
+bool sf_exclude_get(size_t i, uint64_t *host_start, uint64_t *size,
+                    uint32_t *buf_id);
+
 #endif /* SF_SNAP_EXCLUDE_H */

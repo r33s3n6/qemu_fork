@@ -11,6 +11,7 @@
 #include "sf/dirty/engine.h"
 #include "sf/snap/node.h"
 #include "sf/snap/tripwire.h"
+#include "sf/snap/exclude.h"
 #include "sf/snap/persist.h"
 
 #define SF_MANIFEST_VERSION 1
@@ -105,13 +106,73 @@ static uint32_t sf_dev_crc(const SfDevCapture *dev)
     return dev->stream ? crc32c(0, dev->stream, dev->stream_len) : 0;
 }
 
+/* ---- manifest field builders (single source of truth for the on-disk schema;
+ * both sf_snap_persist (full tree) and sf_snap_promote (connected prefix) use
+ * these so the node/block/exclude layout only ever lives in one place). ---- */
+
+static void sf_manifest_put_blocks(QDict *man)
+{
+    QList *blocks = qlist_new();
+
+    for (size_t i = 0; i < sf_n_blocks; i++) {
+        QDict *b = qdict_new();
+        qdict_put_str(b, "idstr", sf_blocks[i].idstr);
+        qdict_put_int(b, "len", (int64_t)sf_blocks[i].len);
+        qlist_append_obj(blocks, QOBJECT(b));
+    }
+    qdict_put(man, "blocks", blocks);
+}
+
+static void sf_manifest_append_node(QList *nodes, SfSnapNode *n)
+{
+    QDict *nd = qdict_new();
+
+    qdict_put_int(nd, "id", n->id);
+    qdict_put_int(nd, "parent", n->parent ? (int64_t)n->parent->id : -1);
+    qdict_put_int(nd, "kind", n->kind);
+    qdict_put_int(nd, "depth", n->depth);
+    qdict_put_int(nd, "kvm_tsc", (int64_t)n->kvm.tsc);
+    qdict_put_int(nd, "dev_len", (int64_t)n->dev.stream_len);
+    qdict_put_int(nd, "dev_crc", sf_dev_crc(&n->dev));
+    qlist_append_obj(nodes, QOBJECT(nd));
+}
+
+/* NO_RESTORE table → manifest as block-relative offsets. Host bases differ per
+ * process, so a cold-started worker rebuilds host addresses from (block,off).
+ * §4.2-3: without this a worker resuming from snapshot X has an empty exclude
+ * table and restore rolls back its task buffer. */
+static void sf_manifest_put_exclude(QDict *man)
+{
+    QList *ex = qlist_new();
+    size_t psize = qemu_real_host_page_size();
+    size_t n = sf_exclude_count();
+
+    for (size_t i = 0; i < n; i++) {
+        uint64_t host_start, size;
+        uint32_t buf_id;
+        SfPageKey key;
+        QDict *e;
+
+        if (!sf_exclude_get(i, &host_start, &size, &buf_id) ||
+            !sf_host_to_key_safe((void *)(uintptr_t)host_start, &key)) {
+            continue;
+        }
+        e = qdict_new();
+        qdict_put_int(e, "block", SF_KEY_BLOCK(key));
+        qdict_put_int(e, "off", (int64_t)(SF_KEY_PFN(key) * psize));
+        qdict_put_int(e, "size", (int64_t)size);
+        qdict_put_int(e, "buf_id", buf_id);
+        qlist_append_obj(ex, QOBJECT(e));
+    }
+    qdict_put(man, "exclude", ex);
+}
+
 /* Append @n and its subtree (pre-order) to the manifest node list, writing each
  * non-root node's diff store + device stream. Sets *ret on the first failure. */
 static void sf_persist_walk(SfSnapNode *n, QList *nodes, const char *dir,
                             Error **errp, int *ret)
 {
     SfSnapNode *child;
-    QDict *nd;
     uint32_t dev_crc = 0;
     char dname[32];
 
@@ -134,15 +195,7 @@ static void sf_persist_walk(SfSnapNode *n, QList *nodes, const char *dir,
         return;
     }
 
-    nd = qdict_new();
-    qdict_put_int(nd, "id", n->id);
-    qdict_put_int(nd, "parent", n->parent ? (int64_t)n->parent->id : -1);
-    qdict_put_int(nd, "kind", n->kind);
-    qdict_put_int(nd, "depth", n->depth);
-    qdict_put_int(nd, "kvm_tsc", (int64_t)n->kvm.tsc);
-    qdict_put_int(nd, "dev_len", (int64_t)n->dev.stream_len);
-    qdict_put_int(nd, "dev_crc", dev_crc);
-    qlist_append_obj(nodes, QOBJECT(nd));
+    sf_manifest_append_node(nodes, n);
 
     QLIST_FOREACH(child, &n->children, sibling) {
         sf_persist_walk(child, nodes, dir, errp, ret);
@@ -153,7 +206,7 @@ int sf_snap_persist(SfSnapNode *root, const char *dir, Error **errp)
 {
     uint64_t root_len = 0;
     QDict *man;
-    QList *blocks, *nodes;
+    QList *nodes;
     char *ndir, *mpath;
     GString *json;
     int ret;
@@ -181,15 +234,8 @@ int sf_snap_persist(SfSnapNode *root, const char *dir, Error **errp)
     qdict_put_int(man, "version", SF_MANIFEST_VERSION);
     qdict_put_int(man, "page_size", qemu_real_host_page_size());
     qdict_put_int(man, "root_ram_len", (int64_t)root_len);
-
-    blocks = qlist_new();
-    for (size_t i = 0; i < sf_n_blocks; i++) {
-        QDict *b = qdict_new();
-        qdict_put_str(b, "idstr", sf_blocks[i].idstr);
-        qdict_put_int(b, "len", (int64_t)sf_blocks[i].len);
-        qlist_append_obj(blocks, QOBJECT(b));
-    }
-    qdict_put(man, "blocks", blocks);
+    sf_manifest_put_blocks(man);
+    sf_manifest_put_exclude(man);
 
     nodes = qlist_new();
     ret = 0;
@@ -350,33 +396,6 @@ static int sf_promote_check_parent_prefix(SfSnapNode *parent, const char *dir,
     return 0;
 }
 
-static void sf_manifest_put_blocks(QDict *man)
-{
-    QList *blocks = qlist_new();
-
-    for (size_t i = 0; i < sf_n_blocks; i++) {
-        QDict *b = qdict_new();
-        qdict_put_str(b, "idstr", sf_blocks[i].idstr);
-        qdict_put_int(b, "len", (int64_t)sf_blocks[i].len);
-        qlist_append_obj(blocks, QOBJECT(b));
-    }
-    qdict_put(man, "blocks", blocks);
-}
-
-static void sf_manifest_append_node(QList *nodes, SfSnapNode *n)
-{
-    QDict *nd = qdict_new();
-
-    qdict_put_int(nd, "id", n->id);
-    qdict_put_int(nd, "parent", n->parent ? (int64_t)n->parent->id : -1);
-    qdict_put_int(nd, "kind", n->kind);
-    qdict_put_int(nd, "depth", n->depth);
-    qdict_put_int(nd, "kvm_tsc", (int64_t)n->kvm.tsc);
-    qdict_put_int(nd, "dev_len", (int64_t)n->dev.stream_len);
-    qdict_put_int(nd, "dev_crc", sf_dev_crc(&n->dev));
-    qlist_append_obj(nodes, QOBJECT(nd));
-}
-
 static int sf_write_prefix_manifest(SfSnapNode *target, const char *dir,
                                     Error **errp)
 {
@@ -395,6 +414,7 @@ static int sf_write_prefix_manifest(SfSnapNode *target, const char *dir,
     qdict_put_int(man, "page_size", qemu_real_host_page_size());
     qdict_put_int(man, "root_ram_len", (int64_t)sf_blocks_root_len());
     sf_manifest_put_blocks(man);
+    sf_manifest_put_exclude(man);
     for (gint i = (gint)path->len - 1; i >= 0; i--) {
         sf_manifest_append_node(nodes, g_ptr_array_index(path, i));
     }
@@ -517,25 +537,24 @@ static int sf_load_validate_blocks(QDict *man, Error **errp)
 static int sf_load_check_root_ram(const char *dir, QDict *man, Error **errp)
 {
     char *path = g_build_filename(dir, "root.ram", NULL);
-    gchar *buf = NULL;
-    gsize len = 0;
-    GError *gerr = NULL;
     uint64_t want_len = (uint64_t)qdict_get_try_int(man, "root_ram_len", -1);
+    struct stat st;
     int ret = -1;
 
-    if (!g_file_get_contents(path, &buf, &len, &gerr)) {
-        error_setg(errp, "sf_snap_load: read root.ram: %s", gerr->message);
-        g_error_free(gerr);
+    /* root.ram is full guest RAM; only its length is validated here (§4.2-5: no
+     * crc). Stat it — reading the whole file just to check size is O(RAM) waste,
+     * and the cold-start core fstat+mmaps it again right after. */
+    if (stat(path, &st) < 0) {
+        error_setg_errno(errp, errno, "sf_snap_load: stat root.ram");
         goto out;
     }
-    if (len != want_len) {
-        error_setg(errp, "sf_snap_load: root.ram len %zu != manifest %" PRIu64,
-                   (size_t)len, want_len);
+    if ((uint64_t)st.st_size != want_len) {
+        error_setg(errp, "sf_snap_load: root.ram len %" PRIu64 " != manifest %"
+                   PRIu64, (uint64_t)st.st_size, want_len);
         goto out;
     }
     ret = 0;
 out:
-    g_free(buf);
     g_free(path);
     return ret;
 }
@@ -715,4 +734,65 @@ void sf_snap_free_loaded(SfSnapNode *root)
         sf_replay_tables_destroy(&root->dev.tables);
     }
     g_free(root);
+}
+
+int sf_exclude_reload(const char *dir, Error **errp)
+{
+    char *mpath = g_build_filename(dir, "manifest.json", NULL);
+    gchar *jstr = NULL;
+    gsize jlen = 0;
+    GError *gerr = NULL;
+    QObject *o;
+    QDict *man;
+    QList *ex;
+    const QListEntry *e;
+    int ret = -1;
+
+    if (!g_file_get_contents(mpath, &jstr, &jlen, &gerr)) {
+        error_setg(errp, "sf_exclude_reload: read manifest: %s", gerr->message);
+        g_error_free(gerr);
+        g_free(mpath);
+        return -1;
+    }
+    g_free(mpath);
+
+    o = qobject_from_json(jstr, errp);
+    g_free(jstr);
+    if (!o) {
+        return -1;
+    }
+    man = qobject_to(QDict, o);
+    if (!man) {
+        error_setg(errp, "sf_exclude_reload: manifest is not a JSON object");
+        goto out;
+    }
+
+    /* Rebuild from a clean slate: block-relative (block,off) → live host base. */
+    sf_exclude_clear();
+    ex = qobject_to(QList, qdict_get(man, "exclude"));
+    if (ex) {
+        QLIST_FOREACH_ENTRY(ex, e) {
+            QDict *ed = qobject_to(QDict, qlist_entry_obj(e));
+            uint32_t bid;
+            uint64_t off, size;
+
+            if (!ed) {
+                error_setg(errp, "sf_exclude_reload: exclude entry not an object");
+                goto out;
+            }
+            bid = (uint32_t)qdict_get_try_int(ed, "block", 0);
+            off = (uint64_t)qdict_get_try_int(ed, "off", 0);
+            size = (uint64_t)qdict_get_try_int(ed, "size", 0);
+            if (bid >= sf_n_blocks || off + size > sf_blocks[bid].len) {
+                error_setg(errp, "sf_exclude_reload: range out of block bounds");
+                goto out;
+            }
+            sf_exclude_add((uint64_t)(uintptr_t)((uint8_t *)sf_blocks[bid].host + off),
+                           size, (uint32_t)qdict_get_try_int(ed, "buf_id", 0));
+        }
+    }
+    ret = 0;
+out:
+    qobject_unref(o);
+    return ret;
 }

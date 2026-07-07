@@ -2,7 +2,7 @@
  * sf/ — stalefuzz fresh-backend restore engine.
  * HMP + terminal entry points. Thin glue over the snap layer (sf/snap/) which
  * owns the multi-level snapshot tree; RAM mechanism stays in sf/dirty/, device
- * replay in sf/vmstate_replay/. See sf/ARCHITECTURE.md + sf/snap/node.h.
+ * replay in sf/vmstate_replay/. See ../ARCHITECTURE.md (vendor/qemu/) + sf/snap/node.h.
  *
  * Clean-room: does NOT include or copy QEMU-Nyx code; Nyx is read only as
  * design reference.

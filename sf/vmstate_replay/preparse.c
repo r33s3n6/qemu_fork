@@ -335,11 +335,16 @@ static const SfSe *find_se(GArray *a, const char *idstr, uint32_t instance_id)
     return NULL;
 }
 
-/* ------------------------------------------------------------------ */
-int sf_preparse(SfReplayTables *out, Error **errp)
+/* ------------------------------------------------------------------ *
+ * 方案 B seam: serialize the current device state into an owned buffer *
+ * — the stock vmstate stream sf_preparse already produced then         *
+ * discarded. B keeps it so a persistent node carries its device state  *
+ * across process boundaries; cold start feeds it to sf_preparse_stream *
+ * to rebuild the replay tables.                                        *
+ * ------------------------------------------------------------------ */
+int sf_device_stream_capture(uint8_t **out_bytes, size_t *out_len, Error **errp)
 {
-    /* 1. Serialize current device state, reopen as a private input stream.
-     * Mirror stock savevm (savevm.c): publish the current runstate into
+    /* Mirror stock savevm (savevm.c): publish the current runstate into
      * global_state first, else globalstate's post_load rejects an empty one. */
     global_state_store();
     QEMUFile *wf = sf_qemufile_from_buffer_output();
@@ -350,8 +355,23 @@ int sf_preparse(SfReplayTables *out, Error **errp)
     const uint8_t *bytes;
     size_t len;
     sf_qemufile_get_output(wf, &bytes, &len);
+    *out_bytes = g_malloc(len);
+    memcpy(*out_bytes, bytes, len);
+    *out_len = len;
+    qemu_fclose(wf);
+    return 0;
+}
+
+/* Parse a device-state stream (@bytes owned by caller) into replay tables via
+ * the "recording real load" (preparse.h). Runs the stock info->get per field
+ * (advancing the stream, re-applying side effects with identical values) and
+ * records每个字段的回放落点; loads the stream into live device state as a
+ * side effect. Used by sf_preparse (current state) and cold start (a node's
+ * persisted stream). */
+int sf_preparse_stream(const uint8_t *bytes, size_t len, SfReplayTables *out,
+                       Error **errp)
+{
     QEMUFile *f = sf_qemufile_from_buffer_input(bytes, len);
-    qemu_fclose(wf); /* input holds a private copy */
 
     GArray *ses = g_array_new(FALSE, FALSE, sizeof(SfSe));
     sf_savevm_for_each_vmsd(collect_se, ses);
@@ -459,6 +479,22 @@ int sf_preparse(SfReplayTables *out, Error **errp)
     out->gets = (SfGet *)g_array_free(c.gets, FALSE);
     out->posts = (SfPost *)g_array_free(c.posts, FALSE);
     return 0;
+}
+
+/* Compose: capture the current device state + parse it. Behavior identical to
+ * the pre-split sf_preparse (in-process table build at save time). */
+int sf_preparse(SfReplayTables *out, Error **errp)
+{
+    uint8_t *bytes;
+    size_t len;
+    int ret;
+
+    if (sf_device_stream_capture(&bytes, &len, errp) < 0) {
+        return -1;
+    }
+    ret = sf_preparse_stream(bytes, len, out, errp);
+    g_free(bytes);
+    return ret;
 }
 
 void sf_replay_tables_destroy(SfReplayTables *t)

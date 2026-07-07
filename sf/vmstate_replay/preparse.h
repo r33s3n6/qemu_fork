@@ -61,6 +61,18 @@ typedef struct {
  */
 int sf_preparse(SfReplayTables *out, Error **errp);
 
+/*
+ * The two halves of sf_preparse, split for persistence (方案 B, plan 07):
+ *  - sf_device_stream_capture: serialize live device state into an owned buffer
+ *    (*out_bytes, caller g_free()s). This is the stock vmstate stream to persist.
+ *  - sf_preparse_stream: parse a stream (@bytes owned by caller) into @out.
+ * sf_preparse = capture + parse. Cold start uses sf_preparse_stream on a node's
+ * persisted stream to rebuild its tables.
+ */
+int sf_device_stream_capture(uint8_t **out_bytes, size_t *out_len, Error **errp);
+int sf_preparse_stream(const uint8_t *bytes, size_t len, SfReplayTables *out,
+                       Error **errp);
+
 void sf_replay_tables_destroy(SfReplayTables *t);
 
 #endif /* SF_VMSTATE_REPLAY_PREPARSE_H */

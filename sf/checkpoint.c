@@ -18,6 +18,7 @@
  */
 #include "qemu/osdep.h"
 #include "qemu/module.h"
+#include "qemu/main-loop.h"   /* bql_lock/bql_unlock */
 #include "qemu/notify.h"
 #include "system/memory.h"
 #include "system/address-spaces.h"
@@ -46,9 +47,21 @@ static void sf_cp_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         return;
     }
 
+    /* The region is lockless_io (see sf_cp_machine_done): under KVM this handler runs
+     * WITHOUT the BQL, so the boundary can later block waiting for a control-channel
+     * command without freezing the main loop (plan 2026-07-07-m3-control-channel §5.6,
+     * Nyx model). save/restore still need the BQL, so take it just around them. But
+     * the TCG I/O path already holds the BQL (cputlb BQL_LOCK_GUARD), so only take it
+     * when not already held — an unconditional bql_lock would recurse. Mirrors
+     * prepare_mmio_access's own release_lock logic. The generation counter is a plain
+     * host word, no lock needed. */
+    bool take_bql = !bql_locked();
+
     switch (val) {
     case SF_CP_SNAPSHOT:
+        if (take_bql) { bql_lock(); }
         sf_checkpoint_snapshot();
+        if (take_bql) { bql_unlock(); }
         g_sf_cp_generation = 0;
         break;
     case SF_CP_RESTORE:
@@ -56,7 +69,9 @@ static void sf_cp_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
          * bump the generation the guest reads via inl so it can tell it was
          * restored (gen k) apart from the first snapshot (gen 0). */
         g_sf_cp_generation++;
+        if (take_bql) { bql_lock(); }
         sf_checkpoint_restore();
+        if (take_bql) { bql_unlock(); }
         break;
     default:
         fprintf(stderr, "sf-cp: unknown cmd %" PRIu64 "\n", val);
@@ -78,6 +93,11 @@ static void sf_cp_machine_done(Notifier *n, void *unused)
 {
     memory_region_init_io(&sf_cp_io, NULL, &sf_cp_ops, NULL,
                           "sf-checkpoint", SF_CP_PORT_SIZE);
+    /* BQL-free dispatch: without this, prepare_mmio_access() would auto-take the
+     * BQL around sf_cp_write for the duration of the access. We want the boundary
+     * to run lock-free (so a future control-channel wait doesn't hold the BQL) and
+     * take the BQL ourselves only around save/restore (plan §5.6). */
+    memory_region_enable_lockless_io(&sf_cp_io);
     memory_region_add_subregion(get_system_io(), SF_CP_PORT, &sf_cp_io);
     fprintf(stderr, "sf-cp: channel registered at port 0x%x (size %d)\n",
             SF_CP_PORT, SF_CP_PORT_SIZE);

@@ -23,6 +23,7 @@
 #include "sf/vmstate_replay/replay.h"
 #include "sf/dirty/engine.h"
 #include "sf/snap/node.h"
+#include "sf/snap/cold.h"
 #include "sf/selftest/selftest.h"
 
 /* ---- device-replay debug skip-knob parsing (HMP debug=/terminal SF_CP_SKIP) ---- */
@@ -203,6 +204,27 @@ void hmp_sf_selftest(Monitor *mon, const QDict *qdict)
 void hmp_sf_tree(Monitor *mon, const QDict *qdict)
 {
     sf_snap_tree(mon);
+}
+
+void hmp_sf_cold_start(Monitor *mon, const QDict *qdict)
+{
+    const char *dir = qdict_get_str(qdict, "dir");
+    int64_t id = qdict_get_try_int(qdict, "id", 0);
+    Error *err = NULL;
+    bool was_running = runstate_is_running();
+
+    if (was_running) {
+        vm_stop(RUN_STATE_RESTORE_VM);
+    }
+    if (sf_cold_start(dir, (uint32_t)id, &err) < 0) {
+        monitor_printf(mon, "sf: cold-start failed: %s\n", error_get_pretty(err));
+        error_free(err);
+    } else {
+        monitor_printf(mon, "sf: cold-start ok: dir=%s id=%" PRId64 "\n", dir, id);
+    }
+    if (was_running) {
+        vm_start();
+    }
 }
 
 /* R3 spike (plan 2026-07-06-07 §3): research-only — verify EPT rebuild after a

@@ -210,6 +210,7 @@ static SfSnapNode *sf_load_node(QDict *nd, GHashTable *byid, Error **errp)
     int64_t parent_id = qdict_get_try_int(nd, "parent", -1);
 
     n->id = (uint32_t)qdict_get_try_int(nd, "id", 0);
+    sf_node_observe_id(n->id);
     n->kind = (SfSnapKind)qdict_get_try_int(nd, "kind", 0);
     n->depth = (uint32_t)qdict_get_try_int(nd, "depth", 0);
     n->kvm.tsc = (uint64_t)qdict_get_try_int(nd, "kvm_tsc", 0);

@@ -10,5 +10,6 @@ system_ss.add(files(
   'snap/exclude.c',
   'snap/tripwire.c',
   'snap/persist.c',
+  'snap/cold.c',
   'selftest/selftest.c',
 ))

@@ -173,8 +173,10 @@ int   sf_ramstore_open_file(SfRamStore *s, const char *path, Error **errp);
 uint64_t sf_blocks_root_len(void);
 int   sf_rootstore_create_anon(SfRamStore *s);
 int   sf_rootstore_create_file(SfRamStore *s, const char *path, Error **errp);
+int   sf_rootstore_open_file(SfRamStore *s, const char *path, Error **errp);
 int   sf_rootstore_seal(SfRamStore *s, Error **errp);
 uint8_t *sf_rootstore_page(const SfRamStore *s, SfPageKey key);
+void  sf_node_observe_id(uint32_t id);
 
 /* Owner resolution (design §3): ≤dst 的最近 owner 的 data page; root 兜底. */
 uint8_t *sf_resolve(SfSnapNode *dst, SfPageKey key);

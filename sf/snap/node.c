@@ -31,6 +31,13 @@ void sf_resolve_inject_skip_node(uint32_t node_id)
     g_inject_skip_node = node_id;
 }
 
+void sf_node_observe_id(uint32_t id)
+{
+    if (id >= g_next_id) {
+        g_next_id = id + 1;
+    }
+}
+
 /* ---- Node tree ---- */
 
 SfSnapNode *sf_node_new(SfSnapNode *parent, SfSnapKind kind)
@@ -458,6 +465,41 @@ int sf_rootstore_create_file(SfRamStore *s, const char *path, Error **errp)
     s->fd = fd;
     s->data = base;
     s->map_base = base;
+    s->path = g_strdup(path);
+    return 0;
+}
+
+int sf_rootstore_open_file(SfRamStore *s, const char *path, Error **errp)
+{
+    uint64_t len = sf_blocks_root_len();
+    struct stat st;
+    void *base;
+    int fd;
+
+    memset(s, 0, sizeof(*s));
+    s->backing = SF_BACKING_FILE;
+    s->fd = -1;
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        error_setg_errno(errp, errno, "sf_rootstore_open_file: open %s", path);
+        return -1;
+    }
+    if (fstat(fd, &st) < 0 || (uint64_t)st.st_size != len) {
+        error_setg(errp, "sf_rootstore_open_file: %s size mismatch", path);
+        close(fd);
+        return -1;
+    }
+    base = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);
+    if (base == MAP_FAILED) {
+        error_setg_errno(errp, errno, "sf_rootstore_open_file: mmap");
+        close(fd);
+        return -1;
+    }
+    s->fd = fd;
+    s->data = base;
+    s->map_base = base;
+    s->map_len = len;
     s->path = g_strdup(path);
     return 0;
 }

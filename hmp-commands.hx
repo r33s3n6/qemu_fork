@@ -395,6 +395,14 @@ ERST
     },
 
     {
+        .name       = "sf_cold_start",
+        .args_type  = "dir:F,id:i?",
+        .params     = "dir [id]",
+        .help       = "sf (M3): cold-start a persisted snapshot tree and restore to id",
+        .cmd        = hmp_sf_cold_start,
+    },
+
+    {
         .name       = "loadvm",
         .args_type  = "name:s",
         .params     = "tag",

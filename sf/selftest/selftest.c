@@ -45,6 +45,7 @@
 #include "sf/snap/exclude.h"
 #include "sf/snap/tripwire.h"
 #include "sf/snap/persist.h"
+#include "sf/snap/cold.h"
 #include "sf/selftest/selftest.h"
 
 /* Must match the sf-rig dirty workload (ARCHITECTURE.md §6): a spin loop that
@@ -1295,6 +1296,91 @@ out:
     g_free(dir);
 }
 
+/* ---- cold-start equivalence (selftest 8, HMP/debug-core path) ------------
+ * RAM-visible half of the cold-start contract: persist a file-backed root tree,
+ * compare hot restore(X) with sf_cold_start(dir, X). Device-stream end-to-end
+ * is covered later by the microvm selftest-8 rig; this case exercises the
+ * destructive core sequence: reset → root.ram MAP_PRIVATE remap → load manifest
+ * and diff stores → restore target → restart dirty tracking.
+ */
+static void sf_selftest_cold_start(Monitor *mon, bool *all_ok)
+{
+    char buf[192];
+    Error *err = NULL;
+    SfSnapNode *L1, *L2, *root;
+    char *dir;
+    uint32_t v1, hot, cold, l2_id;
+
+    if (!kvm_enabled() || !sf_kvm_dirty_ring_enabled()) {
+        monitor_printf(mon, "sf: selftest[cold-start 8]: SKIPPED "
+                       "(needs KVM + dirty ring)\n");
+        return;
+    }
+
+    dir = g_dir_make_tmp("sf-cold-XXXXXX", NULL);
+    if (!dir) {
+        report(mon, all_ok, "8 cold-start", false, "g_dir_make_tmp failed");
+        return;
+    }
+
+    setenv("SF_ROOT_DIR", dir, 1);
+    if (!sf_snap_root(mon)) {
+        unsetenv("SF_ROOT_DIR");
+        *all_ok = false;
+        goto out;
+    }
+    unsetenv("SF_ROOT_DIR");
+
+    sf_run_guest_ms(20);
+    v1 = sf_rd32(SF_ST_BASE);
+    L1 = sf_make_layer(mon, all_ok);
+    sf_run_guest_ms(20);
+    L2 = sf_make_layer(mon, all_ok);
+    if (!L1 || !L2) {
+        goto out;
+    }
+    l2_id = L2->id;
+    root = sf_active;
+    while (root->parent) {
+        root = root->parent;
+    }
+    if (sf_snap_persist(root, dir, &err) < 0) {
+        report(mon, all_ok, "8 cold-start", false, error_get_pretty(err));
+        error_free(err);
+        goto out;
+    }
+
+    if (sf_snap_delta_restore(L1->id, &err) < 0) {
+        report(mon, all_ok, "8 hot-restore baseline", false, error_get_pretty(err));
+        error_free(err);
+        goto out;
+    }
+    hot = sf_rd32(SF_ST_BASE);
+
+    if (sf_cold_start(dir, L1->id, &err) < 0) {
+        report(mon, all_ok, "8 cold-start", false, error_get_pretty(err));
+        error_free(err);
+        goto out;
+    }
+    cold = sf_rd32(SF_ST_BASE);
+    snprintf(buf, sizeof(buf), "hot=%u cold=%u target=%u L2=%u",
+             hot, cold, v1, l2_id);
+    report(mon, all_ok, "8 cold-start equivalence",
+           hot == v1 && cold == hot, buf);
+
+    {
+        bool rejected = (sf_cold_start(dir, 0x7ffffffeU, &err) < 0);
+        snprintf(buf, sizeof(buf), "invalid-id rejected=%d", rejected);
+        report(mon, all_ok, "8-neg cold-start bad-id teeth", rejected, buf);
+        error_free(err);
+        err = NULL;
+    }
+
+out:
+    sf_rmrf_persist_dir(dir);
+    g_free(dir);
+}
+
 /* ---- device stream persist/reparse round-trip (T6 方案 B, plan 07 §1) --------
  * The pc-testable half of device-stream persistence: capture a stock vmstate
  * stream, persist it to a file, read it back, re-preparse, and require the
@@ -1482,6 +1568,7 @@ bool sf_selftest_all(Monitor *mon, Error **errp)
     sf_selftest_tripwire(mon, &all_ok);
     sf_selftest_ramstore_file(mon, &all_ok);   /* host-only; runs under TCG + KVM */
     sf_selftest_persist(mon, &all_ok);          /* needs KVM + dirty ring */
+    sf_selftest_cold_start(mon, &all_ok);       /* needs KVM + dirty ring; destructive */
     sf_selftest_dev_stream(mon, &all_ok);       /* TCG only (reparse re-load) */
 
     monitor_printf(mon, "sf: selftest overall: %s\n",

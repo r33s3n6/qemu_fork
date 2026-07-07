@@ -63,6 +63,7 @@ static void sf_node_destroy_rec(SfSnapNode *n)
         QLIST_REMOVE(n, sibling);
     }
     sf_ramstore_destroy(&n->ram);
+    g_free(n->dev.stream);       /* NULL when not kept or capture failed */
     if (n->dev.have) {
         sf_replay_tables_destroy(&n->dev.tables);
         n->dev.have = false;

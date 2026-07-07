@@ -2,11 +2,13 @@
  * sf/snap/persist — snapshot-tree persistence (T6, plan 07 §1/§2, 方案 B).
  * Serialize a tree to a directory and load it back:
  *   <dir>/manifest.json     version/page_size/blocks/nodes(id,parent,kind,depth,
- *                           kvm_tsc)/root_ram len+crc
+ *                           kvm_tsc,dev_len,dev_crc)/root_ram len+crc
  *   <dir>/root.ram          root full-RAM shadow, raw block-order平铺(no hdr)
+ *   <dir>/root.dev          root device stream (stock vmstate; 方案 B), if kept
  *   <dir>/nodes/<id>.ram    each non-root diff store (SfRamStore FILE format)
- * Device streams (<id>.dev, 方案 B) are the next increment; this covers the RAM
- * + tree structure, which is testable in-process without the microvm rig.
+ *   <dir>/nodes/<id>.dev    each non-root device stream, if kept (RUN nodes: none)
+ * Load re-parses each present .dev via sf_preparse_stream to rebuild the replay
+ * tables (方案 B cold-start重建). Device-state真实端到端对拍待 microvm (selftest 8).
  *
  * Include qemu/osdep.h before this header.
  */

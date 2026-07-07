@@ -472,22 +472,44 @@ int sf_snap_delta_restore(uint32_t dst_id, Error **errp)
  * T2 device capture = re-preparse into the node (correct, pays the preparse cost
  * per save). T4 (plan 2026-07-06-05) evolves non-root capture into the cheap
  * reverse-memcpy from live; root stays preparse (one-time table-build cost).
+ *
+ * 方案 B (plan 07): when @keep_stream, the captured stock vmstate stream is
+ * retained in node->dev.stream so sf_snap_persist can write <id>.dev. ROOT and
+ * named layers keep it (persistable); RUN (ephemeral hot loop) does not, to avoid
+ * holding a stream per generation.
  */
-static int sf_snap_dev_capture(SfSnapNode *node)
+static int sf_snap_dev_capture(SfSnapNode *node, bool keep_stream)
 {
     Error *err = NULL;
+    uint8_t *bytes;
+    size_t len;
 
-    if (sf_preparse(&node->dev.tables, &err) < 0) {
-        monitor_printf(NULL, "sf: WARNING device preparse failed: %s "
+    if (sf_device_stream_capture(&bytes, &len, &err) < 0) {
+        monitor_printf(NULL, "sf: WARNING device stream capture failed: %s "
                        "(RAM snapshot still taken)\n", error_get_pretty(err));
         error_free(err);
         node->dev.have = false;
         return 0;
     }
+    if (sf_preparse_stream(bytes, len, &node->dev.tables, &err) < 0) {
+        monitor_printf(NULL, "sf: WARNING device preparse failed: %s "
+                       "(RAM snapshot still taken)\n", error_get_pretty(err));
+        error_free(err);
+        g_free(bytes);
+        node->dev.have = false;
+        return 0;
+    }
     if (!sf_validate_hot_profile(NULL, &node->dev.tables)) {
         sf_replay_tables_destroy(&node->dev.tables);
+        g_free(bytes);
         node->dev.have = false;
         return -EIO;
+    }
+    if (keep_stream) {
+        node->dev.stream = bytes;
+        node->dev.stream_len = len;
+    } else {
+        g_free(bytes);
     }
     node->dev.have = true;
     return 0;
@@ -517,7 +539,7 @@ int sf_snap_save(SfSnapKind kind, Error **errp)
             return -EIO;
         }
         if (timing) { tb = sf_now_ns(); }
-        if (sf_snap_dev_capture(node) < 0) {
+        if (sf_snap_dev_capture(node, true) < 0) {   /* root keeps its stream */
             sf_node_destroy(node);
             sf_dirty_destroy();
             sf_blocks_destroy();
@@ -568,7 +590,9 @@ int sf_snap_save(SfSnapKind kind, Error **errp)
     }
     node->kvm.tsc = t0_tsc;
     if (timing) { tb = sf_now_ns(); }
-    if (sf_snap_dev_capture(node) < 0) {
+    /* Named layers (CLEAN/SCHEMA/PREFIX) are persistable → keep the device
+     * stream; RUN is the ephemeral hot loop → discard it. */
+    if (sf_snap_dev_capture(node, kind != SF_SNAP_RUN) < 0) {
         sf_node_destroy(node);
         error_setg(errp, "sf_snap_save: hot-profile guard failed");
         return -EIO;

@@ -88,13 +88,36 @@ static int sf_persist_node_ram(const char *dir, SfSnapNode *n, Error **errp)
     return ret;
 }
 
+/* Write a device stream (方案 B) to <dir>/<name>; record its crc. No-op (*out_crc
+ * = 0) when the node has no stream (RUN, or capture failed) — load treats 0 as
+ * "no .dev". Caller records len separately (dev.stream_len). */
+static int sf_persist_dev(const char *dir, const char *name,
+                          const SfDevCapture *dev, uint32_t *out_crc,
+                          Error **errp)
+{
+    char *path;
+    int ret;
+
+    if (!dev->stream) {
+        *out_crc = 0;
+        return 0;
+    }
+    *out_crc = crc32c(0, dev->stream, dev->stream_len);
+    path = g_build_filename(dir, name, NULL);
+    ret = sf_write_file(path, dev->stream, dev->stream_len, errp);
+    g_free(path);
+    return ret;
+}
+
 /* Append @n and its subtree (pre-order) to the manifest node list, writing each
- * non-root node's diff store. Sets *ret on the first failure. */
+ * non-root node's diff store + device stream. Sets *ret on the first failure. */
 static void sf_persist_walk(SfSnapNode *n, QList *nodes, const char *dir,
                             Error **errp, int *ret)
 {
     SfSnapNode *child;
     QDict *nd;
+    uint32_t dev_crc = 0;
+    char dname[32];
 
     if (*ret) {
         return;
@@ -103,12 +126,26 @@ static void sf_persist_walk(SfSnapNode *n, QList *nodes, const char *dir,
         *ret = -1;
         return;
     }
+    if (n->parent) {
+        snprintf(dname, sizeof(dname), "nodes/%u.dev", n->id);
+    } else {
+        /* root's device stream lives next to root.ram (cold start feeds it to
+         * qemu_load_device_state / sf_preparse_stream). */
+        snprintf(dname, sizeof(dname), "root.dev");
+    }
+    if (sf_persist_dev(dir, dname, &n->dev, &dev_crc, errp) < 0) {
+        *ret = -1;
+        return;
+    }
+
     nd = qdict_new();
     qdict_put_int(nd, "id", n->id);
     qdict_put_int(nd, "parent", n->parent ? (int64_t)n->parent->id : -1);
     qdict_put_int(nd, "kind", n->kind);
     qdict_put_int(nd, "depth", n->depth);
     qdict_put_int(nd, "kvm_tsc", (int64_t)n->kvm.tsc);
+    qdict_put_int(nd, "dev_len", (int64_t)n->dev.stream_len);
+    qdict_put_int(nd, "dev_crc", dev_crc);
     qlist_append_obj(nodes, QOBJECT(nd));
 
     QLIST_FOREACH(child, &n->children, sibling) {
@@ -272,6 +309,61 @@ out:
     return ret;
 }
 
+/* Read <dir>/<name>, verify its crc against @want_crc, and re-preparse the device
+ * stream into @dev->tables (方案 B cold-start重建). want_crc == 0 means the node
+ * had no persisted stream (RUN / capture failed) → dev.have stays false, no file
+ * read. The stream bytes are freed after parsing: the replay tables are
+ * self-contained, and a loaded node doesn't need to re-persist. */
+static int sf_load_dev(const char *dir, const char *name, uint32_t want_crc,
+                       SfDevCapture *dev, Error **errp)
+{
+    char *path;
+    gchar *buf = NULL;
+    gsize len = 0;
+    GError *gerr = NULL;
+    int ret = -1;
+
+    if (want_crc == 0) {
+        dev->have = false;
+        return 0;
+    }
+    path = g_build_filename(dir, name, NULL);
+    if (!g_file_get_contents(path, &buf, &len, &gerr)) {
+        error_setg(errp, "sf_snap_load: read %s: %s", name, gerr->message);
+        g_error_free(gerr);
+        goto out;
+    }
+    if (crc32c(0, (const uint8_t *)buf, len) != want_crc) {
+        error_setg(errp, "sf_snap_load: %s crc mismatch", name);
+        goto out;
+    }
+    if (sf_preparse_stream((const uint8_t *)buf, len, &dev->tables, errp) < 0) {
+        goto out;
+    }
+    dev->have = true;
+    ret = 0;
+out:
+    g_free(buf);
+    g_free(path);
+    return ret;
+}
+
+/* Load a node's device stream based on its manifest entry: root → root.dev,
+ * non-root → nodes/<id>.dev. want_crc comes from the node's "dev_crc" field. */
+static int sf_load_node_dev(const char *dir, SfSnapNode *n, QDict *nd,
+                            Error **errp)
+{
+    uint32_t want_crc = (uint32_t)qdict_get_try_int(nd, "dev_crc", 0);
+    char dname[32];
+
+    if (n->parent) {
+        snprintf(dname, sizeof(dname), "nodes/%u.dev", n->id);
+    } else {
+        snprintf(dname, sizeof(dname), "root.dev");
+    }
+    return sf_load_dev(dir, dname, want_crc, &n->dev, errp);
+}
+
 int sf_snap_load(const char *dir, SfSnapNode **root_out, Error **errp)
 {
     char *mpath = g_build_filename(dir, "manifest.json", NULL);
@@ -349,6 +441,12 @@ int sf_snap_load(const char *dir, SfSnapNode **root_out, Error **errp)
                 goto out;   /* ret stays -1 */
             }
         }
+        /* Re-preparse this node's persisted device stream into replay tables
+         * (方案 B). No-op (dev.have=false) when dev_crc==0. Pre-order manifest
+         * → root first; each parse re-loads live device state, last one wins. */
+        if (sf_load_node_dev(dir, n, nd, errp) < 0) {
+            goto out;
+        }
     }
     if (!root) {
         error_setg(errp, "sf_snap_load: no root node in manifest");
@@ -381,6 +479,7 @@ void sf_snap_free_loaded(SfSnapNode *root)
         sf_snap_free_loaded(child);
     }
     sf_ramstore_destroy(&root->ram);
+    g_free(root->dev.stream);    /* NULL for loaded trees (stream freed after parse) */
     if (root->dev.have) {
         sf_replay_tables_destroy(&root->dev.tables);
     }

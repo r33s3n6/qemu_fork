@@ -92,11 +92,19 @@ typedef struct SfRamStore {
 /*
  * Device capture. T1 wraps the existing preparse replay tables (the root capture
  * IS the preparse). T4 (plan 2026-07-06-05) evolves this into per-node arenas
- * (mblock_arena + get_arena) captured from live state without re-serializing.
+ * (mblock_arena + get_arena) captured from live state without re-serializing).
+ *
+ * 方案 B persistence (plan 07): a persistable node also keeps the raw stock
+ * vmstate stream it was preparsed from, so sf_snap_persist can write <id>.dev
+ * and a cold start can re-preparse it. RUN nodes (ephemeral hot loop) don't keep
+ * the stream; ROOT and named layers (CLEAN/SCHEMA/PREFIX) do. stream is NULL
+ * when not kept (or when capture failed); freeing the node frees both.
  */
 typedef struct SfDevCapture {
     SfReplayTables tables;
-    bool           have;   /* preparse succeeded; restore replays iff true */
+    bool           have;       /* preparse succeeded; restore replays iff true */
+    uint8_t       *stream;     /* owned stock vmstate stream; NULL if not kept */
+    size_t         stream_len;
 } SfDevCapture;
 
 /*

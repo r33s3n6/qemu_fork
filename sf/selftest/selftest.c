@@ -1060,6 +1060,8 @@ static void sf_rmrf_persist_dir(const char *dir)
     g_free(nodes);
     p = g_build_filename(dir, "manifest.json", NULL); unlink(p); g_free(p);
     p = g_build_filename(dir, "root.ram", NULL); unlink(p); g_free(p);
+    p = g_build_filename(dir, "root.dev", NULL); unlink(p); g_free(p);
+    p = g_build_filename(dir, "node.dev", NULL); unlink(p); g_free(p);
     rmdir(dir);
 }
 
@@ -1129,6 +1131,157 @@ out:
     g_free(dir);
 }
 
+/* ---- device stream persist/reparse round-trip (T6 方案 B, plan 07 §1) --------
+ * The pc-testable half of device-stream persistence: capture a stock vmstate
+ * stream, persist it to a file, read it back, re-preparse, and require the
+ * rebuilt replay tables to equal the originals ("流留住 + 重解析出的表 == 原表").
+ * Teeth: a corrupted stream is rejected by sf_preparse_stream's framing check.
+ *
+ * Why this is TCG-only and tree-less: sf_preparse_stream re-loads device state
+ * into the live VM, which under KVM asserts (kvm_put_apicbase) — same constraint
+ * as ④⑤, so run under TCG. And sf_snap_persist needs the engine RAM shadow
+ * (sf_dirty_snapshot → KVM dirty ring), unavailable under TCG. So the full
+ * sf_snap_persist/load .dev integration is verified at microvm cold start
+ * (selftest 8, deferred); this case verifies the stream+reparse mechanics that
+ * underpin it, using the real sf_device_stream_capture + sf_preparse_stream.
+ */
+static bool sf_tables_eq(const SfReplayTables *a, const SfReplayTables *b)
+{
+    if (a->n_mblocks != b->n_mblocks || a->n_gets != b->n_gets ||
+        a->n_posts != b->n_posts) {
+        return false;
+    }
+    for (size_t i = 0; i < a->n_mblocks; i++) {
+        const SfMblock *x = &a->mblocks[i], *y = &b->mblocks[i];
+        if (x->size != y->size ||
+            (x->size && memcmp(x->copy, y->copy, x->size) != 0)) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < a->n_gets; i++) {
+        const SfGet *x = &a->gets[i], *y = &b->gets[i];
+        if (x->info != y->info || x->field != y->field || x->size != y->size ||
+            x->captured_len != y->captured_len ||
+            strcmp(x->vmsd_name, y->vmsd_name) ||
+            (x->captured_len && memcmp(x->captured, y->captured, x->captured_len))) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < a->n_posts; i++) {
+        const SfPost *x = &a->posts[i], *y = &b->posts[i];
+        if (x->vmsd != y->vmsd || x->is_pre != y->is_pre ||
+            x->version_id != y->version_id) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void sf_selftest_dev_stream(Monitor *mon, bool *all_ok)
+{
+    char buf[192];
+    Error *err = NULL;
+    char *dir, *path;
+    uint8_t *S = NULL;
+    size_t Slen = 0;
+    gchar *Sback = NULL;
+    gsize Sback_len = 0;
+    SfReplayTables A, B;
+    GError *gerr = NULL;
+    bool ok;
+
+    if (kvm_enabled()) {
+        monitor_printf(mon, "sf: selftest[dev-stream]: SKIPPED under KVM "
+                       "(preparse_stream re-load is KVM-unsafe; run under TCG)\n");
+        return;
+    }
+
+    if (sf_device_stream_capture(&S, &Slen, &err) < 0) {
+        report(mon, all_ok, "H dev-stream", false, error_get_pretty(err));
+        error_free(err);
+        return;
+    }
+    if (sf_preparse_stream(S, Slen, &A, &err) < 0) {
+        report(mon, all_ok, "H dev-stream", false, error_get_pretty(err));
+        error_free(err);
+        g_free(S);
+        return;
+    }
+
+    dir = g_dir_make_tmp("sf-devstream-XXXXXX", NULL);
+    if (!dir) {
+        report(mon, all_ok, "H dev-stream", false, "g_dir_make_tmp failed");
+        sf_replay_tables_destroy(&A);
+        g_free(S);
+        return;
+    }
+    path = g_build_filename(dir, "node.dev", NULL);
+    if (!g_file_set_contents(path, (gchar *)S, Slen, &gerr)) {
+        report(mon, all_ok, "H dev-stream", false, gerr->message);
+        g_error_free(gerr);
+        goto out;
+    }
+    if (!g_file_get_contents(path, &Sback, &Sback_len, &gerr)) {
+        report(mon, all_ok, "H dev-stream", false, gerr->message);
+        g_error_free(gerr);
+        goto out;
+    }
+    if (Sback_len != Slen || memcmp(Sback, S, Slen) != 0) {
+        report(mon, all_ok, "H dev-stream", false, "file round-trip bytes differ");
+        goto out;
+    }
+
+    if (sf_preparse_stream((const uint8_t *)Sback, Sback_len, &B, &err) < 0) {
+        report(mon, all_ok, "H dev-stream", false, error_get_pretty(err));
+        error_free(err);
+        err = NULL;
+        goto out;
+    }
+    ok = sf_tables_eq(&A, &B);
+    snprintf(buf, sizeof(buf), "tables match=%d (mblocks=%zu gets=%zu "
+             "posts=%zu stream=%zuB)", ok, A.n_mblocks, A.n_gets, A.n_posts,
+             Slen);
+    report(mon, all_ok, "H dev-stream reparse-eq", ok, buf);
+    sf_replay_tables_destroy(&B);
+
+    /* teeth: clobber the first stream byte to an invalid section type →
+     * sf_preparse_stream must reject it (framing), proving the reparse has
+     * teeth rather than silently accepting garbage. */
+    {
+        int fd = open(path, O_RDWR);
+        bool rejected = false;
+        if (fd >= 0) {
+            uint8_t bad = 0xFF;  /* not QEMU_VM_EOF(0) nor QEMU_VM_SECTION_FULL(1) */
+            if (pwrite(fd, &bad, 1, 0) == 1) {
+                gchar *clob = NULL;
+                gsize clen = 0;
+                if (g_file_get_contents(path, &clob, &clen, NULL)) {
+                    SfReplayTables T;
+                    rejected = (sf_preparse_stream((const uint8_t *)clob, clen,
+                                                   &T, &err) < 0);
+                    if (!rejected) {
+                        sf_replay_tables_destroy(&T);
+                    }
+                    error_free(err);
+                    err = NULL;
+                }
+                g_free(clob);
+            }
+            close(fd);
+        }
+        snprintf(buf, sizeof(buf), "corrupt-stream rejected=%d", rejected);
+        report(mon, all_ok, "H-neg dev-stream teeth", rejected, buf);
+    }
+
+out:
+    g_free(Sback);
+    g_free(path);
+    sf_rmrf_persist_dir(dir);
+    g_free(dir);
+    sf_replay_tables_destroy(&A);
+    g_free(S);
+}
+
 bool sf_selftest_all(Monitor *mon, Error **errp)
 {
     bool all_ok = true;
@@ -1165,6 +1318,7 @@ bool sf_selftest_all(Monitor *mon, Error **errp)
     sf_selftest_tripwire(mon, &all_ok);
     sf_selftest_ramstore_file(mon, &all_ok);   /* host-only; runs under TCG + KVM */
     sf_selftest_persist(mon, &all_ok);          /* needs KVM + dirty ring */
+    sf_selftest_dev_stream(mon, &all_ok);       /* TCG only (reparse re-load) */
 
     monitor_printf(mon, "sf: selftest overall: %s\n",
                    all_ok ? "GREEN (all cases as expected)" : "RED");

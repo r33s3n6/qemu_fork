@@ -132,11 +132,12 @@ void hmp_sf_snapshot(Monitor *mon, const QDict *qdict)
      */
     Error *err = NULL;
     bool was_running = runstate_is_running();
+    SfSnapKind kind = sf_active ? SF_SNAP_RUN : SF_SNAP_ROOT;
 
     if (was_running) {
         vm_stop(RUN_STATE_SAVE_VM);
     }
-    if (sf_snap_save(SF_SNAP_ROOT, &err) < 0) {
+    if (sf_snap_save(kind, &err) < 0) {
         monitor_printf(mon, "sf: snapshot failed: %s\n", error_get_pretty(err));
         error_free(err);
     }
@@ -247,6 +248,31 @@ void hmp_sf_persist(Monitor *mon, const QDict *qdict)
         return;
     }
     monitor_printf(mon, "sf: persist ok: dir=%s\n", dir);
+}
+
+void hmp_sf_promote(Monitor *mon, const QDict *qdict)
+{
+    const char *dir = qdict_get_str(qdict, "dir");
+    int64_t id = qdict_get_try_int(qdict, "id", -1);
+    SfSnapNode *node;
+    Error *err = NULL;
+
+    if (!sf_active) {
+        monitor_printf(mon, "sf: promote failed: no snapshot tree\n");
+        return;
+    }
+    node = id >= 0 ? sf_node_find((uint32_t)id) : sf_active;
+    if (!node) {
+        monitor_printf(mon, "sf: promote failed: node id %" PRId64 " not found\n",
+                       id);
+        return;
+    }
+    if (sf_snap_promote(node, dir, &err) < 0) {
+        monitor_printf(mon, "sf: promote failed: %s\n", error_get_pretty(err));
+        error_free(err);
+        return;
+    }
+    monitor_printf(mon, "sf: promote ok: dir=%s id=%u\n", dir, node->id);
 }
 
 /* R3 spike (plan 2026-07-06-07 §3): research-only — verify EPT rebuild after a

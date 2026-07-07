@@ -22,6 +22,12 @@
  * @dir (created if absent). Manifest written atomically (tmp+rename). */
 int  sf_snap_persist(SfSnapNode *root, const char *dir, Error **errp);
 
+/* Promote one connected prefix into @dir. Root may be promoted first; a
+ * non-root node is accepted only after its parent is already PERSISTED. The
+ * target node's RAM store is switched to file backing and manifest.json is
+ * rewritten to describe exactly root..target. */
+int  sf_snap_promote(SfSnapNode *node, const char *dir, Error **errp);
+
 /* Load a persisted tree from @dir into a fresh detached tree (*root_out).
  * Validates the manifest against the live block registry (idstr/len), root.ram
  * length, and each diff store's crc. Does NOT touch sf_active or remap guest

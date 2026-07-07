@@ -201,5 +201,6 @@ void hmp_sf_r3_spike(Monitor *mon, const QDict *qdict);
 void hmp_sf_remap_all(Monitor *mon, const QDict *qdict);
 void hmp_sf_cold_start(Monitor *mon, const QDict *qdict);
 void hmp_sf_persist(Monitor *mon, const QDict *qdict);
+void hmp_sf_promote(Monitor *mon, const QDict *qdict);
 
 #endif

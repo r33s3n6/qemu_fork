@@ -1271,6 +1271,61 @@ static void sf_selftest_persist(Monitor *mon, bool *all_ok)
     report(mon, all_ok, "G root-file-backed", root->ram.backing == SF_BACKING_FILE,
            buf);
     sf_snap_free_loaded(lroot);
+    lroot = NULL;
+
+    {
+        char *pdir = g_dir_make_tmp("sf-promote-XXXXXX", NULL);
+        char *orphan_dir = g_dir_make_tmp("sf-promote-orphan-XXXXXX", NULL);
+        SfSnapNode *pload = NULL;
+        bool rejected, root_ok, orphan_rejected = false, promote_ok;
+
+        if (!pdir || !orphan_dir) {
+            report(mon, all_ok, "G promote", false, "g_dir_make_tmp failed");
+        } else {
+            rejected = (sf_snap_promote(L2, pdir, &err) < 0);
+            error_free(err);
+            err = NULL;
+            root_ok = (sf_snap_promote(root, pdir, &err) == 0);
+            error_free(err);
+            err = NULL;
+            orphan_rejected = (sf_snap_promote(L1, orphan_dir, &err) < 0);
+            error_free(err);
+            err = NULL;
+            promote_ok = rejected &&
+                 root_ok &&
+                 orphan_rejected &&
+                 sf_snap_promote(L1, pdir, &err) == 0 &&
+                 sf_snap_promote(L2, pdir, &err) == 0 &&
+                 sf_snap_load(pdir, &pload, &err) == 0;
+            if (promote_ok) {
+                SfSnapNode *pL1 = QLIST_FIRST(&pload->children);
+                SfSnapNode *pL2 = pL1 ? QLIST_FIRST(&pL1->children) : NULL;
+                promote_ok = pL1 && pL2 &&
+                             QLIST_EMPTY(&pL2->children) &&
+                             pload->id == root->id &&
+                             pL1->id == L1->id &&
+                             pL2->id == L2->id &&
+                             root->state == SF_SNAP_PERSISTED &&
+                             L1->state == SF_SNAP_PERSISTED &&
+                             L2->state == SF_SNAP_PERSISTED &&
+                             L1->ram.backing == SF_BACKING_FILE &&
+                             L2->ram.backing == SF_BACKING_FILE;
+            }
+            snprintf(buf, sizeof(buf),
+                     "disconnected=%d orphan-dir=%d chain-only+file-backed=%d",
+                     rejected, orphan_rejected, promote_ok);
+            report(mon, all_ok, "G promote connected-prefix", promote_ok, buf);
+            if (pload) {
+                sf_snap_free_loaded(pload);
+            }
+            error_free(err);
+            err = NULL;
+            sf_rmrf_persist_dir(pdir);
+            sf_rmrf_persist_dir(orphan_dir);
+            g_free(pdir);
+            g_free(orphan_dir);
+        }
+    }
 
     /* teeth: clobber the manifest's first byte → load must fail. */
     {

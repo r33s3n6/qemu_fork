@@ -411,6 +411,14 @@ ERST
     },
 
     {
+        .name       = "sf_promote",
+        .args_type  = "dir:F,id:i?",
+        .params     = "dir [id]",
+        .help       = "sf (M3): promote active/id snapshot into a connected persisted prefix",
+        .cmd        = hmp_sf_promote,
+    },
+
+    {
         .name       = "loadvm",
         .args_type  = "name:s",
         .params     = "tag",

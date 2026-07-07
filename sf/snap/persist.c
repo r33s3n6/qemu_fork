@@ -100,6 +100,11 @@ static int sf_persist_dev(const char *dir, const char *name,
     return ret;
 }
 
+static uint32_t sf_dev_crc(const SfDevCapture *dev)
+{
+    return dev->stream ? crc32c(0, dev->stream, dev->stream_len) : 0;
+}
+
 /* Append @n and its subtree (pre-order) to the manifest node list, writing each
  * non-root node's diff store + device stream. Sets *ret on the first failure. */
 static void sf_persist_walk(SfSnapNode *n, QList *nodes, const char *dir,
@@ -202,6 +207,247 @@ int sf_snap_persist(SfSnapNode *root, const char *dir, Error **errp)
     return ret;
 }
 
+/* ---- promote side (connected prefix, in-place backing switch) ---- */
+
+static int sf_persist_ensure_dirs(const char *dir, Error **errp)
+{
+    char *ndir;
+    int ret;
+
+    if (g_mkdir_with_parents(dir, 0700) < 0) {
+        error_setg_errno(errp, errno, "sf_snap_promote: mkdir %s", dir);
+        return -1;
+    }
+    ndir = g_build_filename(dir, "nodes", NULL);
+    ret = g_mkdir_with_parents(ndir, 0700);
+    g_free(ndir);
+    if (ret < 0) {
+        error_setg_errno(errp, errno, "sf_snap_promote: mkdir nodes/");
+        return -1;
+    }
+    return 0;
+}
+
+static int sf_rebind_root_store(SfSnapNode *root, Error **errp)
+{
+    SfDirtyShadowDesc *shadows;
+    int ret;
+
+    shadows = g_new0(SfDirtyShadowDesc, sf_n_blocks);
+    for (size_t i = 0; i < sf_n_blocks; i++) {
+        SfBlockDesc *b = &sf_blocks[i];
+        shadows[i].host = b->host;
+        shadows[i].len = b->len;
+        shadows[i].shadow = root->ram.data + b->root_off;
+    }
+    ret = sf_dirty_use_external_shadows(shadows, sf_n_blocks, errp);
+    g_free(shadows);
+    return ret;
+}
+
+static int sf_promote_root_ram(SfSnapNode *root, const char *dir, Error **errp)
+{
+    char *path = g_build_filename(dir, "root.ram", NULL);
+    SfRamStore fs;
+    int ret;
+
+    if (!root->ram.data || root->ram.map_len != sf_blocks_root_len()) {
+        error_setg(errp, "sf_snap_promote: root backing missing/short");
+        g_free(path);
+        return -1;
+    }
+    if (root->ram.backing == SF_BACKING_FILE && root->ram.path &&
+        !strcmp(root->ram.path, path)) {
+        ret = sf_rootstore_seal(&root->ram, errp);
+        if (ret == 0) {
+            root->state = SF_SNAP_PERSISTED;
+        }
+        g_free(path);
+        return ret;
+    }
+
+    ret = sf_rootstore_create_file(&fs, path, errp);
+    if (ret == 0) {
+        memcpy(fs.data, root->ram.data, root->ram.map_len);
+        ret = sf_rootstore_seal(&fs, errp);
+    }
+    if (ret == 0) {
+        sf_ramstore_destroy(&root->ram);
+        root->ram = fs;
+        ret = sf_rebind_root_store(root, errp);
+        if (ret == 0) {
+            root->state = SF_SNAP_PERSISTED;
+        }
+    } else {
+        sf_ramstore_destroy(&fs);
+    }
+    g_free(path);
+    return ret;
+}
+
+static int sf_promote_node_ram(SfSnapNode *n, const char *dir, Error **errp)
+{
+    size_t psize = qemu_real_host_page_size();
+    char name[32];
+    char *path;
+    SfRamStore fs;
+    int ret;
+
+    snprintf(name, sizeof(name), "nodes/%u.ram", n->id);
+    path = g_build_filename(dir, name, NULL);
+    if (n->ram.backing == SF_BACKING_FILE && n->ram.path &&
+        !strcmp(n->ram.path, path)) {
+        ret = sf_ramstore_seal(&n->ram, errp);
+        if (ret == 0) {
+            n->state = SF_SNAP_PERSISTED;
+        }
+        g_free(path);
+        return ret;
+    }
+
+    ret = sf_ramstore_create_file(&fs, n->ram.n_pages, path, errp);
+    if (ret == 0) {
+        if (n->ram.n_pages) {
+            memcpy(fs.index, n->ram.index,
+                   (size_t)n->ram.n_pages * sizeof(SfPageKey));
+            memcpy(fs.data, n->ram.data, (size_t)n->ram.n_pages * psize);
+        }
+        ret = sf_ramstore_seal(&fs, errp);
+    }
+    if (ret == 0) {
+        sf_ramstore_destroy(&n->ram);
+        n->ram = fs;
+        n->state = SF_SNAP_PERSISTED;
+    } else {
+        sf_ramstore_destroy(&fs);
+    }
+    g_free(path);
+    return ret;
+}
+
+static int sf_promote_check_parent_prefix(SfSnapNode *parent, const char *dir,
+                                          Error **errp)
+{
+    for (SfSnapNode *n = parent; n; n = n->parent) {
+        char name[32];
+        char *path;
+        bool exists;
+
+        if (!n->parent) {
+            path = g_build_filename(dir, "root.ram", NULL);
+        } else {
+            snprintf(name, sizeof(name), "nodes/%u.ram", n->id);
+            path = g_build_filename(dir, name, NULL);
+        }
+        exists = g_file_test(path, G_FILE_TEST_IS_REGULAR);
+        if (!exists) {
+            error_setg(errp, "sf_snap_promote: parent prefix missing %s", path);
+            g_free(path);
+            return -EINVAL;
+        }
+        g_free(path);
+    }
+    return 0;
+}
+
+static void sf_manifest_put_blocks(QDict *man)
+{
+    QList *blocks = qlist_new();
+
+    for (size_t i = 0; i < sf_n_blocks; i++) {
+        QDict *b = qdict_new();
+        qdict_put_str(b, "idstr", sf_blocks[i].idstr);
+        qdict_put_int(b, "len", (int64_t)sf_blocks[i].len);
+        qlist_append_obj(blocks, QOBJECT(b));
+    }
+    qdict_put(man, "blocks", blocks);
+}
+
+static void sf_manifest_append_node(QList *nodes, SfSnapNode *n)
+{
+    QDict *nd = qdict_new();
+
+    qdict_put_int(nd, "id", n->id);
+    qdict_put_int(nd, "parent", n->parent ? (int64_t)n->parent->id : -1);
+    qdict_put_int(nd, "kind", n->kind);
+    qdict_put_int(nd, "depth", n->depth);
+    qdict_put_int(nd, "kvm_tsc", (int64_t)n->kvm.tsc);
+    qdict_put_int(nd, "dev_len", (int64_t)n->dev.stream_len);
+    qdict_put_int(nd, "dev_crc", sf_dev_crc(&n->dev));
+    qlist_append_obj(nodes, QOBJECT(nd));
+}
+
+static int sf_write_prefix_manifest(SfSnapNode *target, const char *dir,
+                                    Error **errp)
+{
+    GPtrArray *path = g_ptr_array_new();
+    QDict *man = qdict_new();
+    QList *nodes = qlist_new();
+    GString *json;
+    char *mpath;
+    int ret;
+
+    for (SfSnapNode *n = target; n; n = n->parent) {
+        g_ptr_array_add(path, n);
+    }
+
+    qdict_put_int(man, "version", SF_MANIFEST_VERSION);
+    qdict_put_int(man, "page_size", qemu_real_host_page_size());
+    qdict_put_int(man, "root_ram_len", (int64_t)sf_blocks_root_len());
+    sf_manifest_put_blocks(man);
+    for (gint i = (gint)path->len - 1; i >= 0; i--) {
+        sf_manifest_append_node(nodes, g_ptr_array_index(path, i));
+    }
+    qdict_put(man, "nodes", nodes);
+
+    json = qobject_to_json_pretty(QOBJECT(man), true);
+    mpath = g_build_filename(dir, "manifest.json", NULL);
+    ret = sf_write_file(mpath, json->str, json->len, errp);
+    g_free(mpath);
+    g_string_free(json, TRUE);
+    qobject_unref(man);
+    g_ptr_array_free(path, TRUE);
+    return ret;
+}
+
+int sf_snap_promote(SfSnapNode *node, const char *dir, Error **errp)
+{
+    uint32_t dev_crc = 0;
+    char dname[32];
+
+    if (!node) {
+        error_setg(errp, "sf_snap_promote: node required");
+        return -EINVAL;
+    }
+    if (node->parent && node->parent->state != SF_SNAP_PERSISTED) {
+        error_setg(errp, "sf_snap_promote: parent %u is not persisted",
+                   node->parent->id);
+        return -EINVAL;
+    }
+    if (sf_persist_ensure_dirs(dir, errp) < 0) {
+        return -1;
+    }
+
+    if (!node->parent) {
+        if (sf_promote_root_ram(node, dir, errp) < 0) {
+            return -1;
+        }
+        snprintf(dname, sizeof(dname), "root.dev");
+    } else {
+        if (sf_promote_check_parent_prefix(node->parent, dir, errp) < 0) {
+            return -EINVAL;
+        }
+        if (sf_promote_node_ram(node, dir, errp) < 0) {
+            return -1;
+        }
+        snprintf(dname, sizeof(dname), "nodes/%u.dev", node->id);
+    }
+    if (sf_persist_dev(dir, dname, &node->dev, &dev_crc, errp) < 0) {
+        return -1;
+    }
+    return sf_write_prefix_manifest(node, dir, errp);
+}
+
 /* ---- load side ---- */
 
 static SfSnapNode *sf_load_node(QDict *nd, GHashTable *byid, Error **errp)
@@ -214,7 +460,7 @@ static SfSnapNode *sf_load_node(QDict *nd, GHashTable *byid, Error **errp)
     n->kind = (SfSnapKind)qdict_get_try_int(nd, "kind", 0);
     n->depth = (uint32_t)qdict_get_try_int(nd, "depth", 0);
     n->kvm.tsc = (uint64_t)qdict_get_try_int(nd, "kvm_tsc", 0);
-    n->state = SF_SNAP_SEALED;
+    n->state = SF_SNAP_PERSISTED;
     n->ram.fd = -1;
     QLIST_INIT(&n->children);
 

@@ -9,5 +9,6 @@ system_ss.add(files(
   'snap/restore.c',
   'snap/exclude.c',
   'snap/tripwire.c',
+  'snap/persist.c',
   'selftest/selftest.c',
 ))

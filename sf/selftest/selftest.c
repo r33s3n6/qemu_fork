@@ -28,6 +28,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include "system/runstate.h"
+#include <glib/gstdio.h>   /* GDir for persist-test cleanup */
 #include "system/kvm.h"
 #include "system/hw_accel.h"
 #include "hw/core/cpu.h"
@@ -41,6 +42,7 @@
 #include "sf/snap/node.h"
 #include "sf/snap/exclude.h"
 #include "sf/snap/tripwire.h"
+#include "sf/snap/persist.h"
 #include "sf/selftest/selftest.h"
 
 /* Must match the sf-rig dirty workload (ARCHITECTURE.md §6): a spin loop that
@@ -1021,6 +1023,112 @@ out:
     g_free(dir);
 }
 
+/* ---- tree persist/load round-trip (T6, plan 07 §1) ---- *
+ * Build root→L1→L2 (dirtied pages), persist to a tmpdir, load into a fresh tree,
+ * and require the loaded chain (ids/parents) + each diff store (index+data) to
+ * match the live tree byte-for-byte. Teeth: a corrupted manifest is rejected.
+ * Needs KVM + dirty ring (to build diffs). */
+static bool sf_store_eq(const SfRamStore *a, const SfRamStore *b)
+{
+    size_t psize = qemu_real_host_page_size();
+    if (a->n_pages != b->n_pages) {
+        return false;
+    }
+    if (a->n_pages == 0) {
+        return true;
+    }
+    return memcmp(a->index, b->index, (size_t)a->n_pages * sizeof(SfPageKey)) == 0
+        && memcmp(a->data, b->data, (size_t)a->n_pages * psize) == 0;
+}
+
+static void sf_rmrf_persist_dir(const char *dir)
+{
+    char *nodes = g_build_filename(dir, "nodes", NULL);
+    GDir *d = g_dir_open(nodes, 0, NULL);
+    char *p;
+
+    if (d) {
+        const char *name;
+        while ((name = g_dir_read_name(d))) {
+            p = g_build_filename(nodes, name, NULL);
+            unlink(p);
+            g_free(p);
+        }
+        g_dir_close(d);
+    }
+    rmdir(nodes);
+    g_free(nodes);
+    p = g_build_filename(dir, "manifest.json", NULL); unlink(p); g_free(p);
+    p = g_build_filename(dir, "root.ram", NULL); unlink(p); g_free(p);
+    rmdir(dir);
+}
+
+static void sf_selftest_persist(Monitor *mon, bool *all_ok)
+{
+    char buf[192];
+    Error *err = NULL;
+    SfSnapNode *L1, *L2, *root, *lroot = NULL, *lL1, *lL2;
+    char *dir;
+
+    if (!kvm_enabled() || !sf_kvm_dirty_ring_enabled()) {
+        monitor_printf(mon, "sf: selftest[persist]: SKIPPED (needs KVM + dirty ring)\n");
+        return;
+    }
+
+    if (!sf_snap_root(mon)) { *all_ok = false; return; }
+    sf_run_guest_ms(20); L1 = sf_make_layer(mon, all_ok);
+    sf_run_guest_ms(20); L2 = sf_make_layer(mon, all_ok);
+    if (!L1 || !L2) { return; }
+    root = sf_active;
+    while (root->parent) { root = root->parent; }
+
+    dir = g_dir_make_tmp("sf-persist-XXXXXX", NULL);
+    if (!dir) { report(mon, all_ok, "G persist", false, "g_dir_make_tmp failed"); return; }
+
+    if (sf_snap_persist(root, dir, &err) < 0) {
+        report(mon, all_ok, "G persist", false, error_get_pretty(err));
+        error_free(err); goto out;
+    }
+    if (sf_snap_load(dir, &lroot, &err) < 0) {
+        report(mon, all_ok, "G persist", false, error_get_pretty(err));
+        error_free(err); goto out;
+    }
+
+    lL1 = QLIST_FIRST(&lroot->children);
+    lL2 = lL1 ? QLIST_FIRST(&lL1->children) : NULL;
+    bool ok = lL1 && lL2 &&
+              lroot->id == root->id && lL1->id == L1->id && lL2->id == L2->id &&
+              lL1->parent == lroot && lL2->parent == lL1 &&
+              sf_store_eq(&lL1->ram, &L1->ram) && sf_store_eq(&lL2->ram, &L2->ram);
+    snprintf(buf, sizeof(buf), "chain+stores match=%d (L1=%up L2=%up)",
+             ok, L1->ram.n_pages, L2->ram.n_pages);
+    report(mon, all_ok, "G persist roundtrip", ok, buf);
+    sf_snap_free_loaded(lroot);
+
+    /* teeth: clobber the manifest's first byte → load must fail. */
+    {
+        char *mpath = g_build_filename(dir, "manifest.json", NULL);
+        int fd = open(mpath, O_RDWR);
+        bool rejected = false;
+        SfSnapNode *bad = NULL;
+        if (fd >= 0 && pwrite(fd, "X", 1, 0) == 1) {
+            close(fd);
+            rejected = (sf_snap_load(dir, &bad, &err) < 0);
+            if (!rejected) { sf_snap_free_loaded(bad); }
+            error_free(err); err = NULL;
+        } else if (fd >= 0) {
+            close(fd);
+        }
+        g_free(mpath);
+        snprintf(buf, sizeof(buf), "corrupt-manifest rejected=%d", rejected);
+        report(mon, all_ok, "G-neg persist manifest teeth", rejected, buf);
+    }
+
+out:
+    sf_rmrf_persist_dir(dir);
+    g_free(dir);
+}
+
 bool sf_selftest_all(Monitor *mon, Error **errp)
 {
     bool all_ok = true;
@@ -1056,6 +1164,7 @@ bool sf_selftest_all(Monitor *mon, Error **errp)
     sf_selftest_snap(mon, &all_ok);
     sf_selftest_tripwire(mon, &all_ok);
     sf_selftest_ramstore_file(mon, &all_ok);   /* host-only; runs under TCG + KVM */
+    sf_selftest_persist(mon, &all_ok);          /* needs KVM + dirty ring */
 
     monitor_printf(mon, "sf: selftest overall: %s\n",
                    all_ok ? "GREEN (all cases as expected)" : "RED");

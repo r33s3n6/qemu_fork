@@ -474,9 +474,11 @@ int sf_snap_delta_restore(uint32_t dst_id, Error **errp)
  * reverse-memcpy from live; root stays preparse (one-time table-build cost).
  *
  * 方案 B (plan 07): when @keep_stream, the captured stock vmstate stream is
- * retained in node->dev.stream so sf_snap_persist can write <id>.dev. ROOT and
- * named layers keep it (persistable); RUN (ephemeral hot loop) does not, to avoid
- * holding a stream per generation.
+ * retained in node->dev.stream so sf_snap_persist can write <id>.dev. The
+ * control-channel plan makes retention the default for every snapshot, including
+ * RUN: promotion/cold-start may happen after creation, and the stream is only
+ * KB-scale. A future GC/promote API may explicitly drop it and mark the subtree
+ * non-promotable.
  */
 static int sf_snap_dev_capture(SfSnapNode *node, bool keep_stream)
 {
@@ -590,9 +592,9 @@ int sf_snap_save(SfSnapKind kind, Error **errp)
     }
     node->kvm.tsc = t0_tsc;
     if (timing) { tb = sf_now_ns(); }
-    /* Named layers (CLEAN/SCHEMA/PREFIX) are persistable → keep the device
-     * stream; RUN is the ephemeral hot loop → discard it. */
-    if (sf_snap_dev_capture(node, kind != SF_SNAP_RUN) < 0) {
+    /* Keep the stock vmstate stream for every snapshot. It is the only data
+     * needed to re-preparse this node after a later host promote/cold-start. */
+    if (sf_snap_dev_capture(node, true) < 0) {
         sf_node_destroy(node);
         error_setg(errp, "sf_snap_save: hot-profile guard failed");
         return -EIO;

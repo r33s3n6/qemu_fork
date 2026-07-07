@@ -6,7 +6,7 @@
  *   <dir>/root.ram          root full-RAM shadow, raw block-order平铺(no hdr)
  *   <dir>/root.dev          root device stream (stock vmstate; 方案 B), if kept
  *   <dir>/nodes/<id>.ram    each non-root diff store (SfRamStore FILE format)
- *   <dir>/nodes/<id>.dev    each non-root device stream, if kept (RUN nodes: none)
+ *   <dir>/nodes/<id>.dev    each retained non-root device stream
  * Load re-parses each present .dev via sf_preparse_stream to rebuild the replay
  * tables (方案 B cold-start重建). Device-state真实端到端对拍待 microvm (selftest 8).
  *

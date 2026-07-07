@@ -30,6 +30,8 @@ static int sf_write_file(const char *path, const void *buf, size_t len,
     return 0;
 }
 
+static int sf_write_all(int fd, const void *buf, size_t len);  /* defined below */
+
 /* root.ram = root node backing: each block concatenated in block_id order (raw,
  * no header — the layout lives in the manifest). File-backed root created in
  * the target dir seals in place; anon/debug root falls back to one O(RAM) write. */
@@ -80,27 +82,42 @@ static int sf_persist_node_ram(const char *dir, SfSnapNode *n, Error **errp)
     return ret;
 }
 
-/* Write a device stream (方案 B) to <dir>/<name>; record its crc in @out_crc
- * (if non-NULL). No-op (*out_crc = 0) when the node has no stream (RUN, or
- * capture failed) — load treats 0 as "no .dev". The crc is also recomputed by
- * sf_node_record_line, so persist/promote pass NULL when they only need the
- * file written. Caller records len separately (dev.stream_len). */
+/* Write a device stream (方案 B) to <dir>/<name> and fsync it. The fsync is the
+ * commit-point ordering guarantee for promote: the .dev must be durable BEFORE
+ * its nodes.log line is appended (snapshot-tree.md §5.2), otherwise a crash after
+ * the (fsync'd) log append but before the .dev pages hit disk would leave the log
+ * referencing a lost/short .dev → hard load failure. No-op when the node has no
+ * stream (RUN, or capture failed): no file is written, the record's dev_len stays
+ * 0, and load treats it as absent. Integrity is the record's dev_crc
+ * (sf_dev_crc), recomputed by sf_node_record_line — no out param here. */
 static int sf_persist_dev(const char *dir, const char *name,
-                          const SfDevCapture *dev, uint32_t *out_crc,
-                          Error **errp)
+                          const SfDevCapture *dev, Error **errp)
 {
     char *path;
-    int ret;
+    int fd, ret = -1;
 
     if (!dev->stream) {
-        if (out_crc) { *out_crc = 0; }
         return 0;
     }
-    if (out_crc) {
-        *out_crc = crc32c(0, dev->stream, dev->stream_len);
-    }
     path = g_build_filename(dir, name, NULL);
-    ret = sf_write_file(path, dev->stream, dev->stream_len, errp);
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        error_setg_errno(errp, errno, "sf_persist: open %s", path);
+        goto out;
+    }
+    if (sf_write_all(fd, dev->stream, dev->stream_len) < 0) {
+        error_setg_errno(errp, errno, "sf_persist: write %s", path);
+        goto out;
+    }
+    if (fsync(fd) < 0) {
+        error_setg_errno(errp, errno, "sf_persist: fsync %s", path);
+        goto out;
+    }
+    ret = 0;
+out:
+    if (fd >= 0) {
+        close(fd);
+    }
     g_free(path);
     return ret;
 }
@@ -150,7 +167,10 @@ static int sf_node_record_payload(const SfSnapNode *n, char *buf, size_t bufsz)
                     (long long)(n->parent ? (int64_t)n->parent->id : -1LL),
                     (int)n->kind, n->depth,
                     (uint64_t)n->kvm.tsc,
-                    (uint64_t)n->dev.stream_len,
+                    /* dev_len is the presence signal (load keys on it, not crc):
+                     * both fields track stream != NULL together so a real stream
+                     * whose crc happens to be 0 is not misread as absent. */
+                    (uint64_t)(n->dev.stream ? n->dev.stream_len : 0),
                     sf_dev_crc(&n->dev));
 }
 
@@ -303,7 +323,7 @@ static void sf_persist_walk(SfSnapNode *n, int log_fd, const char *dir,
          * qemu_load_device_state / sf_preparse_stream). */
         snprintf(dname, sizeof(dname), "root.dev");
     }
-    if (sf_persist_dev(dir, dname, &n->dev, NULL, errp) < 0) {
+    if (sf_persist_dev(dir, dname, &n->dev, errp) < 0) {
         *ret = -1;
         return;
     }
@@ -548,11 +568,12 @@ int sf_snap_promote(SfSnapNode *node, const char *dir, Error **errp)
         }
         snprintf(dname, sizeof(dname), "nodes/%u.dev", node->id);
     }
-    /* Write the device stream (fsync inside sf_write_file via g_file_set_contents
-     * is not guaranteed; the commit point below makes the append atomic anyway —
-     * a crash before the append leaves an orphan .dev/.ram the old log doesn't
-     * reference, which is harmless). */
-    if (sf_persist_dev(dir, dname, &node->dev, NULL, errp) < 0) {
+    /* Write + fsync the device stream BEFORE the commit point (sf_persist_dev
+     * fsyncs). Ordering: durable .ram (seal msync) + durable .dev, THEN the log
+     * append. A crash before the append leaves an orphan .dev/.ram the log never
+     * references (harmless); a crash after it finds both data files already on
+     * disk. */
+    if (sf_persist_dev(dir, dname, &node->dev, errp) < 0) {
         return -1;
     }
     /* Commit point: append THIS node's record only. We never rewrite the log, so
@@ -672,13 +693,15 @@ static int sf_load_node_ram(const char *dir, SfSnapNode *n, Error **errp)
     return r;
 }
 
-/* Read <dir>/<name>, verify its crc against @want_crc, and re-preparse the device
- * stream into @dev->tables (方案 B cold-start重建). want_crc == 0 means the node
- * had no persisted stream (RUN / capture failed) → dev.have stays false, no file
- * read. The stream bytes are freed after parsing: the replay tables are
- * self-contained, and a loaded node doesn't need to re-persist. */
-static int sf_load_dev(const char *dir, const char *name, uint32_t want_crc,
-                       SfDevCapture *dev, Error **errp)
+/* Read <dir>/<name>, verify length + crc, and re-preparse the device stream into
+ * @dev->tables (方案 B cold-start重建). Presence is keyed on @want_len (the
+ * record's dev_len): want_len == 0 means the node had no persisted stream (RUN /
+ * capture failed) → dev.have stays false, no file read. @want_crc gates integrity
+ * only (a real stream whose crc is 0 is still read, because want_len > 0). The
+ * stream bytes are freed after parsing: the replay tables are self-contained, and
+ * a loaded node doesn't need to re-persist. */
+static int sf_load_dev(const char *dir, const char *name, uint64_t want_len,
+                       uint32_t want_crc, SfDevCapture *dev, Error **errp)
 {
     char *path;
     gchar *buf = NULL;
@@ -686,7 +709,7 @@ static int sf_load_dev(const char *dir, const char *name, uint32_t want_crc,
     GError *gerr = NULL;
     int ret = -1;
 
-    if (want_crc == 0) {
+    if (want_len == 0) {
         dev->have = false;
         return 0;
     }
@@ -694,6 +717,11 @@ static int sf_load_dev(const char *dir, const char *name, uint32_t want_crc,
     if (!g_file_get_contents(path, &buf, &len, &gerr)) {
         error_setg(errp, "sf_snap_load: read %s: %s", name, gerr->message);
         g_error_free(gerr);
+        goto out;
+    }
+    if (len != want_len) {
+        error_setg(errp, "sf_snap_load: %s len %" G_GSIZE_FORMAT " != record %"
+                   PRIu64, name, len, want_len);
         goto out;
     }
     if (crc32c(0, (const uint8_t *)buf, len) != want_crc) {
@@ -721,7 +749,7 @@ static int sf_load_node_dev_rec(const char *dir, SfSnapNode *n,
     } else {
         snprintf(dname, sizeof(dname), "root.dev");
     }
-    return sf_load_dev(dir, dname, rec->dev_crc, &n->dev, errp);
+    return sf_load_dev(dir, dname, rec->dev_len, rec->dev_crc, &n->dev, errp);
 }
 
 static int sf_load_validate_blocks(QDict *man, Error **errp)

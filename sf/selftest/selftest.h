@@ -33,4 +33,14 @@ bool sf_selftest_all(Monitor *mon, Error **errp);
  */
 bool sf_r3_spike_run(Monitor *mon, hwaddr gpa);
 
+/*
+ * R3-full (plan 2026-07-06-07 §3): whole-RAM scale-up of the R3 spike — remap
+ * EVERY guest RAM block to a dump file with munmap+mmap(MAP_PRIVATE|MAP_FIXED),
+ * the Nyx shadow_memory.c:299-306 cold-start loop. Same three checks as R3
+ * (survived/advanced/tracked) at whole-RAM scale. Run under KVM + dirty ring
+ * with the sf-rig dirty workload. Destructive (leaves guest RAM file-mapped);
+ * research-only, not part of sf_selftest_all.
+ */
+bool sf_remap_all_run(Monitor *mon);
+
 #endif /* SF_SELFTEST_H */

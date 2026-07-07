@@ -387,6 +387,14 @@ ERST
     },
 
     {
+        .name       = "sf_remap_all",
+        .args_type  = "",
+        .params     = "",
+        .help       = "sf (M3 R3-full): remap ALL guest RAM blocks MAP_PRIVATE|MAP_FIXED to a dump file, verify whole-RAM EPT rebuild (research)",
+        .cmd        = hmp_sf_remap_all,
+    },
+
+    {
         .name       = "loadvm",
         .args_type  = "name:s",
         .params     = "tag",

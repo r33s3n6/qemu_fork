@@ -219,6 +219,15 @@ void hmp_sf_r3_spike(Monitor *mon, const QDict *qdict)
     sf_r3_spike_run(mon, (hwaddr)gpa);
 }
 
+/* R3-full (plan 2026-07-06-07 §3): whole-RAM scale-up of the R3 spike — remap
+ * every guest RAM block to a dump file (MAP_PRIVATE|MAP_FIXED), the Nyx
+ * shadow_memory.c:299-306 cold-start loop. Run under KVM + dirty ring with the
+ * sf-rig dirty workload. Destructive (leaves guest RAM file-mapped); research. */
+void hmp_sf_remap_all(Monitor *mon, const QDict *qdict)
+{
+    sf_remap_all_run(mon);
+}
+
 /* ---- Terminal CHECKPOINT entries (vcpu thread, no vm_stop) ---- */
 
 /*

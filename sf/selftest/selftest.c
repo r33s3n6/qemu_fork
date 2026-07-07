@@ -24,6 +24,8 @@
 #include "exec/cpu-common.h"
 #include "system/memory.h"
 #include "system/address-spaces.h"
+#include "system/ramblock.h"
+#include "system/ramlist.h"      /* RAMBLOCK_FOREACH (sf_remap_all) */
 #include <sys/mman.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -939,6 +941,156 @@ bool sf_r3_spike_run(Monitor *mon, hwaddr gpa)
     report(mon, NULL, "R3 remap EPT-rebuild", survived && advanced && tracked, buf);
 
     close(fd);
+    return survived && advanced && tracked;
+}
+
+/* ---- R3-full (plan 2026-07-06-07 §3): whole-RAM scale-up of the R3 spike ----
+ * Cold-start step 2 at full scale: remap EVERY guest RAM block to a dump file
+ * with munmap+mmap(MAP_PRIVATE|MAP_FIXED) — the Nyx shadow_memory.c:299-306
+ * loop. R3 proved one page rebuilds EPT; this proves the whole-RAM loop. Pause
+ * the guest, dump each block's live host memory to a tmp file (block-id order =
+ * root.ram layout), enable dirty logging, swap every block to its file slice,
+ * resume, and require the guest to survive + advance (a write reaches a
+ * CoW-private page) + the dirty ring to track it. Destructive: leaves guest RAM
+ * file-mapped (CoW); the VM keeps running on the mapping, but a later sf
+ * snapshot/restore would mix file-backed live RAM with the pre-remap shadow —
+ * reset the VM after spiking. */
+bool sf_remap_all_run(Monitor *mon)
+{
+    Error *err = NULL;
+    char buf[256];
+    RAMBlock *block;
+    struct { void *host; uint64_t len; uint64_t off; } *r;
+    int n = 0;
+    uint64_t total = 0, off = 0;
+    char tmpl[] = "/tmp/sf_remap_all_XXXXXX";
+    int fd;
+    uint8_t *file_map;
+    uint32_t pre, post;
+    uint64_t collected;
+    bool survived, advanced, tracked;
+
+    if (!kvm_enabled() || !sf_kvm_dirty_ring_enabled()) {
+        monitor_printf(mon, "sf-remap-all: SKIPPED (needs KVM + dirty ring)\n");
+        return false;
+    }
+
+    /* Pause the guest before touching its RAM — a whole-RAM remap while running
+     * would unmap the code the vcpu is executing. */
+    if (runstate_is_running()) {
+        vm_stop(RUN_STATE_PAUSED);
+    }
+
+    /* Collect blocks + file offsets (block-id order = root.ram layout, same as
+     * sf_persist_root_ram / sf_blocks_enumerate). */
+    RAMBLOCK_FOREACH(block) {
+        if (!block->host || !block->used_length) {
+            continue;
+        }
+        n++;
+        total += block->used_length;
+    }
+    if (n == 0) {
+        monitor_printf(mon, "sf-remap-all: no RAM blocks\n");
+        return false;
+    }
+    r = g_new(typeof(*r), n);
+    n = 0;
+    RAMBLOCK_FOREACH(block) {
+        if (!block->host || !block->used_length) {
+            continue;
+        }
+        r[n].host = block->host;
+        r[n].len = block->used_length;
+        r[n].off = off;
+        off += block->used_length;
+        n++;
+    }
+
+    /* Dump live RAM → tmp file via a writable shared mapping, then drop it so
+     * only the per-block MAP_PRIVATE remaps reference the file. */
+    fd = mkstemp(tmpl);
+    if (fd < 0) {
+        monitor_printf(mon, "sf-remap-all: mkstemp failed: %s\n", strerror(errno));
+        g_free(r);
+        return false;
+    }
+    unlink(tmpl);
+    if (ftruncate(fd, (off_t)total) != 0) {
+        monitor_printf(mon, "sf-remap-all: ftruncate failed: %s\n", strerror(errno));
+        close(fd);
+        g_free(r);
+        return false;
+    }
+    file_map = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (file_map == MAP_FAILED) {
+        monitor_printf(mon, "sf-remap-all: dump mmap failed: %s\n", strerror(errno));
+        close(fd);
+        g_free(r);
+        return false;
+    }
+    for (int i = 0; i < n; i++) {
+        memcpy(file_map + r[i].off, r[i].host, r[i].len);
+    }
+    munmap(file_map, total);
+
+    /* Enable KVM dirty logging so post-remap writes are tracked. The memslot's
+     * userspace address is unchanged (MAP_FIXED keeps it); KVM logs by GPA. */
+    if (sf_dirty_snapshot(&err) < 0) {
+        monitor_printf(mon, "sf-remap-all: snapshot failed: %s\n",
+                       error_get_pretty(err));
+        error_free(err);
+        close(fd);
+        g_free(r);
+        return false;
+    }
+
+    /* The swap: each block's host range → its file slice, MAP_PRIVATE|MAP_FIXED.
+     * KVM memslot is already registered; the mmu-notifier rebuilds EPT to the
+     * file-backed pages on next guest access (R3 proved this for one page; this
+     * loop is the whole-RAM version). */
+    for (int i = 0; i < n; i++) {
+        if (munmap(r[i].host, r[i].len) != 0) {
+            monitor_printf(mon, "sf-remap-all: munmap block %d failed: %s\n",
+                           i, strerror(errno));
+            close(fd);
+            g_free(r);
+            return false;
+        }
+        void *p = mmap(r[i].host, r[i].len,
+                       PROT_READ | PROT_WRITE | PROT_EXEC,
+                       MAP_PRIVATE | MAP_FIXED, fd, r[i].off);
+        if (p == MAP_FAILED) {
+            monitor_printf(mon, "sf-remap-all: mmap block %d failed: %s\n",
+                           i, strerror(errno));
+            close(fd);
+            g_free(r);
+            return false;
+        }
+    }
+
+    /* Reaching here means the remap didn't crash the process. Now run the guest:
+     * if EPT did NOT rebuild for some block, the vcpu faults on a stale mapping
+     * → SIGSEGV here (survived=false, observed by the caller as a crash). */
+    pre = sf_rd32(SF_ST_BASE);
+    sf_run_guest_ms(60);
+    post = sf_rd32(SF_ST_BASE);
+    collected = sf_dirty_collect();
+
+    survived = true;            /* we're here → no stale-EPT crash */
+    advanced = (post != pre);   /* guest write reached a CoW-private page */
+    tracked = (collected > 0);  /* dirty ring saw the write(s) */
+    snprintf(buf, sizeof(buf),
+             "survived=%d advanced=%d tracked=%d (blocks=%d total=%lluB "
+             "pre=%u post=%u collected=%llu)",
+             survived, advanced, tracked, n, (unsigned long long)total,
+             pre, post, (unsigned long long)collected);
+    monitor_printf(mon, "sf-remap-all: %s\n", buf);
+    report(mon, NULL, "R3-full remap all-blocks",
+           survived && advanced && tracked, buf);
+
+    close(fd);
+    g_free(r);
     return survived && advanced && tracked;
 }
 

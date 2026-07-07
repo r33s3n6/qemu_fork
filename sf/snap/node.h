@@ -58,6 +58,7 @@ typedef struct SfBlockDesc {
     char     idstr[64];   /* RAMBlock idstr, for manifest/persistence */
     void    *host;        /* live RAMBlock host base */
     uint64_t len;         /* used_length at root creation */
+    uint64_t root_off;    /* offset in root.ram/root backing (block-order) */
 } SfBlockDesc;
 
 /* On-disk-ish header of a non-root SfRamStore (memory layout == file layout,
@@ -86,7 +87,9 @@ typedef struct SfRamStore {
     SfBacking   backing;
     uint32_t    n_pages;
     int         fd;        /* FILE backing fd; -1 for ANON */
+    void       *map_base;  /* FILE/root contiguous mmap base */
     size_t      map_len;   /* FILE: contiguous mmap length; 0 for ANON */
+    char       *path;      /* FILE backing path, for root.ram persist fast path */
 } SfRamStore;
 
 /*
@@ -164,6 +167,15 @@ int   sf_ramstore_create_file(SfRamStore *s, uint32_t n_pages, const char *path,
 int   sf_ramstore_seal(SfRamStore *s, Error **errp);
 int   sf_ramstore_open_file(SfRamStore *s, const char *path, Error **errp);
 
+/* Root backing: raw block-order contiguous bytes (no SfStoreHdr/index). This is
+ * root.ram's in-memory form. create_* copies no RAM; caller fills data using
+ * sf_blocks[i].root_off, then registers the slices with the dirty engine. */
+uint64_t sf_blocks_root_len(void);
+int   sf_rootstore_create_anon(SfRamStore *s);
+int   sf_rootstore_create_file(SfRamStore *s, const char *path, Error **errp);
+int   sf_rootstore_seal(SfRamStore *s, Error **errp);
+uint8_t *sf_rootstore_page(const SfRamStore *s, SfPageKey key);
+
 /* Owner resolution (design §3): ≤dst 的最近 owner 的 data page; root 兜底. */
 uint8_t *sf_resolve(SfSnapNode *dst, SfPageKey key);
 
@@ -177,7 +189,7 @@ int   sf_snap_restore(uint32_t dst_id, const SfReplayDebug *debug, Error **errp)
  * Production save/restore wrap these with device capture (T4) + clock tail.
  * Exposed so the RAM diff/delta mechanics are testable under pc KVM (where the
  * microvm hot-profile guard refuses the full preparse). */
-SfSnapNode *sf_snap_ram_root(Error **errp);   /* engine shadow + blocks + root node, sets sf_active */
+SfSnapNode *sf_snap_ram_root(Error **errp);   /* root backing + blocks + root node, sets sf_active */
 SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind,
                                Error **errp);  /* collect ∪ HOT → non-root diff node (RAM only) */
 int   sf_snap_delta_restore(uint32_t dst_id, Error **errp);  /* RAM delta-restore (no device/clock) */

@@ -19,12 +19,25 @@
  */
 typedef enum { SF_PAGE_COLD = 0, SF_PAGE_HOT } SfPagePolicy;
 
+typedef struct SfDirtyShadowDesc {
+    void    *host;    /* live RAMBlock host base */
+    uint64_t len;     /* RAMBlock used_length */
+    uint8_t *shadow;  /* root backing slice for this block */
+} SfDirtyShadowDesc;
+
 /*
  * Snapshot guest RAM: record a shadow copy of every RAMBlock and start dirty
  * tracking from a clean slate (all pages reprotected, bitmaps cleared).
  * Idempotent (drops any previous snapshot). Requires KVM dirty ring + BQL.
  */
 int sf_dirty_snapshot(Error **errp);
+
+/* Register an already-built root shadow/backing as the restore source and start
+ * dirty tracking from a clean slate. The engine does not own @descs[i].shadow.
+ * Used by the M3 snapshot tree so root.ram/SfRamStore is the single root
+ * backing, not a second private copy inside dirty/engine. */
+int sf_dirty_use_external_shadows(const SfDirtyShadowDesc *descs, size_t n_descs,
+                                  Error **errp);
 
 /*
  * Collect this round's dirtied pages into the to-restore set. Returns the

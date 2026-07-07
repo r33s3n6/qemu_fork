@@ -51,7 +51,7 @@ sf/
 │   ├── preparse.{c,h}      带记录的真加载 → 三表(SfMblock / SfGet / SfPost)
 │   └── replay.{c,h}        [Task5] 重放三表 + 对拍 stock qemu_load_device_state
 ├── dirty/                  RAM 脏页引擎(机制层):collect/restore/reset + hot/cold + ring-full
-│   └── engine.{c,h}        (已实现 Task6;M3 起影子由 root 节点经 sf_dirty_shadow_for 引用)
+│   └── engine.{c,h}        (已实现 Task6;M3 起 dirty engine 借用 root 节点 backing)
 ├── snap/                   [M3] 多层快照树(策略 + 存储层;设计 plans/2026-07-06-03)
 │   ├── node.{c,h}          SfSnapNode 树生命周期 + SfBlockDesc 块表 + SfPageKey +
 │   │                       SfRamStore(diff 存储) + sf_resolve(owner 解析,≤dst 最近 owner)

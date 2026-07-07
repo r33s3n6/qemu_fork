@@ -29,37 +29,28 @@ static int sf_write_file(const char *path, const void *buf, size_t len,
     return 0;
 }
 
-/* root.ram = each block's engine shadow concatenated in block_id order (raw, no
- * header — the layout lives in the manifest). */
-static int sf_persist_root_ram(const char *dir, uint64_t *out_len,
-                               uint32_t *out_crc, Error **errp)
+/* root.ram = root node backing: each block concatenated in block_id order (raw,
+ * no header — the layout lives in the manifest). File-backed root created in
+ * the target dir seals in place; anon/debug root falls back to one O(RAM) write. */
+static int sf_persist_root_ram(SfSnapNode *root, const char *dir,
+                               uint64_t *out_len, Error **errp)
 {
-    uint64_t total = 0, off = 0;
-    uint8_t *buf;
     char *path;
     int ret;
 
-    for (size_t i = 0; i < sf_n_blocks; i++) {
-        total += sf_blocks[i].len;
+    if (!root->ram.data || root->ram.map_len != sf_blocks_root_len()) {
+        error_setg(errp, "sf_persist: root backing missing/short");
+        return -1;
     }
-    buf = g_malloc(total);
-    for (size_t i = 0; i < sf_n_blocks; i++) {
-        uint64_t remain = 0;
-        uint8_t *shadow = sf_dirty_shadow_for(sf_blocks[i].host, &remain);
-        if (!shadow || remain < sf_blocks[i].len) {
-            g_free(buf);
-            error_setg(errp, "sf_persist: root shadow missing/short for block %zu", i);
-            return -1;
-        }
-        memcpy(buf + off, shadow, sf_blocks[i].len);
-        off += sf_blocks[i].len;
-    }
-    *out_len = total;
-    *out_crc = crc32c(0, buf, total);
+    *out_len = root->ram.map_len;
     path = g_build_filename(dir, "root.ram", NULL);
-    ret = sf_write_file(path, buf, total, errp);
+    if (root->ram.backing == SF_BACKING_FILE && root->ram.path &&
+        !strcmp(root->ram.path, path)) {
+        ret = sf_rootstore_seal(&root->ram, errp);
+    } else {
+        ret = sf_write_file(path, root->ram.data, root->ram.map_len, errp);
+    }
     g_free(path);
-    g_free(buf);
     return ret;
 }
 
@@ -156,7 +147,6 @@ static void sf_persist_walk(SfSnapNode *n, QList *nodes, const char *dir,
 int sf_snap_persist(SfSnapNode *root, const char *dir, Error **errp)
 {
     uint64_t root_len = 0;
-    uint32_t root_crc = 0;
     QDict *man;
     QList *blocks, *nodes;
     char *ndir, *mpath;
@@ -178,7 +168,7 @@ int sf_snap_persist(SfSnapNode *root, const char *dir, Error **errp)
         error_setg_errno(errp, errno, "sf_snap_persist: mkdir nodes/");
         return -1;
     }
-    if (sf_persist_root_ram(dir, &root_len, &root_crc, errp) < 0) {
+    if (sf_persist_root_ram(root, dir, &root_len, errp) < 0) {
         return -1;
     }
 
@@ -186,7 +176,6 @@ int sf_snap_persist(SfSnapNode *root, const char *dir, Error **errp)
     qdict_put_int(man, "version", SF_MANIFEST_VERSION);
     qdict_put_int(man, "page_size", qemu_real_host_page_size());
     qdict_put_int(man, "root_ram_len", (int64_t)root_len);
-    qdict_put_int(man, "root_ram_crc", root_crc);
 
     blocks = qlist_new();
     for (size_t i = 0; i < sf_n_blocks; i++) {
@@ -285,7 +274,6 @@ static int sf_load_check_root_ram(const char *dir, QDict *man, Error **errp)
     gsize len = 0;
     GError *gerr = NULL;
     uint64_t want_len = (uint64_t)qdict_get_try_int(man, "root_ram_len", -1);
-    uint32_t want_crc = (uint32_t)qdict_get_try_int(man, "root_ram_crc", 0);
     int ret = -1;
 
     if (!g_file_get_contents(path, &buf, &len, &gerr)) {
@@ -296,10 +284,6 @@ static int sf_load_check_root_ram(const char *dir, QDict *man, Error **errp)
     if (len != want_len) {
         error_setg(errp, "sf_snap_load: root.ram len %zu != manifest %" PRIu64,
                    (size_t)len, want_len);
-        goto out;
-    }
-    if (crc32c(0, (const uint8_t *)buf, len) != want_crc) {
-        error_setg(errp, "sf_snap_load: root.ram crc mismatch");
         goto out;
     }
     ret = 0;

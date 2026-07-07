@@ -29,6 +29,7 @@ typedef struct SfRamShadow {
     void    *host;   /* live RAMBlock host base */
     uint64_t len;    /* used_length at snapshot time */
     uint8_t *shadow; /* our copy of [host, host+len) */
+    bool     owned;  /* true when dirty/engine allocated shadow */
 } SfRamShadow;
 
 static SfRamShadow *g_shadows;
@@ -89,7 +90,9 @@ uint8_t *sf_dirty_shadow_for(void *p, uint64_t *remain)
 void sf_dirty_destroy(void)
 {
     for (size_t i = 0; i < g_n_shadows; i++) {
-        g_free(g_shadows[i].shadow);
+        if (g_shadows[i].owned) {
+            g_free(g_shadows[i].shadow);
+        }
     }
     g_free(g_shadows);
     g_shadows = NULL;
@@ -99,6 +102,39 @@ void sf_dirty_destroy(void)
     g_dirty_n = g_dirty_cap = 0;
     /* g_hot (policy) intentionally persists across snapshots. */
     g_have_snapshot = false;
+}
+
+static int sf_dirty_start_tracking(Error **errp)
+{
+    if (!sf_kvm_dirty_ring_enabled()) {
+        error_setg(errp, "KVM dirty ring not enabled "
+                   "(need -accel kvm,dirty-ring-size=N)");
+        return -ENOTSUP;
+    }
+
+    if (!g_log_started) {
+        if (!memory_global_dirty_log_start(GLOBAL_DIRTY_MIGRATION, errp)) {
+            return -EIO;
+        }
+        g_log_started = true;
+    }
+    return 0;
+}
+
+static void sf_dirty_clean_slate(void)
+{
+    if (!g_hot) {
+        g_hot = sf_set();
+    }
+    g_have_snapshot = true;
+
+    /*
+     * Start tracking from a clean slate: drain whatever is pending (this also
+     * reprotects those pages via KVM_RESET_DIRTY_RINGS) and clear the bitmaps
+     * so the next collect() only sees writes made after this snapshot.
+     */
+    sf_kvm_collect_dirty(NULL, NULL);
+    sf_kvm_dirty_reset_all();
 }
 
 bool sf_dirty_have_snapshot(void)
@@ -136,18 +172,9 @@ int sf_dirty_snapshot(Error **errp)
     size_t cap = 0, n = 0;
     SfRamShadow *shadows = NULL;
 
-    if (!sf_kvm_dirty_ring_enabled()) {
-        error_setg(errp, "KVM dirty ring not enabled "
-                   "(need -accel kvm,dirty-ring-size=N)");
-        return -ENOTSUP;
-    }
-
-    /* Enable global dirty logging once; keeps every RAM slot tracked. */
-    if (!g_log_started) {
-        if (!memory_global_dirty_log_start(GLOBAL_DIRTY_MIGRATION, errp)) {
-            return -EIO;
-        }
-        g_log_started = true;
+    int ret = sf_dirty_start_tracking(errp);
+    if (ret < 0) {
+        return ret;
     }
 
     /* Drop any previous snapshot (keep HOT policy set). */
@@ -166,6 +193,7 @@ int sf_dirty_snapshot(Error **errp)
             shadows[n].host = block->host;
             shadows[n].len = len;
             shadows[n].shadow = g_malloc(len);
+            shadows[n].owned = true;
             memcpy(shadows[n].shadow, block->host, len);
             n++;
         }
@@ -173,19 +201,40 @@ int sf_dirty_snapshot(Error **errp)
 
     g_shadows = shadows;
     g_n_shadows = n;
-    if (!g_hot) {
-        g_hot = sf_set();
+    sf_dirty_clean_slate();
+    return 0;
+}
+
+int sf_dirty_use_external_shadows(const SfDirtyShadowDesc *descs, size_t n_descs,
+                                  Error **errp)
+{
+    SfRamShadow *shadows;
+
+    int ret = sf_dirty_start_tracking(errp);
+    if (ret < 0) {
+        return ret;
     }
-    g_have_snapshot = true;
+    if (!descs || n_descs == 0) {
+        error_setg(errp, "sf_dirty_use_external_shadows: no root backing slices");
+        return -EINVAL;
+    }
 
-    /*
-     * Start tracking from a clean slate: drain whatever is pending (this also
-     * reprotects those pages via KVM_RESET_DIRTY_RINGS) and clear the bitmaps
-     * so the next collect() only sees writes made after this snapshot.
-     */
-    sf_kvm_collect_dirty(NULL, NULL);
-    sf_kvm_dirty_reset_all();
-
+    sf_dirty_destroy();
+    shadows = g_new0(SfRamShadow, n_descs);
+    for (size_t i = 0; i < n_descs; i++) {
+        if (!descs[i].host || !descs[i].len || !descs[i].shadow) {
+            g_free(shadows);
+            error_setg(errp, "sf_dirty_use_external_shadows: bad slice %zu", i);
+            return -EINVAL;
+        }
+        shadows[i].host = descs[i].host;
+        shadows[i].len = descs[i].len;
+        shadows[i].shadow = descs[i].shadow;
+        shadows[i].owned = false;
+    }
+    g_shadows = shadows;
+    g_n_shadows = n_descs;
+    sf_dirty_clean_slate();
     return 0;
 }
 

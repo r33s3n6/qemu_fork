@@ -2,7 +2,7 @@
  * sf/snap/persist — snapshot-tree persistence (T6, plan 07 §1/§2, 方案 B).
  * Serialize a tree to a directory and load it back:
  *   <dir>/manifest.json     version/page_size/blocks/nodes(id,parent,kind,depth,
- *                           kvm_tsc,dev_len,dev_crc)/root_ram len+crc
+ *                           kvm_tsc,dev_len,dev_crc)/root_ram_len
  *   <dir>/root.ram          root full-RAM shadow, raw block-order平铺(no hdr)
  *   <dir>/root.dev          root device stream (stock vmstate; 方案 B), if kept
  *   <dir>/nodes/<id>.ram    each non-root diff store (SfRamStore FILE format)
@@ -24,9 +24,9 @@ int  sf_snap_persist(SfSnapNode *root, const char *dir, Error **errp);
 
 /* Load a persisted tree from @dir into a fresh detached tree (*root_out).
  * Validates the manifest against the live block registry (idstr/len), root.ram
- * len+crc, and each diff store's crc. Does NOT touch sf_active or remap guest
- * RAM (cold start does that, T7); the loaded root's RAM stays empty so
- * in-process owner-resolution falls through to the live engine shadow. */
+ * length, and each diff store's crc. Does NOT touch sf_active or remap guest
+ * RAM (cold start does that, T7); the loaded root's RAM stays empty until the
+ * cold-start core maps root.ram as the root backing. */
 int  sf_snap_load(const char *dir, SfSnapNode **root_out, Error **errp);
 
 /* Free a tree returned by sf_snap_load (no tripwire side effects). */

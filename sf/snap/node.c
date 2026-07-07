@@ -80,6 +80,7 @@ void sf_node_destroy(SfSnapNode *n)
      * tripwire (no snapshot RAM to protect anymore). */
     if (n->parent == NULL) {
         sf_tripwire_arm(false);
+        sf_dirty_destroy();      /* drops borrowed root backing pointers first */
     }
     sf_node_destroy_rec(n);
 }
@@ -87,6 +88,17 @@ void sf_node_destroy(SfSnapNode *n)
 static SfSnapNode *sf_tree_root(void)
 {
     SfSnapNode *n = sf_active;
+    if (!n) {
+        return NULL;
+    }
+    while (n->parent) {
+        n = n->parent;
+    }
+    return n;
+}
+
+static SfSnapNode *sf_root_of(SfSnapNode *n)
+{
     if (!n) {
         return NULL;
     }
@@ -137,6 +149,7 @@ int sf_blocks_enumerate(Error **errp)
     RAMBlock *block;
     size_t cap = 0, n = 0;
     SfBlockDesc *descs = NULL;
+    uint64_t root_off = 0;
 
     sf_blocks_destroy();
 
@@ -151,8 +164,10 @@ int sf_blocks_enumerate(Error **errp)
             }
             descs[n].host = block->host;
             descs[n].len = block->used_length;
+            descs[n].root_off = root_off;
             g_strlcpy(descs[n].idstr, block->idstr ? block->idstr : "",
                       sizeof(descs[n].idstr));
+            root_off += descs[n].len;
             n++;
         }
     }
@@ -165,6 +180,15 @@ int sf_blocks_enumerate(Error **errp)
     sf_blocks = descs;
     sf_n_blocks = n;
     return 0;
+}
+
+uint64_t sf_blocks_root_len(void)
+{
+    uint64_t total = 0;
+    for (size_t i = 0; i < sf_n_blocks; i++) {
+        total += sf_blocks[i].len;
+    }
+    return total;
 }
 
 void sf_blocks_destroy(void)
@@ -233,8 +257,8 @@ void sf_ramstore_destroy(SfRamStore *s)
 {
     if (s->backing == SF_BACKING_FILE) {
         /* hdr/index/data all point into one contiguous mmap; free it as a whole. */
-        if (s->hdr && s->map_len) {
-            munmap(s->hdr, s->map_len);
+        if (s->map_base && s->map_len) {
+            munmap(s->map_base, s->map_len);
         }
         if (s->fd >= 0) {
             close(s->fd);
@@ -244,6 +268,7 @@ void sf_ramstore_destroy(SfRamStore *s)
         g_free(s->index);
         g_free(s->hdr);
     }
+    g_free(s->path);
     memset(s, 0, sizeof(*s));
     s->fd = -1;
 }
@@ -267,6 +292,7 @@ static size_t sf_store_map_len(uint32_t n_pages)
 /* Point hdr/index/data into a contiguous mapping @base of a store with n_pages. */
 static void sf_store_map_ptrs(SfRamStore *s, void *base, uint32_t n_pages)
 {
+    s->map_base = base;
     s->hdr = (SfStoreHdr *)base;
     s->index = n_pages ? (SfPageKey *)((uint8_t *)base + sf_store_index_off()) : NULL;
     s->data = n_pages ? (uint8_t *)base + sf_store_data_off(n_pages) : NULL;
@@ -302,6 +328,7 @@ int sf_ramstore_create_file(SfRamStore *s, uint32_t n_pages, const char *path,
     }
     s->fd = fd;
     s->map_len = map_len;
+    s->path = g_strdup(path);
     sf_store_map_ptrs(s, base, n_pages);
     s->hdr->magic = SF_STORE_MAGIC;
     s->hdr->version = SF_STORE_VERSION;
@@ -384,8 +411,88 @@ int sf_ramstore_open_file(SfRamStore *s, const char *path, Error **errp)
     s->fd = fd;
     s->map_len = want;
     s->n_pages = hdr->n_pages;
+    s->path = g_strdup(path);
     sf_store_map_ptrs(s, base, hdr->n_pages);
     return 0;
+}
+
+int sf_rootstore_create_anon(SfRamStore *s)
+{
+    uint64_t len = sf_blocks_root_len();
+
+    memset(s, 0, sizeof(*s));
+    s->backing = SF_BACKING_ANON;
+    s->fd = -1;
+    s->map_len = len;
+    s->data = len ? g_malloc(len) : NULL;
+    return 0;
+}
+
+int sf_rootstore_create_file(SfRamStore *s, const char *path, Error **errp)
+{
+    uint64_t len = sf_blocks_root_len();
+    void *base;
+    int fd;
+
+    memset(s, 0, sizeof(*s));
+    s->backing = SF_BACKING_FILE;
+    s->fd = -1;
+    s->map_len = len;
+
+    fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        error_setg_errno(errp, errno, "sf_rootstore_create_file: open %s", path);
+        return -1;
+    }
+    if (ftruncate(fd, len) < 0) {
+        error_setg_errno(errp, errno, "sf_rootstore_create_file: ftruncate");
+        close(fd);
+        return -1;
+    }
+    base = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (base == MAP_FAILED) {
+        error_setg_errno(errp, errno, "sf_rootstore_create_file: mmap");
+        close(fd);
+        return -1;
+    }
+    s->fd = fd;
+    s->data = base;
+    s->map_base = base;
+    s->path = g_strdup(path);
+    return 0;
+}
+
+int sf_rootstore_seal(SfRamStore *s, Error **errp)
+{
+    if (s->backing != SF_BACKING_FILE || !s->map_base) {
+        error_setg(errp, "sf_rootstore_seal: not a file-backed root store");
+        return -EINVAL;
+    }
+    if (msync(s->map_base, s->map_len, MS_SYNC) < 0) {
+        error_setg_errno(errp, errno, "sf_rootstore_seal: msync");
+        return -1;
+    }
+    if (mprotect(s->map_base, s->map_len, PROT_READ) < 0) {
+        error_setg_errno(errp, errno, "sf_rootstore_seal: mprotect RO");
+        return -1;
+    }
+    return 0;
+}
+
+uint8_t *sf_rootstore_page(const SfRamStore *s, SfPageKey key)
+{
+    size_t psize = qemu_real_host_page_size();
+    uint32_t bid = SF_KEY_BLOCK(key);
+    uint64_t off;
+
+    if (!s || !s->data || bid >= sf_n_blocks) {
+        return NULL;
+    }
+    off = sf_blocks[bid].root_off + SF_KEY_PFN(key) * psize;
+    if (off >= s->map_len || off + psize > s->map_len) {
+        return NULL;
+    }
+    return s->data + off;
 }
 
 int sf_key_cmp(const void *a, const void *b)
@@ -422,7 +529,16 @@ uint8_t *sf_resolve(SfSnapNode *dst, SfPageKey key)
             return n->ram.data + (size_t)idx * psize;
         }
     }
-    /* root兜底: root shadow lives in the dirty engine's per-block shadows. */
+    /* root兜底: prefer the root node's backing. The dirty engine borrows the
+     * same slices for restore, so there is no second root shadow on M3 paths. */
+    SfSnapNode *root = sf_root_of(dst);
+    uint8_t *page = sf_rootstore_page(root ? &root->ram : NULL, key);
+    if (page) {
+        return page;
+    }
+
+    /* Legacy/selftest fallback for code paths that call sf_dirty_snapshot()
+     * directly without constructing a root node. */
     uint8_t *host = sf_key_to_host(key);
     if (host) {
         uint64_t remain = 0;

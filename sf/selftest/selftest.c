@@ -1229,15 +1229,22 @@ static void sf_selftest_persist(Monitor *mon, bool *all_ok)
         return;
     }
 
-    if (!sf_snap_root(mon)) { *all_ok = false; return; }
-    sf_run_guest_ms(20); L1 = sf_make_layer(mon, all_ok);
-    sf_run_guest_ms(20); L2 = sf_make_layer(mon, all_ok);
-    if (!L1 || !L2) { return; }
-    root = sf_active;
-    while (root->parent) { root = root->parent; }
-
     dir = g_dir_make_tmp("sf-persist-XXXXXX", NULL);
     if (!dir) { report(mon, all_ok, "G persist", false, "g_dir_make_tmp failed"); return; }
+
+    setenv("SF_ROOT_DIR", dir, 1);
+    if (!sf_snap_root(mon)) {
+        unsetenv("SF_ROOT_DIR");
+        *all_ok = false;
+        goto out;
+    }
+    unsetenv("SF_ROOT_DIR");
+
+    sf_run_guest_ms(20); L1 = sf_make_layer(mon, all_ok);
+    sf_run_guest_ms(20); L2 = sf_make_layer(mon, all_ok);
+    if (!L1 || !L2) { goto out; }
+    root = sf_active;
+    while (root->parent) { root = root->parent; }
 
     if (sf_snap_persist(root, dir, &err) < 0) {
         report(mon, all_ok, "G persist", false, error_get_pretty(err));
@@ -1257,6 +1264,11 @@ static void sf_selftest_persist(Monitor *mon, bool *all_ok)
     snprintf(buf, sizeof(buf), "chain+stores match=%d (L1=%up L2=%up)",
              ok, L1->ram.n_pages, L2->ram.n_pages);
     report(mon, all_ok, "G persist roundtrip", ok, buf);
+    snprintf(buf, sizeof(buf), "root-file-backed=%d path=%s",
+             root->ram.backing == SF_BACKING_FILE,
+             root->ram.path ? root->ram.path : "(null)");
+    report(mon, all_ok, "G root-file-backed", root->ram.backing == SF_BACKING_FILE,
+           buf);
     sf_snap_free_loaded(lroot);
 
     /* teeth: clobber the manifest's first byte → load must fail. */

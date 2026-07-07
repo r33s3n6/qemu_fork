@@ -286,6 +286,9 @@ SfSnapNode *sf_snap_ram_root(Error **errp)
 {
     Error *err = NULL;
     SfSnapNode *node;
+    SfDirtyShadowDesc *shadows = NULL;
+    const char *root_dir = getenv("SF_ROOT_DIR");
+    char *root_path = NULL;
 
     /* Drop any previous tree + block table; the engine snapshot drops the old
      * shadow itself. */
@@ -297,18 +300,53 @@ SfSnapNode *sf_snap_ram_root(Error **errp)
     }
     sf_blocks_destroy();
 
-    node = sf_node_new(NULL, SF_SNAP_ROOT);
     if (sf_blocks_enumerate(&err) < 0) {
         error_propagate(errp, err);
-        sf_node_destroy(node);
         return NULL;
     }
-    if (sf_dirty_snapshot(&err) < 0) {
-        error_propagate(errp, err);
+
+    node = sf_node_new(NULL, SF_SNAP_ROOT);
+    if (root_dir && *root_dir) {
+        if (g_mkdir_with_parents(root_dir, 0700) < 0) {
+            error_setg_errno(errp, errno, "sf_snap_ram_root: mkdir %s", root_dir);
+            sf_node_destroy(node);
+            sf_blocks_destroy();
+            return NULL;
+        }
+        root_path = g_build_filename(root_dir, "root.ram", NULL);
+        if (sf_rootstore_create_file(&node->ram, root_path, &err) < 0) {
+            error_propagate(errp, err);
+            g_free(root_path);
+            sf_node_destroy(node);
+            sf_blocks_destroy();
+            return NULL;
+        }
+        g_free(root_path);
+    } else if (sf_rootstore_create_anon(&node->ram) < 0) {
+        error_setg(errp, "sf_snap_ram_root: root backing allocation failed");
         sf_node_destroy(node);
         sf_blocks_destroy();
         return NULL;
     }
+
+    shadows = g_new0(SfDirtyShadowDesc, sf_n_blocks);
+    for (size_t i = 0; i < sf_n_blocks; i++) {
+        SfBlockDesc *b = &sf_blocks[i];
+        uint8_t *dst = node->ram.data + b->root_off;
+        memcpy(dst, b->host, b->len);
+        shadows[i].host = b->host;
+        shadows[i].len = b->len;
+        shadows[i].shadow = dst;
+    }
+
+    if (sf_dirty_use_external_shadows(shadows, sf_n_blocks, &err) < 0) {
+        error_propagate(errp, err);
+        g_free(shadows);
+        sf_node_destroy(node);
+        sf_blocks_destroy();
+        return NULL;
+    }
+    g_free(shadows);
     if (kvm_enabled() && current_cpu) {
         node->kvm.tsc = sf_kvm_read_tsc(current_cpu);
     }

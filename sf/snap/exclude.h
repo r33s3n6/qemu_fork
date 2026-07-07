@@ -27,9 +27,6 @@ void sf_exclude_add(uint64_t host_start, uint64_t size, uint32_t buf_id);
  * branch, hot-path zero-cost). */
 bool sf_excluded(const void *host);
 
-/* True iff [host, host+size) overlaps any excluded range. */
-bool sf_excluded_range(const void *host, uint64_t size);
-
 /* Drop every excluded range (tree teardown / fresh tree). */
 void sf_exclude_clear(void);
 

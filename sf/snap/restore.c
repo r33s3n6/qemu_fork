@@ -172,8 +172,6 @@ static bool sf_validate_hot_profile(Monitor *mon, const SfReplayTables *t)
  */
 static int sf_root_selfcheck(Monitor *mon)
 {
-    size_t psize = qemu_real_host_page_size();
-
     for (size_t i = 0; i < sf_n_blocks; i++) {
         SfBlockDesc *b = &sf_blocks[i];
         uint8_t *host = (uint8_t *)b->host;
@@ -181,8 +179,8 @@ static int sf_root_selfcheck(Monitor *mon)
         SfPageKey key;
         uint8_t *back, *shadow;
 
-        key = sf_host_to_key(host);
-        if (SF_KEY_BLOCK(key) != i || SF_KEY_PFN(key) != 0) {
+        if (!sf_host_to_key_safe(host, &key) ||
+            SF_KEY_BLOCK(key) != i || SF_KEY_PFN(key) != 0) {
             monitor_printf(mon, "sf: selfcheck FAIL block %zu host->key=%llx\n",
                            i, (unsigned long long)key);
             return -EIO;
@@ -200,7 +198,6 @@ static int sf_root_selfcheck(Monitor *mon)
                            i);
             return -EIO;
         }
-        (void)psize;
     }
     return 0;
 }
@@ -216,12 +213,6 @@ typedef struct SfWAcc {
     SfPageKey *keys;
     size_t     n, cap;
 } SfWAcc;
-
-static int sf_key_cmp_r(const void *a, const void *b)
-{
-    SfPageKey ka = *(const SfPageKey *)a, kb = *(const SfPageKey *)b;
-    return (ka > kb) - (ka < kb);
-}
 
 static void sf_w_push(SfWAcc *a, SfPageKey k)
 {
@@ -243,7 +234,7 @@ static void sf_w_push_host(void *host, void *user)
 /* Sort + unique in place; return the unique count. */
 static size_t sf_w_sort_uniq(SfWAcc *a)
 {
-    qsort(a->keys, a->n, sizeof(SfPageKey), sf_key_cmp_r);
+    qsort(a->keys, a->n, sizeof(SfPageKey), sf_key_cmp);
     size_t u = 0;
     for (size_t i = 0; i < a->n; i++) {
         if (i == 0 || a->keys[i] != a->keys[i - 1]) {
@@ -257,11 +248,12 @@ static size_t sf_w_sort_uniq(SfWAcc *a)
  * page is excluded. Empty table → no-op (one branch per key). */
 static size_t sf_w_filter_excluded(SfWAcc *a, size_t n)
 {
-    size_t psize = qemu_real_host_page_size();
     size_t u = 0;
     for (size_t i = 0; i < n; i++) {
         uint8_t *host = sf_key_to_host(a->keys[i]);
-        if (host && sf_excluded_range(host, psize)) {
+        /* Each key is one page-aligned page → point query (bsearch), not the
+         * linear range scan. */
+        if (host && sf_excluded(host)) {
             continue;   /* NO_RESTORE: not saved, not restored */
         }
         a->keys[u++] = a->keys[i];
@@ -690,7 +682,9 @@ static void sf_apply_clock_tail(SfSnapNode *dst)
     }
 }
 
-int sf_snap_restore(uint32_t dst_id, Error **errp)
+/* @debug (optional, NULL = normal) injects a device-replay skip so a phase1.5
+ * gate can prove teeth. dst may be any node in the tree (delta-restore). */
+int sf_snap_restore(uint32_t dst_id, const SfReplayDebug *debug, Error **errp)
 {
     SfSnapNode *dst;
 
@@ -698,34 +692,12 @@ int sf_snap_restore(uint32_t dst_id, Error **errp)
         error_setg(errp, "sf_snap_restore: no snapshot (run sf_snapshot first)");
         return -EINVAL;
     }
-    /* T1: only the root/active node exists. T3 will accept any id (delta). */
     dst = (dst_id == sf_active->id) ? sf_active : sf_node_find(dst_id);
     if (!dst) {
         error_setg(errp, "sf_snap_restore: node id %u not found", dst_id);
         return -ENOENT;
     }
 
-    sf_snap_restore_core(dst, NULL);
-    sf_apply_clock_tail(dst);
-    sf_active = dst;
-    return 0;
-}
-
-/* Restore with a debug skip-knob (HMP debug=/terminal SF_CP_SKIP). Finds dst by
- * id (root/active for T1) and injects the skip into the device replay. */
-int sf_snap_restore_debug(uint32_t dst_id, const SfReplayDebug *debug, Error **errp)
-{
-    SfSnapNode *dst;
-
-    if (!sf_active) {
-        error_setg(errp, "sf_snap_restore: no snapshot");
-        return -EINVAL;
-    }
-    dst = (dst_id == sf_active->id) ? sf_active : sf_node_find(dst_id);
-    if (!dst) {
-        error_setg(errp, "sf_snap_restore: node id %u not found", dst_id);
-        return -ENOENT;
-    }
     sf_snap_restore_core(dst, (SfReplayDebug *)debug);
     sf_apply_clock_tail(dst);
     sf_active = dst;
@@ -763,22 +735,27 @@ int sf_snap_delete(uint32_t id, Error **errp)
     return 0;
 }
 
+static void sf_snap_tree_rec(Monitor *mon, SfSnapNode *n)
+{
+    SfSnapNode *child;
+
+    monitor_printf(mon, "sf: node id=%u kind=%d state=%d depth=%u dev=%s%s\n",
+                   n->id, n->kind, n->state, n->depth,
+                   n->dev.have ? "yes" : "no",
+                   (n == sf_active) ? " (ACTIVE)" : "");
+    QLIST_FOREACH(child, &n->children, sibling) {
+        sf_snap_tree_rec(mon, child);   /* full DFS: branches, not just leftmost */
+    }
+}
+
 void sf_snap_tree(Monitor *mon)
 {
-    SfSnapNode *root, *n;
+    SfSnapNode *root;
     if (!sf_active) {
         monitor_printf(mon, "sf: no snapshot tree\n");
         return;
     }
     root = sf_active;
     while (root->parent) { root = root->parent; }
-    /* flat DFS dump (T1: chain only; real tree print can come later). */
-    n = root;
-    while (n) {
-        monitor_printf(mon, "sf: node id=%u kind=%d state=%d depth=%u "
-                       "dev=%s%s\n", n->id, n->kind, n->state, n->depth,
-                       n->dev.have ? "yes" : "no",
-                       (n == sf_active) ? " (ACTIVE)" : "");
-        n = QLIST_FIRST(&n->children);
-    }
+    sf_snap_tree_rec(mon, root);
 }

@@ -172,11 +172,8 @@ void hmp_sf_restore(Monitor *mon, const QDict *qdict)
     if (was_running) {
         vm_stop(RUN_STATE_RESTORE_VM);
     }
-    if (have_debug) {
-        sf_snap_restore_debug(sf_active ? sf_active->id : 0, &debug, &err);
-    } else {
-        sf_snap_restore(sf_active ? sf_active->id : 0, &err);
-    }
+    sf_snap_restore(sf_active ? sf_active->id : 0,
+                    have_debug ? &debug : NULL, &err);
     if (err) {
         monitor_printf(mon, "sf: restore failed: %s\n", error_get_pretty(err));
         error_free(err);
@@ -290,11 +287,7 @@ void sf_checkpoint_restore(void)
             fprintf(stderr, "sf-cp: bad SF_CP_SKIP='%s' — ignored\n", skip);
         }
     }
-    if (dbgp) {
-        sf_snap_restore_debug(sf_active->id, dbgp, &err);
-    } else {
-        sf_snap_restore(sf_active->id, &err);
-    }
+    sf_snap_restore(sf_active->id, dbgp, &err);
     if (err) {
         fprintf(stderr, "sf-cp: restore failed: %s\n", error_get_pretty(err));
         error_free(err);

@@ -16,11 +16,6 @@ static SfExclRange *g_excl;
 static size_t       g_excl_n;
 static size_t       g_excl_cap;
 
-static size_t sf_excl_psize(void)
-{
-    return qemu_real_host_page_size();
-}
-
 void sf_exclude_clear(void)
 {
     g_free(g_excl);
@@ -36,7 +31,7 @@ size_t sf_exclude_count(void)
 
 void sf_exclude_add(uint64_t host_start, uint64_t size, uint32_t buf_id)
 {
-    size_t psize = sf_excl_psize();
+    size_t psize = qemu_real_host_page_size();
 
     /* Page-aligned registration (plan -06 §1: 页粒度断言). */
     if (host_start & (psize - 1)) {
@@ -101,25 +96,4 @@ bool sf_excluded(const void *host)
         return false;
     }
     return sf_excl_find((uint64_t)(uintptr_t)host) >= 0;
-}
-
-bool sf_excluded_range(const void *host, uint64_t size)
-{
-    if (g_excl_n == 0) {
-        return false;
-    }
-    uint64_t start = (uint64_t)(uintptr_t)host;
-    uint64_t end = start + size;
-    /* A range overlaps an excluded range iff the lower-bound candidate or its
-     * predecessor covers it. Check the candidate at `start` and whether any
-     * excluded range starts before `end` and ends after `start`. */
-    if (sf_excluded((const void *)(uintptr_t)start)) {
-        return true;
-    }
-    for (size_t i = 0; i < g_excl_n; i++) {
-        if (g_excl[i].host_start < end && g_excl[i].host_end > start) {
-            return true;
-        }
-    }
-    return false;
 }

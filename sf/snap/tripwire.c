@@ -35,7 +35,8 @@ void sf_tripwire_set_mode(bool abort_mode) { g_mode_override = true; g_mode_abor
 
 void sf_tripwire_hit(MemoryRegion *mr, hwaddr addr, hwaddr length)
 {
-    if (!g_armed || g_inject_disable) {
+    /* Caller (invalidate_and_set_dirty) already gated on sf_tripwire_armed(). */
+    if (g_inject_disable) {
         return;
     }
     /* Host address of the written byte (resolve aliases via get_ram_ptr). */

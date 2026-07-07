@@ -30,11 +30,6 @@ void sf_resolve_inject_skip_node(uint32_t node_id)
     g_inject_skip_node = node_id;
 }
 
-static inline size_t sf_page_size(void)
-{
-    return qemu_real_host_page_size();
-}
-
 /* ---- Node tree ---- */
 
 SfSnapNode *sf_node_new(SfSnapNode *parent, SfSnapKind kind)
@@ -177,16 +172,9 @@ void sf_blocks_destroy(void)
     sf_n_blocks = 0;
 }
 
-SfPageKey sf_host_to_key(void *host_page)
-{
-    SfPageKey key = 0;
-    sf_host_to_key_safe(host_page, &key);
-    return key;
-}
-
 bool sf_host_to_key_safe(void *host_page, SfPageKey *out)
 {
-    size_t psize = sf_page_size();
+    size_t psize = qemu_real_host_page_size();
 
     for (size_t i = 0; i < sf_n_blocks; i++) {
         SfBlockDesc *b = &sf_blocks[i];
@@ -202,7 +190,7 @@ bool sf_host_to_key_safe(void *host_page, SfPageKey *out)
 
 uint8_t *sf_key_to_host(SfPageKey key)
 {
-    size_t psize = sf_page_size();
+    size_t psize = qemu_real_host_page_size();
     uint32_t bid = SF_KEY_BLOCK(key);
     uint64_t pfn = SF_KEY_PFN(key);
     uint64_t off;
@@ -221,7 +209,7 @@ uint8_t *sf_key_to_host(SfPageKey key)
 
 int sf_ramstore_create_anon(SfRamStore *s, uint32_t n_pages)
 {
-    size_t psize = sf_page_size();
+    size_t psize = qemu_real_host_page_size();
 
     memset(s, 0, sizeof(*s));
     s->backing = SF_BACKING_ANON;
@@ -235,11 +223,7 @@ int sf_ramstore_create_anon(SfRamStore *s, uint32_t n_pages)
     }
     s->hdr = g_new0(SfStoreHdr, 1);
     s->index = g_new(SfPageKey, n_pages);
-    s->data = g_malloc((size_t)n_pages * psize);
-    if (!s->index || !s->data) {
-        sf_ramstore_destroy(s);
-        return -ENOMEM;
-    }
+    s->data = g_malloc((size_t)n_pages * psize);   /* g_* abort on OOM */
     return 0;
 }
 
@@ -247,7 +231,7 @@ void sf_ramstore_destroy(SfRamStore *s)
 {
     if (s->backing == SF_BACKING_FILE && s->data) {
         /* T6 will manage fd/unmap; for now anon-only build path. */
-        munmap(s->data, (size_t)s->n_pages * sf_page_size());
+        munmap(s->data, (size_t)s->n_pages * qemu_real_host_page_size());
     } else {
         g_free(s->data);
     }
@@ -260,7 +244,7 @@ void sf_ramstore_destroy(SfRamStore *s)
     s->fd = -1;
 }
 
-static int sf_key_cmp(const void *a, const void *b)
+int sf_key_cmp(const void *a, const void *b)
 {
     SfPageKey ka = *(const SfPageKey *)a, kb = *(const SfPageKey *)b;
     return (ka > kb) - (ka < kb);
@@ -283,7 +267,7 @@ int sf_ramstore_lookup(const SfRamStore *s, SfPageKey key)
  */
 uint8_t *sf_resolve(SfSnapNode *dst, SfPageKey key)
 {
-    size_t psize = sf_page_size();
+    size_t psize = qemu_real_host_page_size();
 
     for (SfSnapNode *n = dst; n; n = n->parent) {
         if (n->id == g_inject_skip_node) {

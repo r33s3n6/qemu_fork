@@ -24,6 +24,7 @@
 #include "sf/dirty/engine.h"
 #include "sf/snap/node.h"
 #include "sf/snap/cold.h"
+#include "sf/snap/persist.h"
 #include "sf/selftest/selftest.h"
 
 /* ---- device-replay debug skip-knob parsing (HMP debug=/terminal SF_CP_SKIP) ---- */
@@ -225,6 +226,27 @@ void hmp_sf_cold_start(Monitor *mon, const QDict *qdict)
     if (was_running) {
         vm_start();
     }
+}
+
+void hmp_sf_persist(Monitor *mon, const QDict *qdict)
+{
+    const char *dir = qdict_get_str(qdict, "dir");
+    SfSnapNode *root = sf_active;
+    Error *err = NULL;
+
+    if (!root) {
+        monitor_printf(mon, "sf: persist failed: no snapshot tree\n");
+        return;
+    }
+    while (root->parent) {
+        root = root->parent;
+    }
+    if (sf_snap_persist(root, dir, &err) < 0) {
+        monitor_printf(mon, "sf: persist failed: %s\n", error_get_pretty(err));
+        error_free(err);
+        return;
+    }
+    monitor_printf(mon, "sf: persist ok: dir=%s\n", dir);
 }
 
 /* R3 spike (plan 2026-07-06-07 §3): research-only — verify EPT rebuild after a

@@ -403,6 +403,14 @@ ERST
     },
 
     {
+        .name       = "sf_persist",
+        .args_type  = "dir:F",
+        .params     = "dir",
+        .help       = "sf (M3): persist the current snapshot tree to dir",
+        .cmd        = hmp_sf_persist,
+    },
+
+    {
         .name       = "loadvm",
         .args_type  = "name:s",
         .params     = "tag",

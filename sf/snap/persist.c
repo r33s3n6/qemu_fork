@@ -80,9 +80,11 @@ static int sf_persist_node_ram(const char *dir, SfSnapNode *n, Error **errp)
     return ret;
 }
 
-/* Write a device stream (方案 B) to <dir>/<name>; record its crc. No-op (*out_crc
- * = 0) when the node has no stream (RUN, or capture failed) — load treats 0 as
- * "no .dev". Caller records len separately (dev.stream_len). */
+/* Write a device stream (方案 B) to <dir>/<name>; record its crc in @out_crc
+ * (if non-NULL). No-op (*out_crc = 0) when the node has no stream (RUN, or
+ * capture failed) — load treats 0 as "no .dev". The crc is also recomputed by
+ * sf_node_record_line, so persist/promote pass NULL when they only need the
+ * file written. Caller records len separately (dev.stream_len). */
 static int sf_persist_dev(const char *dir, const char *name,
                           const SfDevCapture *dev, uint32_t *out_crc,
                           Error **errp)
@@ -91,10 +93,12 @@ static int sf_persist_dev(const char *dir, const char *name,
     int ret;
 
     if (!dev->stream) {
-        *out_crc = 0;
+        if (out_crc) { *out_crc = 0; }
         return 0;
     }
-    *out_crc = crc32c(0, dev->stream, dev->stream_len);
+    if (out_crc) {
+        *out_crc = crc32c(0, dev->stream, dev->stream_len);
+    }
     path = g_build_filename(dir, name, NULL);
     ret = sf_write_file(path, dev->stream, dev->stream_len, errp);
     g_free(path);
@@ -123,18 +127,124 @@ static void sf_manifest_put_blocks(QDict *man)
     qdict_put(man, "blocks", blocks);
 }
 
-static void sf_manifest_append_node(QList *nodes, SfSnapNode *n)
-{
-    QDict *nd = qdict_new();
+/*
+ * Node records live in an append-only log (<dir>/nodes.log), one node per line,
+ * NOT in manifest.json. manifest.json keeps only the tree-level header
+ * (version/page_size/blocks/root_ram_len/exclude). The record is the single
+ * on-disk contract shared by sf_snap_persist (full-tree sequential write) and
+ * sf_snap_promote (one-line append = commit point) — snapshot-tree.md §5.1.
+ *
+ * Line = "<id> <parent> <kind> <depth> <kvm_tsc> <dev_len> <dev_crc> <crc08x>\n"
+ * where <crc> = crc32c over the payload bytes (the 7 fields up to the last
+ * space). parent is the full composite id, or -1 for the root. A crash can
+ * truncate the final line; load verifies each line's crc and drops a残缺 tail.
+ */
+#define SF_NODE_LOG_NAME "nodes.log"
 
-    qdict_put_int(nd, "id", n->id);
-    qdict_put_int(nd, "parent", n->parent ? (int64_t)n->parent->id : -1);
-    qdict_put_int(nd, "kind", n->kind);
-    qdict_put_int(nd, "depth", n->depth);
-    qdict_put_int(nd, "kvm_tsc", (int64_t)n->kvm.tsc);
-    qdict_put_int(nd, "dev_len", (int64_t)n->dev.stream_len);
-    qdict_put_int(nd, "dev_crc", sf_dev_crc(&n->dev));
-    qlist_append_obj(nodes, QOBJECT(nd));
+/* Format the 7-field payload (no crc, no newline) into @buf; return its length. */
+static int sf_node_record_payload(const SfSnapNode *n, char *buf, size_t bufsz)
+{
+    return snprintf(buf, bufsz,
+                    "%u %lld %d %u %" PRIu64 " %" PRIu64 " %u",
+                    n->id,
+                    (long long)(n->parent ? (int64_t)n->parent->id : -1LL),
+                    (int)n->kind, n->depth,
+                    (uint64_t)n->kvm.tsc,
+                    (uint64_t)n->dev.stream_len,
+                    sf_dev_crc(&n->dev));
+}
+
+/* Full record line (payload + crc + newline) into @buf; return its length. */
+static int sf_node_record_line(const SfSnapNode *n, char *buf, size_t bufsz)
+{
+    char payload[160];
+    int plen = sf_node_record_payload(n, payload, sizeof(payload));
+    uint32_t crc = crc32c(0, (const uint8_t *)payload, plen);
+
+    return snprintf(buf, bufsz, "%s %08x\n", payload, crc);
+}
+
+static char *sf_node_log_path(const char *dir)
+{
+    return g_build_filename(dir, SF_NODE_LOG_NAME, NULL);
+}
+
+static int sf_write_all(int fd, const void *buf, size_t len)
+{
+    const uint8_t *p = buf;
+    while (len) {
+        ssize_t w = write(fd, p, len);
+        if (w < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        p += w;
+        len -= (size_t)w;
+    }
+    return 0;
+}
+
+/* Append one node record to nodes.log (O_APPEND → commit point for promote).
+ * fsyncs the log so the record survives a crash right after. */
+static int sf_node_log_append(const char *dir, const SfSnapNode *n, Error **errp)
+{
+    char line[192];
+    int llen = sf_node_record_line(n, line, sizeof(line));
+    char *path = sf_node_log_path(dir);
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    int ret = -1;
+
+    if (fd < 0) {
+        error_setg_errno(errp, errno, "sf_persist: open %s", path);
+        goto out;
+    }
+    if (sf_write_all(fd, line, llen) < 0) {
+        error_setg_errno(errp, errno, "sf_persist: append %s", path);
+        goto out;
+    }
+    if (fsync(fd) < 0) {
+        error_setg_errno(errp, errno, "sf_persist: fsync %s", path);
+        goto out;
+    }
+    ret = 0;
+out:
+    if (fd >= 0) {
+        close(fd);
+    }
+    g_free(path);
+    return ret;
+}
+
+/* NO_RESTORE table → manifest as block-relative offsets (defined below; forward
+ * declared so the header writer can call it). */
+static void sf_manifest_put_exclude(QDict *man);
+
+/* manifest.json header (NO nodes — those are in nodes.log). Written atomically
+ * (tmp+rename via g_file_set_contents). Used by sf_snap_persist and by promote
+ * on the root (the first promote of a workdir, which establishes the header). */
+static int sf_manifest_write_header(const char *dir, uint64_t root_ram_len,
+                                    Error **errp)
+{
+    QDict *man = qdict_new();
+    GString *json;
+    char *mpath;
+    int ret;
+
+    qdict_put_int(man, "version", SF_MANIFEST_VERSION);
+    qdict_put_int(man, "page_size", qemu_real_host_page_size());
+    qdict_put_int(man, "root_ram_len", (int64_t)root_ram_len);
+    sf_manifest_put_blocks(man);
+    sf_manifest_put_exclude(man);
+
+    json = qobject_to_json_pretty(QOBJECT(man), true);
+    mpath = g_build_filename(dir, "manifest.json", NULL);
+    ret = sf_write_file(mpath, json->str, json->len, errp);
+    g_free(mpath);
+    g_string_free(json, TRUE);
+    qobject_unref(man);
+    return ret;
 }
 
 /* NO_RESTORE table → manifest as block-relative offsets. Host bases differ per
@@ -167,13 +277,16 @@ static void sf_manifest_put_exclude(QDict *man)
     qdict_put(man, "exclude", ex);
 }
 
-/* Append @n and its subtree (pre-order) to the manifest node list, writing each
- * non-root node's diff store + device stream. Sets *ret on the first failure. */
-static void sf_persist_walk(SfSnapNode *n, QList *nodes, const char *dir,
+/* Walk @n's subtree pre-order: write each non-root diff store + device stream,
+ * and append the node record to nodes.log (@log_fd). Parent is always written
+ * before its children, so the log is loadable in file order. Sets *ret on first
+ * failure. */
+static void sf_persist_walk(SfSnapNode *n, int log_fd, const char *dir,
                             Error **errp, int *ret)
 {
     SfSnapNode *child;
-    uint32_t dev_crc = 0;
+    char line[192];
+    int llen;
     char dname[32];
 
     if (*ret) {
@@ -190,26 +303,29 @@ static void sf_persist_walk(SfSnapNode *n, QList *nodes, const char *dir,
          * qemu_load_device_state / sf_preparse_stream). */
         snprintf(dname, sizeof(dname), "root.dev");
     }
-    if (sf_persist_dev(dir, dname, &n->dev, &dev_crc, errp) < 0) {
+    if (sf_persist_dev(dir, dname, &n->dev, NULL, errp) < 0) {
         *ret = -1;
         return;
     }
 
-    sf_manifest_append_node(nodes, n);
+    llen = sf_node_record_line(n, line, sizeof(line));
+    if (sf_write_all(log_fd, line, llen) < 0) {
+        error_setg_errno(errp, errno, "sf_snap_persist: write nodes.log");
+        *ret = -1;
+        return;
+    }
 
     QLIST_FOREACH(child, &n->children, sibling) {
-        sf_persist_walk(child, nodes, dir, errp, ret);
+        sf_persist_walk(child, log_fd, dir, errp, ret);
     }
 }
 
 int sf_snap_persist(SfSnapNode *root, const char *dir, Error **errp)
 {
     uint64_t root_len = 0;
-    QDict *man;
-    QList *nodes;
-    char *ndir, *mpath;
-    GString *json;
-    int ret;
+    char *ndir, *lpath;
+    int log_fd = -1;
+    int ret = -1;
 
     if (!root || root->parent) {
         error_setg(errp, "sf_snap_persist: need the root node");
@@ -229,27 +345,26 @@ int sf_snap_persist(SfSnapNode *root, const char *dir, Error **errp)
     if (sf_persist_root_ram(root, dir, &root_len, errp) < 0) {
         return -1;
     }
-
-    man = qdict_new();
-    qdict_put_int(man, "version", SF_MANIFEST_VERSION);
-    qdict_put_int(man, "page_size", qemu_real_host_page_size());
-    qdict_put_int(man, "root_ram_len", (int64_t)root_len);
-    sf_manifest_put_blocks(man);
-    sf_manifest_put_exclude(man);
-
-    nodes = qlist_new();
-    ret = 0;
-    sf_persist_walk(root, nodes, dir, errp, &ret);
-    qdict_put(man, "nodes", nodes);
-
-    if (ret == 0) {
-        json = qobject_to_json_pretty(QOBJECT(man), true);
-        mpath = g_build_filename(dir, "manifest.json", NULL);
-        ret = sf_write_file(mpath, json->str, json->len, errp);
-        g_free(mpath);
-        g_string_free(json, TRUE);
+    /* Header (no nodes) first; nodes go to a fresh nodes.log below. */
+    if (sf_manifest_write_header(dir, root_len, errp) < 0) {
+        return -1;
     }
-    qobject_unref(man);
+
+    lpath = sf_node_log_path(dir);
+    log_fd = open(lpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    g_free(lpath);
+    if (log_fd < 0) {
+        error_setg_errno(errp, errno, "sf_snap_persist: open nodes.log");
+        return -1;
+    }
+
+    ret = 0;
+    sf_persist_walk(root, log_fd, dir, errp, &ret);
+    if (ret == 0 && (fsync(log_fd) < 0)) {
+        error_setg_errno(errp, errno, "sf_snap_persist: fsync nodes.log");
+        ret = -1;
+    }
+    close(log_fd);
     return ret;
 }
 
@@ -396,43 +511,8 @@ static int sf_promote_check_parent_prefix(SfSnapNode *parent, const char *dir,
     return 0;
 }
 
-static int sf_write_prefix_manifest(SfSnapNode *target, const char *dir,
-                                    Error **errp)
-{
-    GPtrArray *path = g_ptr_array_new();
-    QDict *man = qdict_new();
-    QList *nodes = qlist_new();
-    GString *json;
-    char *mpath;
-    int ret;
-
-    for (SfSnapNode *n = target; n; n = n->parent) {
-        g_ptr_array_add(path, n);
-    }
-
-    qdict_put_int(man, "version", SF_MANIFEST_VERSION);
-    qdict_put_int(man, "page_size", qemu_real_host_page_size());
-    qdict_put_int(man, "root_ram_len", (int64_t)sf_blocks_root_len());
-    sf_manifest_put_blocks(man);
-    sf_manifest_put_exclude(man);
-    for (gint i = (gint)path->len - 1; i >= 0; i--) {
-        sf_manifest_append_node(nodes, g_ptr_array_index(path, i));
-    }
-    qdict_put(man, "nodes", nodes);
-
-    json = qobject_to_json_pretty(QOBJECT(man), true);
-    mpath = g_build_filename(dir, "manifest.json", NULL);
-    ret = sf_write_file(mpath, json->str, json->len, errp);
-    g_free(mpath);
-    g_string_free(json, TRUE);
-    qobject_unref(man);
-    g_ptr_array_free(path, TRUE);
-    return ret;
-}
-
 int sf_snap_promote(SfSnapNode *node, const char *dir, Error **errp)
 {
-    uint32_t dev_crc = 0;
     char dname[32];
 
     if (!node) {
@@ -452,6 +532,12 @@ int sf_snap_promote(SfSnapNode *node, const char *dir, Error **errp)
         if (sf_promote_root_ram(node, dir, errp) < 0) {
             return -1;
         }
+        /* Root promote establishes the workdir: write the header (manifest.json)
+         * once. Non-root promotes inherit it — the header is tree-level and
+         * stable, so they only append their node record. */
+        if (sf_manifest_write_header(dir, sf_blocks_root_len(), errp) < 0) {
+            return -1;
+        }
         snprintf(dname, sizeof(dname), "root.dev");
     } else {
         if (sf_promote_check_parent_prefix(node->parent, dir, errp) < 0) {
@@ -462,34 +548,105 @@ int sf_snap_promote(SfSnapNode *node, const char *dir, Error **errp)
         }
         snprintf(dname, sizeof(dname), "nodes/%u.dev", node->id);
     }
-    if (sf_persist_dev(dir, dname, &node->dev, &dev_crc, errp) < 0) {
+    /* Write the device stream (fsync inside sf_write_file via g_file_set_contents
+     * is not guaranteed; the commit point below makes the append atomic anyway —
+     * a crash before the append leaves an orphan .dev/.ram the old log doesn't
+     * reference, which is harmless). */
+    if (sf_persist_dev(dir, dname, &node->dev, NULL, errp) < 0) {
         return -1;
     }
-    return sf_write_prefix_manifest(node, dir, errp);
+    /* Commit point: append THIS node's record only. We never rewrite the log, so
+     * sibling branches promoted before/after are preserved (snapshot-tree.md
+     * §5.1 — the bug where a later promote rewrote manifest.json to a single
+     * lineage and erased the sibling). fsync makes the append durable. */
+    return sf_node_log_append(dir, node, errp);
 }
 
 /* ---- load side ---- */
 
-static SfSnapNode *sf_load_node(QDict *nd, GHashTable *byid, Error **errp)
+/* Parsed node record (one nodes.log line). Mirrors sf_node_record_payload. */
+typedef struct SfNodeRec {
+    uint32_t id;
+    int64_t  parent;     /* -1 for root */
+    int      kind;
+    uint32_t depth;
+    uint64_t tsc;
+    uint64_t dev_len;
+    uint32_t dev_crc;
+} SfNodeRec;
+
+/* Parse one record line (WITHOUT the trailing '\n', @len bytes). Splits off the
+ * trailing crc token, verifies it against crc32c of the payload, and parses the
+ * 7 payload fields into @rec. *crc_ok = false on crc mismatch. Returns 0 on a
+ * structurally-valid line (caller still checks *crc_ok), -1 on a malformed line
+ * (wrong token count / non-numeric). */
+static int sf_node_record_parse(const char *line, size_t len, SfNodeRec *rec,
+                                bool *crc_ok)
+{
+    char *copy = g_strndup(line, len);
+    char **tok = NULL;
+    char *p;
+    uint32_t want, got;
+    int ret = -1;
+
+    *crc_ok = false;
+    /* The crc is the last whitespace-separated token; the payload is everything
+     * before its separating space. Find the last space in the line. */
+    p = NULL;
+    for (ssize_t i = (ssize_t)len - 1; i >= 0; i--) {
+        if (copy[i] == ' ') {
+            p = &copy[i];
+            break;
+        }
+    }
+    if (!p) {
+        goto out;
+    }
+    want = (uint32_t)g_ascii_strtoull(p + 1, NULL, 16);
+    got = crc32c(0, (const uint8_t *)copy, (size_t)(p - copy));
+    *crc_ok = (want == got);
+
+    /* Truncate at the separating space so g_strsplit yields exactly the 7
+     * payload fields. */
+    *p = '\0';
+    tok = g_strsplit_set(copy, " ", 7);
+    if (!tok || g_strv_length(tok) != 7) {
+        goto out;
+    }
+    rec->id      = (uint32_t)g_ascii_strtoull(tok[0], NULL, 10);
+    rec->parent  = (int64_t)g_ascii_strtoll(tok[1], NULL, 10);
+    rec->kind    = (int)g_ascii_strtoll(tok[2], NULL, 10);
+    rec->depth   = (uint32_t)g_ascii_strtoull(tok[3], NULL, 10);
+    rec->tsc     = (uint64_t)g_ascii_strtoull(tok[4], NULL, 10);
+    rec->dev_len = (uint64_t)g_ascii_strtoull(tok[5], NULL, 10);
+    rec->dev_crc = (uint32_t)g_ascii_strtoull(tok[6], NULL, 10);
+    ret = 0;
+out:
+    g_strfreev(tok);
+    g_free(copy);
+    return ret;
+}
+
+static SfSnapNode *sf_load_node_rec(const SfNodeRec *rec, GHashTable *byid,
+                                    Error **errp)
 {
     SfSnapNode *n = g_new0(SfSnapNode, 1);
-    int64_t parent_id = qdict_get_try_int(nd, "parent", -1);
 
-    n->id = (uint32_t)qdict_get_try_int(nd, "id", 0);
+    n->id = rec->id;
     sf_node_observe_id(n->id);
-    n->kind = (SfSnapKind)qdict_get_try_int(nd, "kind", 0);
-    n->depth = (uint32_t)qdict_get_try_int(nd, "depth", 0);
-    n->kvm.tsc = (uint64_t)qdict_get_try_int(nd, "kvm_tsc", 0);
+    n->kind = (SfSnapKind)rec->kind;
+    n->depth = rec->depth;
+    n->kvm.tsc = rec->tsc;
     n->state = SF_SNAP_PERSISTED;
     n->ram.fd = -1;
     QLIST_INIT(&n->children);
 
-    if (parent_id >= 0) {
+    if (rec->parent >= 0) {
         SfSnapNode *parent = g_hash_table_lookup(byid,
-                                                 GUINT_TO_POINTER(parent_id));
+                                                 GUINT_TO_POINTER((uint32_t)rec->parent));
         if (!parent) {
             error_setg(errp, "sf_snap_load: node %u parent %" PRId64 " not seen "
-                       "yet (manifest not pre-order?)", n->id, parent_id);
+                       "yet (log not parent-before-child?)", n->id, rec->parent);
             g_free(n);
             return NULL;
         }
@@ -498,6 +655,73 @@ static SfSnapNode *sf_load_node(QDict *nd, GHashTable *byid, Error **errp)
     }
     g_hash_table_insert(byid, GUINT_TO_POINTER(n->id), n);
     return n;
+}
+
+/* Open a non-root node's diff store (nodes/<id>.ram); root's ram stays empty
+ * (the cold-start core maps root.ram as the backing). */
+static int sf_load_node_ram(const char *dir, SfSnapNode *n, Error **errp)
+{
+    char name[32];
+    char *rpath;
+    int r;
+
+    snprintf(name, sizeof(name), "nodes/%u.ram", n->id);
+    rpath = g_build_filename(dir, name, NULL);
+    r = sf_ramstore_open_file(&n->ram, rpath, errp);
+    g_free(rpath);
+    return r;
+}
+
+/* Read <dir>/<name>, verify its crc against @want_crc, and re-preparse the device
+ * stream into @dev->tables (方案 B cold-start重建). want_crc == 0 means the node
+ * had no persisted stream (RUN / capture failed) → dev.have stays false, no file
+ * read. The stream bytes are freed after parsing: the replay tables are
+ * self-contained, and a loaded node doesn't need to re-persist. */
+static int sf_load_dev(const char *dir, const char *name, uint32_t want_crc,
+                       SfDevCapture *dev, Error **errp)
+{
+    char *path;
+    gchar *buf = NULL;
+    gsize len = 0;
+    GError *gerr = NULL;
+    int ret = -1;
+
+    if (want_crc == 0) {
+        dev->have = false;
+        return 0;
+    }
+    path = g_build_filename(dir, name, NULL);
+    if (!g_file_get_contents(path, &buf, &len, &gerr)) {
+        error_setg(errp, "sf_snap_load: read %s: %s", name, gerr->message);
+        g_error_free(gerr);
+        goto out;
+    }
+    if (crc32c(0, (const uint8_t *)buf, len) != want_crc) {
+        error_setg(errp, "sf_snap_load: %s crc mismatch", name);
+        goto out;
+    }
+    if (sf_preparse_stream((const uint8_t *)buf, len, &dev->tables, errp) < 0) {
+        goto out;
+    }
+    dev->have = true;
+    ret = 0;
+out:
+    g_free(buf);
+    g_free(path);
+    return ret;
+}
+
+static int sf_load_node_dev_rec(const char *dir, SfSnapNode *n,
+                                const SfNodeRec *rec, Error **errp)
+{
+    char dname[32];
+
+    if (n->parent) {
+        snprintf(dname, sizeof(dname), "nodes/%u.dev", n->id);
+    } else {
+        snprintf(dname, sizeof(dname), "root.dev");
+    }
+    return sf_load_dev(dir, dname, rec->dev_crc, &n->dev, errp);
 }
 
 static int sf_load_validate_blocks(QDict *man, Error **errp)
@@ -559,59 +783,109 @@ out:
     return ret;
 }
 
-/* Read <dir>/<name>, verify its crc against @want_crc, and re-preparse the device
- * stream into @dev->tables (方案 B cold-start重建). want_crc == 0 means the node
- * had no persisted stream (RUN / capture failed) → dev.have stays false, no file
- * read. The stream bytes are freed after parsing: the replay tables are
- * self-contained, and a loaded node doesn't need to re-persist. */
-static int sf_load_dev(const char *dir, const char *name, uint32_t want_crc,
-                       SfDevCapture *dev, Error **errp)
+/*
+ * Read <dir>/nodes.log and rebuild the tree into @byid / @root_out. Each
+ * complete line (terminated by '\n') must pass crc — a crc failure there is hard
+ * corruption. The bytes after the final '\n' are a possibly-truncated tail: if
+ * empty, fine; if it parses and crcs, accept it; if not, drop it (a crash wrote
+ * a half line — snapshot-tree.md §5.1/§5.2). Parent records precede their
+ * children in the log (enforced by promote's PERSISTED-ancestor invariant and
+ * persist's pre-order walk), so file order is loadable.
+ *
+ * For each node: link to parent, open non-root .ram, re-preparse .dev.
+ */
+static int sf_node_log_load(const char *dir, GHashTable *byid,
+                            SfSnapNode **root_out, Error **errp)
 {
-    char *path;
+    char *lpath = sf_node_log_path(dir);
     gchar *buf = NULL;
-    gsize len = 0;
+    gsize blen = 0;
     GError *gerr = NULL;
+    SfSnapNode *root = NULL;
+    const char *p, *nl;
     int ret = -1;
 
-    if (want_crc == 0) {
-        dev->have = false;
-        return 0;
-    }
-    path = g_build_filename(dir, name, NULL);
-    if (!g_file_get_contents(path, &buf, &len, &gerr)) {
-        error_setg(errp, "sf_snap_load: read %s: %s", name, gerr->message);
+    if (!g_file_get_contents(lpath, &buf, &blen, &gerr)) {
+        error_setg(errp, "sf_snap_load: read nodes.log: %s", gerr->message);
         g_error_free(gerr);
+        g_free(lpath);
+        return -1;
+    }
+    g_free(lpath);
+
+    p = buf;
+    nl = buf;
+    while (nl < buf + blen) {
+        const char *next = memchr(nl, '\n', (size_t)(buf + blen - nl));
+        if (!next) {
+            break;   /* trailing partial line — handled after the loop */
+        }
+        size_t line_len = (size_t)(next - nl);
+        SfNodeRec rec;
+        bool crc_ok;
+        SfSnapNode *n;
+
+        if (sf_node_record_parse(nl, line_len, &rec, &crc_ok) < 0) {
+            error_setg(errp, "sf_snap_load: nodes.log malformed line");
+            goto out;
+        }
+        if (!crc_ok) {
+            error_setg(errp, "sf_snap_load: nodes.log crc mismatch (corrupt "
+                       "record, not a crash tail)");
+            goto out;
+        }
+        n = sf_load_node_rec(&rec, byid, errp);
+        if (!n) {
+            goto out;
+        }
+        if (!n->parent) {
+            root = n;
+        } else if (sf_load_node_ram(dir, n, errp) < 0) {
+            goto out;
+        }
+        if (sf_load_node_dev_rec(dir, n, &rec, errp) < 0) {
+            goto out;
+        }
+        nl = next + 1;
+        p = nl;
+    }
+
+    /* Trailing tail after the last '\n': a crash may have written a partial
+     * line here. Accept it only if it parses AND crcs; otherwise drop it. */
+    if (p < buf + blen) {
+        SfNodeRec rec;
+        bool crc_ok;
+        if (sf_node_record_parse(p, (size_t)(buf + blen - p), &rec, &crc_ok) == 0
+            && crc_ok) {
+            SfSnapNode *n = sf_load_node_rec(&rec, byid, errp);
+            if (!n) {
+                goto out;
+            }
+            if (!n->parent) {
+                root = n;
+            } else if (sf_load_node_ram(dir, n, errp) < 0) {
+                goto out;
+            }
+            if (sf_load_node_dev_rec(dir, n, &rec, errp) < 0) {
+                goto out;
+            }
+        }
+        /* else: incomplete tail — drop silently. */
+    }
+
+    if (!root) {
+        error_setg(errp, "sf_snap_load: no root node in nodes.log");
         goto out;
     }
-    if (crc32c(0, (const uint8_t *)buf, len) != want_crc) {
-        error_setg(errp, "sf_snap_load: %s crc mismatch", name);
-        goto out;
-    }
-    if (sf_preparse_stream((const uint8_t *)buf, len, &dev->tables, errp) < 0) {
-        goto out;
-    }
-    dev->have = true;
+    *root_out = root;
+    root = NULL;
     ret = 0;
 out:
-    g_free(buf);
-    g_free(path);
-    return ret;
-}
-
-/* Load a node's device stream based on its manifest entry: root → root.dev,
- * non-root → nodes/<id>.dev. want_crc comes from the node's "dev_crc" field. */
-static int sf_load_node_dev(const char *dir, SfSnapNode *n, QDict *nd,
-                            Error **errp)
-{
-    uint32_t want_crc = (uint32_t)qdict_get_try_int(nd, "dev_crc", 0);
-    char dname[32];
-
-    if (n->parent) {
-        snprintf(dname, sizeof(dname), "nodes/%u.dev", n->id);
-    } else {
-        snprintf(dname, sizeof(dname), "root.dev");
+    if (root) {
+        sf_snap_free_loaded(root);
     }
-    return sf_load_dev(dir, dname, want_crc, &n->dev, errp);
+    g_free(buf);
+    return ret;
 }
 
 int sf_snap_load(const char *dir, SfSnapNode **root_out, Error **errp)
@@ -622,8 +896,6 @@ int sf_snap_load(const char *dir, SfSnapNode **root_out, Error **errp)
     GError *gerr = NULL;
     QObject *o = NULL;
     QDict *man;
-    QList *nodes;
-    const QListEntry *e;
     GHashTable *byid = NULL;
     SfSnapNode *root = NULL;
     int ret = -1;
@@ -660,51 +932,14 @@ int sf_snap_load(const char *dir, SfSnapNode **root_out, Error **errp)
         goto out;
     }
 
-    nodes = qobject_to(QList, qdict_get(man, "nodes"));
-    if (!nodes) {
-        error_setg(errp, "sf_snap_load: manifest 'nodes' missing");
-        goto out;
-    }
+    /* Nodes live in nodes.log now (append-only), not in manifest.json. */
     byid = g_hash_table_new(g_direct_hash, g_direct_equal);
-    QLIST_FOREACH_ENTRY(nodes, e) {
-        QDict *nd = qobject_to(QDict, qlist_entry_obj(e));
-        SfSnapNode *n;
-        if (!nd) {
-            error_setg(errp, "sf_snap_load: node entry not an object");
-            goto out;
-        }
-        n = sf_load_node(nd, byid, errp);
-        if (!n) {
-            goto out;
-        }
-        if (!n->parent) {
-            root = n;
-        } else {
-            char name[32];
-            char *rpath;
-            int r;
-            snprintf(name, sizeof(name), "nodes/%u.ram", n->id);
-            rpath = g_build_filename(dir, name, NULL);
-            r = sf_ramstore_open_file(&n->ram, rpath, errp);
-            g_free(rpath);
-            if (r < 0) {
-                goto out;   /* ret stays -1 */
-            }
-        }
-        /* Re-preparse this node's persisted device stream into replay tables
-         * (方案 B). No-op (dev.have=false) when dev_crc==0. Pre-order manifest
-         * → root first; each parse re-loads live device state, last one wins. */
-        if (sf_load_node_dev(dir, n, nd, errp) < 0) {
-            goto out;
-        }
-    }
-    if (!root) {
-        error_setg(errp, "sf_snap_load: no root node in manifest");
+    if (sf_node_log_load(dir, byid, &root, errp) < 0) {
         goto out;
     }
     *root_out = root;
-    ret = 0;
     root = NULL;   /* transferred to caller */
+    ret = 0;
 out:
     if (root) {
         sf_snap_free_loaded(root);

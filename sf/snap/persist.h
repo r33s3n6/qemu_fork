@@ -1,9 +1,13 @@
 /*
  * sf/snap/persist — snapshot-tree persistence (T6, plan 07 §1/§2, 方案 B).
  * Serialize a tree to a directory and load it back:
- *   <dir>/manifest.json     version/page_size/blocks/nodes(id,parent,kind,depth,
- *                           kvm_tsc,dev_len,dev_crc)/root_ram_len/exclude
- *                           (NO_RESTORE ranges as block-relative block/off/size)
+ *   <dir>/manifest.json     version/page_size/blocks/root_ram_len/exclude
+ *                           (NO_RESTORE ranges as block-relative block/off/size).
+ *                           Header only — NO nodes here.
+ *   <dir>/nodes.log         append-only node log, one record per line:
+ *                           id(parent composite)/parent/kind/depth/kvm_tsc/
+ *                           dev_len/dev_crc + trailing crc32c; load drops a
+ *                           truncated tail line (snapshot-tree.md §5.1).
  *   <dir>/root.ram          root full-RAM shadow, raw block-order平铺(no hdr)
  *   <dir>/root.dev          root device stream (stock vmstate; 方案 B), if kept
  *   <dir>/nodes/<id>.ram    each non-root diff store (SfRamStore FILE format)
@@ -23,15 +27,18 @@
  * @dir (created if absent). Manifest written atomically (tmp+rename). */
 int  sf_snap_persist(SfSnapNode *root, const char *dir, Error **errp);
 
-/* Promote one connected prefix into @dir. Root may be promoted first; a
+/* Promote one node into @dir's append-only log. Root may be promoted first; a
  * non-root node is accepted only after its parent is already PERSISTED. The
- * target node's RAM store is switched to file backing and manifest.json is
- * rewritten to describe exactly root..target. */
+ * node's RAM store is switched to file backing, its device stream is written,
+ * then exactly one record is appended to nodes.log (the commit point). The log
+ * is never rewritten, so sibling branches promoted before/after are preserved
+ * (snapshot-tree.md §5.1). Root promote also writes the manifest.json header. */
 int  sf_snap_promote(SfSnapNode *node, const char *dir, Error **errp);
 
 /* Load a persisted tree from @dir into a fresh detached tree (*root_out).
- * Validates the manifest against the live block registry (idstr/len), root.ram
- * length, and each diff store's crc. Does NOT touch sf_active or remap guest
+ * Validates the manifest header against the live block registry (idstr/len) and
+ * root.ram length, then replays nodes.log (crc per line, truncated tail
+ * dropped) and each diff store's crc. Does NOT touch sf_active or remap guest
  * RAM (cold start does that, T7); the loaded root's RAM stays empty until the
  * cold-start core maps root.ram as the root backing. */
 int  sf_snap_load(const char *dir, SfSnapNode **root_out, Error **errp);

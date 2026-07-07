@@ -20,7 +20,9 @@ SfSnapNode  *sf_active;
 SfBlockDesc *sf_blocks;
 size_t       sf_n_blocks;
 
-static uint32_t g_next_id;
+static uint32_t g_next_local;        /* per-current-worker local id counter */
+static uint32_t g_worker_id;         /* injected worker slot (env SF_WORKER_ID) */
+static bool g_id_inited;             /* env read once */
 
 /* selftest fault injection: sf_resolve skips the node with this id (0xFFFFFFFF
  * = none). Test-only — production never sets it. */
@@ -31,10 +33,49 @@ void sf_resolve_inject_skip_node(uint32_t node_id)
     g_inject_skip_node = node_id;
 }
 
+/* Worker 0 reserves local 0 for the root (root.id == SF_ROOT_ID == 0); a non-zero
+ * worker's local counter starts at 0 since its root is the shared worker-0 node. */
+static void sf_id_reset_local(void)
+{
+    g_next_local = (g_worker_id == 0) ? 1u : 0u;
+}
+
+static void sf_id_init_once(void)
+{
+    if (g_id_inited) {
+        return;
+    }
+    g_id_inited = true;
+    const char *e = getenv("SF_WORKER_ID");
+    if (e && *e) {
+        g_worker_id = (uint32_t)strtoul(e, NULL, 0) & SF_ID_MAX_WORKER;
+    }
+    sf_id_reset_local();
+}
+
+void sf_node_set_worker_id(uint32_t wid)
+{
+    g_worker_id = wid & SF_ID_MAX_WORKER;
+    g_id_inited = true;      /* an explicit setter wins over the env default */
+    sf_id_reset_local();
+}
+
+uint32_t sf_node_worker_id(void)
+{
+    sf_id_init_once();
+    return g_worker_id;
+}
+
 void sf_node_observe_id(uint32_t id)
 {
-    if (id >= g_next_id) {
-        g_next_id = id + 1;
+    sf_id_init_once();
+    /* Only this worker's own ids advance its local counter; ids from other
+     * workers (e.g. a cold-started base branched off another worker) don't. */
+    if (SF_ID_WORKER(id) == g_worker_id) {
+        uint32_t local = SF_ID_LOCAL(id);
+        if (local >= g_next_local) {
+            g_next_local = local + 1;
+        }
     }
 }
 
@@ -43,7 +84,12 @@ void sf_node_observe_id(uint32_t id)
 SfSnapNode *sf_node_new(SfSnapNode *parent, SfSnapKind kind)
 {
     SfSnapNode *n = g_new0(SfSnapNode, 1);
-    n->id = g_next_id++;
+    sf_id_init_once();
+    if (parent == NULL) {
+        n->id = SF_ROOT_ID;             /* shared main-tree root, reserved 0 */
+    } else {
+        n->id = SF_ID(g_worker_id, g_next_local++);
+    }
     n->parent = parent;
     n->depth = parent ? parent->depth + 1 : 0;
     n->kind = kind;

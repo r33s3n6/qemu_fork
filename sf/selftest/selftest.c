@@ -1212,10 +1212,23 @@ static void sf_rmrf_persist_dir(const char *dir)
     rmdir(nodes);
     g_free(nodes);
     p = g_build_filename(dir, "manifest.json", NULL); unlink(p); g_free(p);
+    p = g_build_filename(dir, "nodes.log", NULL); unlink(p); g_free(p);
     p = g_build_filename(dir, "root.ram", NULL); unlink(p); g_free(p);
     p = g_build_filename(dir, "root.dev", NULL); unlink(p); g_free(p);
     p = g_build_filename(dir, "node.dev", NULL); unlink(p); g_free(p);
     rmdir(dir);
+}
+
+/* Count nodes in a loaded subtree (crash-tail teeth: verify the truncated tail
+ * was dropped but the rest of the log survived). */
+static size_t sf_count_nodes(SfSnapNode *n)
+{
+    size_t cnt = 1;
+    SfSnapNode *c;
+    QLIST_FOREACH(c, &n->children, sibling) {
+        cnt += sf_count_nodes(c);
+    }
+    return cnt;
 }
 
 static void sf_selftest_persist(Monitor *mon, bool *all_ok)
@@ -1344,6 +1357,132 @@ static void sf_selftest_persist(Monitor *mon, bool *all_ok)
         g_free(mpath);
         snprintf(buf, sizeof(buf), "corrupt-manifest rejected=%d", rejected);
         report(mon, all_ok, "G-neg persist manifest teeth", rejected, buf);
+    }
+
+    /* G 加分叉牙齿: root→A→{B,C} 兄弟,promote A/B/C 后 cold-start(B)/(C) marker
+     * 各命中、互不丢失。旧单路径 manifest 全量重写会丢兄弟 → cold-start(B) 找不
+     * 到 B 节点而失败;append-log 每次只追加自己一行,兄弟俱在。 */
+    {
+        char *fdir = g_dir_make_tmp("sf-fork-XXXXXX", NULL);
+        if (!fdir) {
+            report(mon, all_ok, "G fork promote siblings", false,
+                   "g_dir_make_tmp failed");
+        } else {
+            SfSnapNode *froot = NULL, *fA = NULL, *fB = NULL, *fC = NULL;
+            uint32_t b_id = 0, c_id = 0, vB = 0, vC = 0;
+            bool prom_ok = true, cold_b = false, cold_c = false, fok = true;
+            do {
+                setenv("SF_ROOT_DIR", fdir, 1);
+                bool rok = sf_snap_root(mon);
+                unsetenv("SF_ROOT_DIR");
+                if (!rok) { *all_ok = false; fok = false; break; }
+                sf_run_guest_ms(20);
+                fA = sf_make_layer(mon, all_ok);
+                if (!fA) { fok = false; break; }
+                froot = sf_active;
+                while (froot->parent) { froot = froot->parent; }
+                /* B: child of A, marker = vB */
+                sf_run_guest_ms(20);
+                vB = sf_rd32(SF_ST_BASE);
+                fB = sf_make_layer(mon, all_ok);
+                if (!fB) { fok = false; break; }
+                /* C: sibling of B under A, distinct marker vC */
+                sf_snap_delta_restore(fA->id, &err); error_free(err); err = NULL;
+                sf_run_guest_ms(20);
+                vC = sf_rd32(SF_ST_BASE);
+                fC = sf_make_layer(mon, all_ok);
+                if (!fC) { fok = false; break; }
+                b_id = fB->id; c_id = fC->id;
+
+                if (sf_snap_promote(froot, fdir, &err) < 0) {
+                    prom_ok = false; error_free(err); err = NULL; break;
+                }
+                if (sf_snap_promote(fA, fdir, &err) < 0) {
+                    prom_ok = false; error_free(err); err = NULL; break;
+                }
+                if (sf_snap_promote(fB, fdir, &err) < 0) {
+                    prom_ok = false; error_free(err); err = NULL; break;
+                }
+                if (sf_snap_promote(fC, fdir, &err) < 0) {
+                    prom_ok = false; error_free(err); err = NULL; break;
+                }
+                if (sf_cold_start(fdir, b_id, &err) < 0) {
+                    error_free(err); err = NULL; break;
+                }
+                cold_b = (sf_rd32(SF_ST_BASE) == vB);
+                if (!cold_b) { break; }
+                if (sf_cold_start(fdir, c_id, &err) < 0) {
+                    error_free(err); err = NULL; break;
+                }
+                cold_c = (sf_rd32(SF_ST_BASE) == vC);
+            } while (0);
+            bool fteeth = fok && prom_ok && cold_b && cold_c && (vB != vC);
+            snprintf(buf, sizeof(buf),
+                     "prom=%d coldB=%d coldC=%d vB=%u vC=%u",
+                     prom_ok, cold_b, cold_c, vB, vC);
+            report(mon, all_ok, "G fork promote siblings (cold-start B/C)",
+                   fteeth, buf);
+            sf_rmrf_persist_dir(fdir);
+            g_free(fdir);
+        }
+    }
+
+    /* G 崩溃尾行丢弃: 往 nodes.log 追加半行(无换行)模拟 crash mid-append,load
+     * 必须丢弃残缺尾行、其余节点完好(snapshot-tree.md §5.2)。 */
+    {
+        char *cdir = g_dir_make_tmp("sf-crash-XXXXXX", NULL);
+        if (!cdir) {
+            report(mon, all_ok, "G crash tail-drop", false,
+                   "g_dir_make_tmp failed");
+        } else {
+            SfSnapNode *croot = NULL, *cL1 = NULL, *cL2 = NULL;
+            bool cok = true, dropped = false;
+            size_t cn = 0;
+            do {
+                setenv("SF_ROOT_DIR", cdir, 1);
+                bool rok = sf_snap_root(mon);
+                unsetenv("SF_ROOT_DIR");
+                if (!rok) { *all_ok = false; cok = false; break; }
+                sf_run_guest_ms(20); cL1 = sf_make_layer(mon, all_ok);
+                if (!cL1) { cok = false; break; }
+                sf_run_guest_ms(20); cL2 = sf_make_layer(mon, all_ok);
+                if (!cL2) { cok = false; break; }
+                croot = sf_active;
+                while (croot->parent) { croot = croot->parent; }
+                if (sf_snap_promote(croot, cdir, &err) < 0) {
+                    cok = false; error_free(err); err = NULL; break;
+                }
+                if (sf_snap_promote(cL1, cdir, &err) < 0) {
+                    cok = false; error_free(err); err = NULL; break;
+                }
+                if (sf_snap_promote(cL2, cdir, &err) < 0) {
+                    cok = false; error_free(err); err = NULL; break;
+                }
+                /* Append a half line (no newline) — a crash mid-append. */
+                char *lp = g_build_filename(cdir, "nodes.log", NULL);
+                int lfd = open(lp, O_WRONLY | O_APPEND);
+                g_free(lp);
+                if (lfd < 0) { cok = false; break; }
+                const char *half = "999 0 4 3 12345";
+                if (write(lfd, half, strlen(half)) < 0) {
+                    close(lfd); cok = false; break;
+                }
+                close(lfd);
+
+                SfSnapNode *loaded = NULL;
+                if (sf_snap_load(cdir, &loaded, &err) < 0) {
+                    error_free(err); err = NULL; break;
+                }
+                cn = sf_count_nodes(loaded);
+                sf_snap_free_loaded(loaded);
+                dropped = (cn == 3);   /* root + L1 + L2; half-line tail dropped */
+            } while (0);
+            snprintf(buf, sizeof(buf), "loaded=%d nodes=%zu (want 3)", dropped, cn);
+            report(mon, all_ok, "G crash tail-drop (half line dropped)",
+                   cok && dropped, buf);
+            sf_rmrf_persist_dir(cdir);
+            g_free(cdir);
+        }
     }
 
 out:
@@ -1608,6 +1747,43 @@ out:
     g_free(S);
 }
 
+/* Compound id (worker_id, local_id) encoding — snapshot-tree.md §6 id 契约.
+ * Pure allocator check, no RAM/KVM, runs before any active tree exists: root is
+ * the reserved id 0 regardless of the worker slot; a non-root node carries the
+ * injected worker_id in the high bits and a per-worker local_id in the low bits;
+ * two different workers never collide. Teeth: if worker_id weren't encoded, the
+ * worker-7 child's high bits would read 0, not 7. */
+static void sf_selftest_compound_id(Monitor *mon, bool *all_ok)
+{
+    char buf[192];
+    SfSnapNode *r0, *c0, *r1, *c1;
+    uint32_t i_r0, i_c0, i_r1, i_c1;
+    bool ok;
+
+    sf_node_set_worker_id(0);
+    r0 = sf_node_new(NULL, SF_SNAP_ROOT);     /* reserved id 0 */
+    c0 = sf_node_new(r0, SF_SNAP_RUN);        /* SF_ID(0, 1) */
+    sf_node_set_worker_id(7);
+    r1 = sf_node_new(NULL, SF_SNAP_ROOT);     /* still reserved id 0 */
+    c1 = sf_node_new(r1, SF_SNAP_RUN);        /* SF_ID(7, 0) */
+    i_r0 = r0->id; i_c0 = c0->id; i_r1 = r1->id; i_c1 = c1->id;
+
+    ok = i_r0 == SF_ROOT_ID && i_c0 == SF_ID(0, 1) &&
+         i_r1 == SF_ROOT_ID &&
+         SF_ID_WORKER(i_c1) == 7 && SF_ID_LOCAL(i_c1) == 0 &&
+         i_c1 != i_c0 && i_c1 != SF_ROOT_ID;
+
+    /* Free bare nodes without sf_node_destroy (no RAM store, no tripwire/dirty
+     * side effects — safe only because no active tree exists yet). */
+    g_free(c1); g_free(r1); g_free(c0); g_free(r0);
+    sf_node_set_worker_id(0);
+
+    snprintf(buf, sizeof(buf),
+             "r0=%u c0=%u r1=%u c1=%u (worker=%u local=%u)",
+             i_r0, i_c0, i_r1, i_c1, SF_ID_WORKER(i_c1), SF_ID_LOCAL(i_c1));
+    report(mon, all_ok, "G+ compound-id encoding", ok, buf);
+}
+
 bool sf_selftest_all(Monitor *mon, Error **errp)
 {
     bool all_ok = true;
@@ -1616,6 +1792,10 @@ bool sf_selftest_all(Monitor *mon, Error **errp)
      * never aborts the process; case 7 reads the counter. */
     sf_tripwire_set_mode(false);
     sf_tripwire_reset_count();
+
+    /* Compound-id encoding (snapshot-tree.md §6): pure allocator check, runs
+     * before any active tree exists and needs no accel. */
+    sf_selftest_compound_id(mon, &all_ok);
 
     /* Device work needs a stable state. */
     if (runstate_is_running()) {

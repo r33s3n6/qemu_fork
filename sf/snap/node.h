@@ -33,6 +33,26 @@ typedef uint64_t SfPageKey;
 #define SF_KEY_BLOCK(k)   ((uint32_t)((k) >> 40))
 #define SF_KEY_PFN(k)     ((k) & 0xFFFFFFFFFFULL)
 
+/*
+ * Composite node id = (worker_id << SF_ID_LOCAL_BITS) | local_id. The on-disk
+ * id stored in nodes.log is this full uint32; the per-worker local_id is the
+ * process-monotonic counter. root is the shared main-tree node and takes the
+ * reserved id 0 (worker 0, local 0); a non-root node built by worker W gets
+ * worker_id = W. Multi-worker trees branched off the same base then never
+ * collide, and a controller-side treelib can merge them without renumbering
+ * (snapshot-tree.md §6 id 契约). Bit split 8/24 → 256 workers × 16M locals.
+ */
+#define SF_ID_WORKER_BITS 8
+#define SF_ID_LOCAL_BITS  24
+#define SF_ID_MAX_WORKER  ((1u << SF_ID_WORKER_BITS) - 1u)
+#define SF_ID_MAX_LOCAL   ((1u << SF_ID_LOCAL_BITS) - 1u)
+#define SF_ID(worker, local) \
+    (((uint32_t)((worker) & SF_ID_MAX_WORKER) << SF_ID_LOCAL_BITS) | \
+     ((uint32_t)(local) & SF_ID_MAX_LOCAL))
+#define SF_ID_WORKER(id)  ((uint32_t)(id) >> SF_ID_LOCAL_BITS)
+#define SF_ID_LOCAL(id)   ((uint32_t)(id) & SF_ID_MAX_LOCAL)
+#define SF_ROOT_ID        0u
+
 typedef enum {
     SF_SNAP_ROOT = 0,
     SF_SNAP_CLEAN,
@@ -177,6 +197,14 @@ int   sf_rootstore_open_file(SfRamStore *s, const char *path, Error **errp);
 int   sf_rootstore_seal(SfRamStore *s, Error **errp);
 uint8_t *sf_rootstore_page(const SfRamStore *s, SfPageKey key);
 void  sf_node_observe_id(uint32_t id);
+
+/* Composite-id worker slot. worker_id is injected by the host (env SF_WORKER_ID
+ * at first node creation, or this override for HMP/tests); the worker never
+ * self-selects. root always keeps the reserved id 0 regardless of the worker
+ * slot. Switching the slot resets the per-worker local counter (worker 0
+ * reserves local 0 for the root). */
+void     sf_node_set_worker_id(uint32_t wid);
+uint32_t sf_node_worker_id(void);
 
 /* Owner resolution (design §3): ≤dst 的最近 owner 的 data page; root 兜底. */
 uint8_t *sf_resolve(SfSnapNode *dst, SfPageKey key);

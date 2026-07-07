@@ -8,6 +8,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/queue.h"
+#include "qemu/crc32c.h"
 #include "exec/cpu-common.h"
 #include "system/ramblock.h"
 #include "system/ramlist.h"
@@ -229,19 +230,161 @@ int sf_ramstore_create_anon(SfRamStore *s, uint32_t n_pages)
 
 void sf_ramstore_destroy(SfRamStore *s)
 {
-    if (s->backing == SF_BACKING_FILE && s->data) {
-        /* T6 will manage fd/unmap; for now anon-only build path. */
-        munmap(s->data, (size_t)s->n_pages * qemu_real_host_page_size());
+    if (s->backing == SF_BACKING_FILE) {
+        /* hdr/index/data all point into one contiguous mmap; free it as a whole. */
+        if (s->hdr && s->map_len) {
+            munmap(s->hdr, s->map_len);
+        }
+        if (s->fd >= 0) {
+            close(s->fd);
+        }
     } else {
         g_free(s->data);
-    }
-    g_free(s->index);
-    g_free(s->hdr);
-    if (s->fd >= 0) {
-        close(s->fd);
+        g_free(s->index);
+        g_free(s->hdr);
     }
     memset(s, 0, sizeof(*s));
     s->fd = -1;
+}
+
+/* Layout offsets (node.h): index 8-aligned after hdr, data page-aligned so a
+ * MAP_SHARED data region page-shares across workers (plan 07 §4). */
+static size_t sf_store_index_off(void)
+{
+    return ROUND_UP(sizeof(SfStoreHdr), 8);
+}
+static size_t sf_store_data_off(uint32_t n_pages)
+{
+    size_t psize = qemu_real_host_page_size();
+    return ROUND_UP(sf_store_index_off() + (size_t)n_pages * sizeof(SfPageKey), psize);
+}
+static size_t sf_store_map_len(uint32_t n_pages)
+{
+    return sf_store_data_off(n_pages) + (size_t)n_pages * qemu_real_host_page_size();
+}
+
+/* Point hdr/index/data into a contiguous mapping @base of a store with n_pages. */
+static void sf_store_map_ptrs(SfRamStore *s, void *base, uint32_t n_pages)
+{
+    s->hdr = (SfStoreHdr *)base;
+    s->index = n_pages ? (SfPageKey *)((uint8_t *)base + sf_store_index_off()) : NULL;
+    s->data = n_pages ? (uint8_t *)base + sf_store_data_off(n_pages) : NULL;
+}
+
+int sf_ramstore_create_file(SfRamStore *s, uint32_t n_pages, const char *path,
+                            Error **errp)
+{
+    size_t map_len = sf_store_map_len(n_pages);
+    void *base;
+    int fd;
+
+    memset(s, 0, sizeof(*s));
+    s->backing = SF_BACKING_FILE;
+    s->fd = -1;
+    s->n_pages = n_pages;
+
+    fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        error_setg_errno(errp, errno, "sf_ramstore_create_file: open %s", path);
+        return -1;
+    }
+    if (ftruncate(fd, map_len) < 0) {
+        error_setg_errno(errp, errno, "sf_ramstore_create_file: ftruncate");
+        close(fd);
+        return -1;
+    }
+    base = mmap(NULL, map_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (base == MAP_FAILED) {
+        error_setg_errno(errp, errno, "sf_ramstore_create_file: mmap");
+        close(fd);
+        return -1;
+    }
+    s->fd = fd;
+    s->map_len = map_len;
+    sf_store_map_ptrs(s, base, n_pages);
+    s->hdr->magic = SF_STORE_MAGIC;
+    s->hdr->version = SF_STORE_VERSION;
+    s->hdr->n_pages = n_pages;
+    s->hdr->page_size = (uint32_t)qemu_real_host_page_size();
+    s->hdr->crc32c = 0;   /* filled by seal */
+    return 0;
+}
+
+int sf_ramstore_seal(SfRamStore *s, Error **errp)
+{
+    uint8_t *base = (uint8_t *)s->hdr;
+    size_t off = sizeof(SfStoreHdr);   /* crc covers everything after the hdr */
+
+    if (s->backing != SF_BACKING_FILE || !base) {
+        error_setg(errp, "sf_ramstore_seal: not a file-backed store");
+        return -EINVAL;
+    }
+    s->hdr->crc32c = crc32c(0, base + off, s->map_len - off);
+    if (msync(base, s->map_len, MS_SYNC) < 0) {
+        error_setg_errno(errp, errno, "sf_ramstore_seal: msync");
+        return -1;
+    }
+    if (mprotect(base, s->map_len, PROT_READ) < 0) {
+        error_setg_errno(errp, errno, "sf_ramstore_seal: mprotect RO");
+        return -1;
+    }
+    return 0;
+}
+
+int sf_ramstore_open_file(SfRamStore *s, const char *path, Error **errp)
+{
+    size_t off = sizeof(SfStoreHdr);
+    struct stat st;
+    void *base;
+    SfStoreHdr *hdr;
+    size_t want;
+    uint32_t crc;
+    int fd;
+
+    memset(s, 0, sizeof(*s));
+    s->backing = SF_BACKING_FILE;
+    s->fd = -1;
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        error_setg_errno(errp, errno, "sf_ramstore_open_file: open %s", path);
+        return -1;
+    }
+    if (fstat(fd, &st) < 0 || (size_t)st.st_size < sizeof(SfStoreHdr)) {
+        error_setg(errp, "sf_ramstore_open_file: %s too small / stat failed", path);
+        close(fd);
+        return -1;
+    }
+    base = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+    if (base == MAP_FAILED) {
+        error_setg_errno(errp, errno, "sf_ramstore_open_file: mmap");
+        close(fd);
+        return -1;
+    }
+    hdr = base;
+    want = sf_store_map_len(hdr->n_pages);
+    if (hdr->magic != SF_STORE_MAGIC || hdr->version != SF_STORE_VERSION ||
+        hdr->page_size != qemu_real_host_page_size() ||
+        (size_t)st.st_size != want) {
+        error_setg(errp, "sf_ramstore_open_file: bad magic/version/page/size "
+                   "(size %zu want %zu)", (size_t)st.st_size, want);
+        munmap(base, st.st_size);
+        close(fd);
+        return -1;
+    }
+    crc = crc32c(0, (uint8_t *)base + off, want - off);
+    if (crc != hdr->crc32c) {
+        error_setg(errp, "sf_ramstore_open_file: crc mismatch (%08x vs %08x)",
+                   crc, hdr->crc32c);
+        munmap(base, st.st_size);
+        close(fd);
+        return -1;
+    }
+    s->fd = fd;
+    s->map_len = want;
+    s->n_pages = hdr->n_pages;
+    sf_store_map_ptrs(s, base, hdr->n_pages);
+    return 0;
 }
 
 int sf_key_cmp(const void *a, const void *b)

@@ -76,6 +76,9 @@ typedef struct SfStoreHdr {
  * root特例: hdr=NULL, index=NULL, data=NULL — the root shadow lives in the
  * dirty engine's per-block shadows; sf_resolve falls through to it.
  */
+#define SF_STORE_MAGIC   0x53465254u   /* "SFRT" */
+#define SF_STORE_VERSION 1u
+
 typedef struct SfRamStore {
     SfStoreHdr *hdr;
     SfPageKey  *index;     /* ascending; NULL for root */
@@ -83,6 +86,7 @@ typedef struct SfRamStore {
     SfBacking   backing;
     uint32_t    n_pages;
     int         fd;        /* FILE backing fd; -1 for ANON */
+    size_t      map_len;   /* FILE: contiguous mmap length; 0 for ANON */
 } SfRamStore;
 
 /*
@@ -141,6 +145,16 @@ int        sf_key_cmp(const void *a, const void *b);  /* qsort/bsearch SfPageKey
 int   sf_ramstore_create_anon(SfRamStore *s, uint32_t n_pages);
 void  sf_ramstore_destroy(SfRamStore *s);
 int   sf_ramstore_lookup(const SfRamStore *s, SfPageKey key);  /* bsearch; -1 if absent */
+
+/* FILE backing (T6 persistence, plan 07 §2). Layout == on-disk == in-mmap:
+ *   [hdr][index n_pages×key][pad→page][data n_pages×page]  (data page-aligned).
+ * create_file: O_RDWR mmap, writable, caller fills index/data (as for anon).
+ * seal: crc32c the payload into hdr, msync, mprotect(PROT_READ) → immutable/shareable.
+ * open_file: map an existing sealed file read-only, verifying magic/version/size/crc. */
+int   sf_ramstore_create_file(SfRamStore *s, uint32_t n_pages, const char *path,
+                              Error **errp);
+int   sf_ramstore_seal(SfRamStore *s, Error **errp);
+int   sf_ramstore_open_file(SfRamStore *s, const char *path, Error **errp);
 
 /* Owner resolution (design §3): ≤dst 的最近 owner 的 data page; root 兜底. */
 uint8_t *sf_resolve(SfSnapNode *dst, SfPageKey key);

@@ -940,6 +940,87 @@ bool sf_r3_spike_run(Monitor *mon, hwaddr gpa)
     return survived && advanced && tracked;
 }
 
+/* ---- ramstore FILE backing round-trip (T6 persistence, plan 07 §2) ----
+ * Pure host-side (no guest/KVM): create a file-backed store, fill index+data,
+ * seal, reopen read-only, verify byte-for-byte + lookup. Teeth: a corrupted
+ * payload byte on disk must be rejected by the crc check on open. */
+static void sf_selftest_ramstore_file(Monitor *mon, bool *all_ok)
+{
+    char buf[192];
+    Error *err = NULL;
+    const uint32_t n = 4;
+    size_t psize = qemu_real_host_page_size();
+    SfPageKey keys[4] = { SF_KEY(0, 0), SF_KEY(0, 5), SF_KEY(1, 2), SF_KEY(2, 100) };
+    SfRamStore w, r;
+    char *dir = g_dir_make_tmp("sf-ramstore-XXXXXX", NULL);
+    char *path;
+
+    if (!dir) {
+        report(mon, all_ok, "F ramstore-file", false, "g_dir_make_tmp failed");
+        return;
+    }
+    path = g_build_filename(dir, "node.ram", NULL);
+
+    if (sf_ramstore_create_file(&w, n, path, &err) < 0) {
+        report(mon, all_ok, "F ramstore-file", false, error_get_pretty(err));
+        error_free(err);
+        goto out;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        w.index[i] = keys[i];
+        memset(w.data + (size_t)i * psize, 0xA0 + i, psize);
+    }
+    if (sf_ramstore_seal(&w, &err) < 0) {
+        report(mon, all_ok, "F ramstore-file", false, error_get_pretty(err));
+        error_free(err);
+        sf_ramstore_destroy(&w);
+        goto out;
+    }
+    sf_ramstore_destroy(&w);   /* drop the writable mapping; file persists */
+
+    if (sf_ramstore_open_file(&r, path, &err) < 0) {
+        report(mon, all_ok, "F ramstore-file", false, error_get_pretty(err));
+        error_free(err);
+        goto out;
+    }
+    bool ok = (r.n_pages == n);
+    for (uint32_t i = 0; ok && i < n; i++) {
+        ok = (r.index[i] == keys[i]) &&
+             (r.data[(size_t)i * psize] == (uint8_t)(0xA0 + i)) &&
+             (sf_ramstore_lookup(&r, keys[i]) == (int)i);
+    }
+    sf_ramstore_destroy(&r);
+    snprintf(buf, sizeof(buf), "reopen n=%u index+data+lookup match=%d", n, ok);
+    report(mon, all_ok, "F ramstore-file roundtrip", ok, buf);
+
+    /* teeth: flip an index byte on disk (offset = 8-aligned after hdr) → crc rejects. */
+    {
+        int fd = open(path, O_RDWR);
+        uint8_t bad = 0xFF;
+        bool rejected = false;
+        if (fd >= 0 && pwrite(fd, &bad, 1, ROUND_UP(sizeof(SfStoreHdr), 8)) == 1) {
+            close(fd);
+            SfRamStore bad_r;
+            rejected = (sf_ramstore_open_file(&bad_r, path, &err) < 0);
+            if (!rejected) {
+                sf_ramstore_destroy(&bad_r);
+            }
+            error_free(err);
+            err = NULL;
+        } else if (fd >= 0) {
+            close(fd);
+        }
+        snprintf(buf, sizeof(buf), "corrupt-byte rejected=%d", rejected);
+        report(mon, all_ok, "F-neg ramstore-file crc teeth", rejected, buf);
+    }
+
+out:
+    unlink(path);
+    rmdir(dir);
+    g_free(path);
+    g_free(dir);
+}
+
 bool sf_selftest_all(Monitor *mon, Error **errp)
 {
     bool all_ok = true;
@@ -974,6 +1055,7 @@ bool sf_selftest_all(Monitor *mon, Error **errp)
     sf_selftest_tsc(mon, &all_ok);
     sf_selftest_snap(mon, &all_ok);
     sf_selftest_tripwire(mon, &all_ok);
+    sf_selftest_ramstore_file(mon, &all_ok);   /* host-only; runs under TCG + KVM */
 
     monitor_printf(mon, "sf: selftest overall: %s\n",
                    all_ok ? "GREEN (all cases as expected)" : "RED");

@@ -1,0 +1,539 @@
+/*
+ * sf/control/gate — guest-agency gate + QEMU-internal timeout (M3 slice 7).
+ * See gate.h for the two-dispatch-context design + plan §3/§4/§5.
+ *
+ * Threading: the state machine + the condvar handoff live here, guarded by
+ * sf_gate_mtx. The vcpu boundary (sf/checkpoint.c) calls sf_gate_recv (cond_wait)
+ * and the sf_gate_boundary_* deciders; the main-loop chardev read callback
+ * (channel.c) calls sf_gate_route, which for a STOPPED_TIMEOUT state dispatches
+ * directly (sf_gate_stopped_cmd) and for a PARKED_* state hands the cmd to the
+ * vcpu via the condvar. The timer fires on the main loop and is the only path
+ * that calls vm_stop; the boundary never does (plan §4.4: no vm_stop crutch at
+ * the I/O-exit boundary). The boundary disarms the timer under the mutex before
+ * claiming; the timer fires only if it sees state==RUNNING, so the two are
+ * serialized and the channel never observes the race (plan §4).
+ *
+ * Clean-room: no QEMU-Nyx code.
+ */
+#include "qemu/osdep.h"
+#include "qemu/thread.h"
+#include "qemu/main-loop.h"      /* bql_lock/bql_unlock */
+#include "qemu/timer.h"
+#include "system/runstate.h"
+#include "qapi/error.h"
+#include "sf/sf.h"                /* sf_checkpoint_snapshot */
+#include "sf/checkpoint.h"        /* SF_CP_SNAPSHOT/RESTORE + sf_cp_generation_* */
+#include "sf/snap/node.h"         /* sf_snap_restore / sf_active / have_snapshot */
+#include "sf/snap/cold.h"         /* sf_cold_start */
+#include "sf/control/channel.h"   /* sf_control_reply */
+#include "sf/control/gate.h"
+
+/* ---- sync + state (all under sf_gate_mtx) ---- */
+static QemuMutex sf_gate_mtx;
+static QemuCond  sf_gate_cond;
+static bool      sf_gate_have_cmd;
+static SfCtlCmd  sf_gate_cmd;
+
+static SfCtlState sf_gate_state = SF_CS_RUNNING;
+static SfGateMode sf_gate_mode   = SF_GATE_ALLOW;
+static int64_t    sf_gate_timeout_ms;        /* 0 = infinite (no timer) */
+static QEMUTimer *sf_gate_timer;
+
+/* Owed response at the current parked/stopped state (re-sent on reconnect). */
+static char sf_gate_pending_reply[64];
+static bool sf_gate_pending;
+static bool sf_gate_connected;
+
+/* ---- helpers (caller holds sf_gate_mtx) ---- */
+
+static void sf_gate_arm_locked(void)
+{
+    if (sf_gate_timeout_ms > 0) {
+        timer_mod(sf_gate_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + sf_gate_timeout_ms);
+    }
+}
+
+static void sf_gate_disarm_locked(void)
+{
+    timer_del(sf_gate_timer);
+}
+
+/* Record the owed reply for the parked/stopped state and mark it pending. */
+static void sf_gate_owe_locked(const char *reply)
+{
+    g_strlcpy(sf_gate_pending_reply, reply, sizeof(sf_gate_pending_reply));
+    sf_gate_pending = true;
+}
+
+/* Send the owed reply if connected; callable from vcpu (boundary) or main loop
+ * (on_connect). Reads state under the lock, writes the chardev outside it. */
+static void sf_gate_flush(void)
+{
+    char buf[64];
+    bool go;
+
+    qemu_mutex_lock(&sf_gate_mtx);
+    go = sf_gate_pending && sf_gate_connected;
+    if (go) {
+        memcpy(buf, sf_gate_pending_reply, sizeof(buf));
+        sf_gate_pending = false;
+    }
+    qemu_mutex_unlock(&sf_gate_mtx);
+    if (go) {
+        sf_control_reply(buf);
+    }
+}
+
+/* Transition to RUNNING (a resume is starting) + arm the timer. Caller holds
+ * the lock. No owed reply (the next stop reports the resume's outcome). */
+static void sf_gate_begin_resume_locked(void)
+{
+    sf_gate_state = SF_CS_RUNNING;
+    sf_gate_pending = false;
+    sf_gate_arm_locked();
+}
+
+/* ---- vcpu-thread boundary primitives ---- */
+
+void sf_gate_recv(SfCtlCmd *out)
+{
+    qemu_mutex_lock(&sf_gate_mtx);
+    while (!sf_gate_have_cmd) {
+        qemu_cond_wait(&sf_gate_cond, &sf_gate_mtx);
+    }
+    *out = sf_gate_cmd;
+    sf_gate_have_cmd = false;
+    qemu_mutex_unlock(&sf_gate_mtx);
+}
+
+SfCtlState sf_gate_state_locked(void)
+{
+    return sf_gate_state;   /* caller holds the lock */
+}
+
+bool sf_gate_snapshot_ok_locked(void)
+{
+    return sf_gate_state == SF_CS_PARKED_CHECKPOINT
+        || sf_gate_state == SF_CS_PARKED_SNAPSHOT;
+}
+
+/*
+ * Apply the gate to the guest's port-write value and emit the boundary's initial
+ * response. Returns true if the guest resumes (ALLOW self-restore), false if it
+ * stays parked. The claim (set a non-RUNNING state + disarm the timer) happens
+ * under the lock first so the timer fire callback can't race-claim; the heavy
+ * BQL save/restore runs outside the lock.
+ */
+bool sf_gate_boundary_enter(uint64_t val)
+{
+    SfGateMode mode;
+
+    qemu_mutex_lock(&sf_gate_mtx);
+    if (sf_gate_state != SF_CS_RUNNING) {
+        /* The timer already won (STOPPED_TIMEOUT). Defer: return so the vcpu
+         * leaves the MMIO handler; the in-flight vm_stop parks it. The timer
+         * already sent 't'. */
+        qemu_mutex_unlock(&sf_gate_mtx);
+        return true;
+    }
+    sf_gate_disarm_locked();            /* we reached a boundary before it fired */
+    sf_gate_state = SF_CS_PARKED_CHECKPOINT;   /* tentative claim */
+    sf_gate_have_cmd = false;           /* no command may predate this boundary */
+    mode = sf_gate_mode;
+    qemu_mutex_unlock(&sf_gate_mtx);
+
+    char rsp[64];
+    bool resume = false;
+
+    switch (mode) {
+    case SF_GATE_ALLOW:
+        if (val == SF_CP_SNAPSHOT) {
+            bql_lock();
+            sf_checkpoint_snapshot();
+            bql_unlock();
+            sf_cp_generation_reset();
+            snprintf(rsp, sizeof(rsp), "s %u\n",
+                      sf_active ? sf_active->id : 0);
+            qemu_mutex_lock(&sf_gate_mtx);
+            sf_gate_state = SF_CS_PARKED_SNAPSHOT;
+            sf_gate_owe_locked(rsp);
+            qemu_mutex_unlock(&sf_gate_mtx);
+        } else if (val == SF_CP_RESTORE) {
+            if (!sf_snap_have_snapshot()) {
+                qemu_mutex_lock(&sf_gate_mtx);
+                sf_gate_state = SF_CS_PARKED_CHECKPOINT;
+                sf_gate_owe_locked("e no-snapshot\n");
+                qemu_mutex_unlock(&sf_gate_mtx);
+            } else {
+                Error *err = NULL;
+                uint32_t id = sf_active ? sf_active->id : 0;
+                bql_lock();
+                int r = sf_snap_restore(id, NULL, &err);
+                bql_unlock();
+                if (r < 0) {
+                    fprintf(stderr, "sf-gate: self-restore %u failed: %s\n",
+                            id, error_get_pretty(err));
+                    error_free(err);
+                    qemu_mutex_lock(&sf_gate_mtx);
+                    sf_gate_state = SF_CS_PARKED_CHECKPOINT;
+                    sf_gate_owe_locked("e restore-failed\n");
+                    qemu_mutex_unlock(&sf_gate_mtx);
+                } else {
+                    sf_cp_generation_inc();
+                    qemu_mutex_lock(&sf_gate_mtx);
+                    sf_gate_begin_resume_locked();
+                    qemu_mutex_unlock(&sf_gate_mtx);
+                    resume = true;
+                }
+            }
+        } else {
+            /* stop (0) or any unrecognized value: park as a checkpoint */
+            qemu_mutex_lock(&sf_gate_mtx);
+            sf_gate_state = SF_CS_PARKED_CHECKPOINT;
+            sf_gate_owe_locked("c\n");
+            qemu_mutex_unlock(&sf_gate_mtx);
+        }
+        break;
+
+    case SF_GATE_DISABLE:
+        /* any guest cmd yields -> 'c', host decides */
+        qemu_mutex_lock(&sf_gate_mtx);
+        sf_gate_state = SF_CS_PARKED_CHECKPOINT;
+        sf_gate_owe_locked("c\n");
+        qemu_mutex_unlock(&sf_gate_mtx);
+        break;
+
+    case SF_GATE_STRICT:
+        if (val == SF_CP_SNAPSHOT || val == SF_CP_RESTORE) {
+            /* non-stop intent -> panic -> 'x' (snapshot now rejected) */
+            qemu_mutex_lock(&sf_gate_mtx);
+            sf_gate_state = SF_CS_PARKED_CRASH;
+            sf_gate_owe_locked("x\n");
+            qemu_mutex_unlock(&sf_gate_mtx);
+        } else {
+            qemu_mutex_lock(&sf_gate_mtx);
+            sf_gate_state = SF_CS_PARKED_CHECKPOINT;
+            sf_gate_owe_locked("c\n");
+            qemu_mutex_unlock(&sf_gate_mtx);
+        }
+        break;
+    }
+
+    if (!resume) {
+        sf_gate_flush();   /* emit the boundary's initial response ('c'/'s <id>'/'x'/'e ...') */
+    }
+    return resume;
+}
+
+/* One command in the boundary loop (vcpu parked). Returns true if the guest
+ * resumes (c/r/C), false to stay parked. */
+bool sf_gate_boundary_cmd(const SfCtlCmd *cmd)
+{
+    switch (cmd->kind) {
+    case SF_CTL_CONTINUE:
+        qemu_mutex_lock(&sf_gate_mtx);
+        sf_gate_begin_resume_locked();
+        qemu_mutex_unlock(&sf_gate_mtx);
+        return true;
+
+    case SF_CTL_SNAPSHOT: {
+        qemu_mutex_lock(&sf_gate_mtx);
+        bool ok = sf_gate_snapshot_ok_locked();
+        qemu_mutex_unlock(&sf_gate_mtx);
+        if (!ok) {
+            sf_control_reply("e invalid-state\n");
+            return false;
+        }
+        bql_lock();
+        sf_checkpoint_snapshot();
+        bql_unlock();
+        sf_cp_generation_reset();
+        char rsp[64];
+        snprintf(rsp, sizeof(rsp), "s %u\n", sf_active ? sf_active->id : 0);
+        qemu_mutex_lock(&sf_gate_mtx);
+        sf_gate_state = SF_CS_PARKED_SNAPSHOT;
+        sf_gate_owe_locked(rsp);
+        qemu_mutex_unlock(&sf_gate_mtx);
+        sf_gate_flush();
+        return false;
+    }
+
+    case SF_CTL_RESTORE: {
+        uint32_t id = cmd->has_id ? cmd->id : (sf_active ? sf_active->id : 0);
+        if (!sf_snap_have_snapshot()) {
+            sf_control_reply("e no-snapshot\n");
+            return false;
+        }
+        Error *err = NULL;
+        bql_lock();
+        int r = sf_snap_restore(id, NULL, &err);
+        bql_unlock();
+        if (r < 0) {
+            fprintf(stderr, "sf-gate: restore %u failed: %s\n",
+                    id, error_get_pretty(err));
+            error_free(err);
+            sf_control_reply("e restore-failed\n");
+            return false;
+        }
+        sf_cp_generation_inc();
+        qemu_mutex_lock(&sf_gate_mtx);
+        sf_gate_begin_resume_locked();
+        qemu_mutex_unlock(&sf_gate_mtx);
+        return true;
+    }
+
+    case SF_CTL_COLDSTART: {
+        if (!cmd->dir[0] || !cmd->has_id) {
+            sf_control_reply("e cold-start-needs-dir-and-id\n");
+            return false;
+        }
+        Error *err = NULL;
+        bql_lock();
+        int r = sf_cold_start(cmd->dir, cmd->id, &err);
+        bql_unlock();
+        if (r < 0) {
+            fprintf(stderr, "sf-gate: cold-start %s/%u failed: %s\n",
+                    cmd->dir, cmd->id, error_get_pretty(err));
+            error_free(err);
+            sf_control_reply("e cold-start-failed\n");
+            return false;
+        }
+        sf_cp_generation_inc();
+        qemu_mutex_lock(&sf_gate_mtx);
+        sf_gate_begin_resume_locked();
+        qemu_mutex_unlock(&sf_gate_mtx);
+        return true;
+    }
+
+    case SF_CTL_GATE:
+        qemu_mutex_lock(&sf_gate_mtx);
+        sf_gate_mode = cmd->gmode;
+        qemu_mutex_unlock(&sf_gate_mtx);
+        sf_control_reply("o\n");
+        return false;
+
+    case SF_CTL_TIMEOUT:
+        qemu_mutex_lock(&sf_gate_mtx);
+        sf_gate_timeout_ms = cmd->timeout_ms;
+        qemu_mutex_unlock(&sf_gate_mtx);
+        sf_control_reply("o\n");
+        return false;
+
+    case SF_CTL_BAD:
+    default:
+        sf_control_reply("e bad-command\n");
+        return false;
+    }
+}
+
+/* ---- main-loop stopped dispatch (after timeout) ---- */
+
+/* Resume-class from the stopped state: vm_start (+ restore/cold-start under BQL
+ * first if any), transition to RUNNING, arm the timer. The reply is deferred to
+ * the next stop. @what: 0=c, 1=r, 2=C. Returns true if a resume started. */
+static bool sf_gate_stopped_resume(const SfCtlCmd *cmd)
+{
+    /* The chardev read callback runs in the main loop; it may or may not hold
+     * the BQL depending on the dispatch path. Take the BQL only if not already
+     * held (an unconditional bql_lock would assert) — same pattern as the
+     * standalone sf_cp_write. Restore/cold-start + vm_start then run under it,
+     * mirroring the HMP crutch (vm_stop done by the timer + restore + vm_start). */
+    bool take_bql = !bql_locked();
+
+    if (cmd->kind == SF_CTL_RESTORE) {
+        if (!sf_snap_have_snapshot()) {
+            sf_control_reply("e no-snapshot\n");
+            return false;
+        }
+        uint32_t id = cmd->has_id ? cmd->id : (sf_active ? sf_active->id : 0);
+        Error *err = NULL;
+        if (take_bql) { bql_lock(); }
+        int r = sf_snap_restore(id, NULL, &err);
+        if (r < 0) {
+            if (take_bql) { bql_unlock(); }
+            fprintf(stderr, "sf-gate: stopped restore %u failed: %s\n",
+                    id, error_get_pretty(err));
+            error_free(err);
+            sf_control_reply("e restore-failed\n");
+            return false;
+        }
+        sf_cp_generation_inc();
+        /* vm_start with the BQL held (matches HMP); release before the gate
+         * mutex to keep sf_gate_mtx never nested under the BQL. */
+        vm_start();
+        if (take_bql) { bql_unlock(); }
+    } else if (cmd->kind == SF_CTL_COLDSTART) {
+        if (!cmd->dir[0] || !cmd->has_id) {
+            sf_control_reply("e cold-start-needs-dir-and-id\n");
+            return false;
+        }
+        Error *err = NULL;
+        if (take_bql) { bql_lock(); }
+        int r = sf_cold_start(cmd->dir, cmd->id, &err);
+        if (r < 0) {
+            if (take_bql) { bql_unlock(); }
+            fprintf(stderr, "sf-gate: stopped cold-start %s/%u failed: %s\n",
+                    cmd->dir, cmd->id, error_get_pretty(err));
+            error_free(err);
+            sf_control_reply("e cold-start-failed\n");
+            return false;
+        }
+        sf_cp_generation_inc();
+        vm_start();
+        if (take_bql) { bql_unlock(); }
+    } else {
+        /* SF_CTL_CONTINUE: just resume. */
+        vm_start();
+    }
+    qemu_mutex_lock(&sf_gate_mtx);
+    sf_gate_begin_resume_locked();
+    qemu_mutex_unlock(&sf_gate_mtx);
+    return true;
+}
+
+void sf_gate_stopped_cmd(const SfCtlCmd *cmd)
+{
+    switch (cmd->kind) {
+    case SF_CTL_CONTINUE:
+    case SF_CTL_RESTORE:
+    case SF_CTL_COLDSTART:
+        sf_gate_stopped_resume(cmd);   /* deferred reply; stay stopped on error */
+        break;
+
+    case SF_CTL_SNAPSHOT:
+        /* timeout stop is not a persistable boundary (plan §4) */
+        sf_control_reply("e invalid-state\n");
+        break;
+
+    case SF_CTL_GATE:
+        qemu_mutex_lock(&sf_gate_mtx);
+        sf_gate_mode = cmd->gmode;
+        qemu_mutex_unlock(&sf_gate_mtx);
+        sf_control_reply("o\n");
+        break;
+
+    case SF_CTL_TIMEOUT:
+        qemu_mutex_lock(&sf_gate_mtx);
+        sf_gate_timeout_ms = cmd->timeout_ms;
+        qemu_mutex_unlock(&sf_gate_mtx);
+        sf_control_reply("o\n");
+        break;
+
+    case SF_CTL_BAD:
+    default:
+        sf_control_reply("e bad-command\n");
+        break;
+    }
+}
+
+/* ---- timer + connection (main loop) ---- */
+
+/*
+ * vm_stop can't run inside a QEMUTimer callback: pause_all_vcpus ->
+ * qemu_clock_enable(QEMU_CLOCK_VIRTUAL, false) waits on the timer list's
+ * timers_done_ev, which is only set after this timerlist_run_timers iteration
+ * returns — i.e. after we return — so a direct vm_stop here self-deadlocks. So
+ * the timer just claims the stop (state + owed 't') and defers the vm_stop to
+ * the main loop via qemu_system_vmstop_request; a vm_change_state_handler
+ * (sf_gate_vm_state_cb) flushes 't' once the deferred vm_stop completes and the
+ * vcpu is actually parked. The boundary disarming the timer before this callback
+ * runs is the only other contender; the channel mutex serializes them (plan §4).
+ */
+static void sf_gate_vm_state_cb(void *opaque, bool running, RunState state)
+{
+    bool owe;
+
+    if (running || state != RUN_STATE_PAUSED) {
+        return;
+    }
+    qemu_mutex_lock(&sf_gate_mtx);
+    owe = (sf_gate_state == SF_CS_STOPPED_TIMEOUT) && sf_gate_pending;
+    qemu_mutex_unlock(&sf_gate_mtx);
+    if (owe) {
+        sf_gate_flush();   /* the deferred timeout vm_stop finished -> send 't' */
+    }
+}
+
+void sf_gate_timer_fire(void *opaque)
+{
+    qemu_mutex_lock(&sf_gate_mtx);
+    if (sf_gate_state != SF_CS_RUNNING) {
+        /* the boundary claimed first (disarmed) — no-op */
+        qemu_mutex_unlock(&sf_gate_mtx);
+        return;
+    }
+    sf_gate_state = SF_CS_STOPPED_TIMEOUT;
+    sf_gate_owe_locked("t\n");
+    qemu_mutex_unlock(&sf_gate_mtx);
+
+    /* Defer vm_stop to the main loop (see comment above). The owed 't' is sent
+     * by sf_gate_vm_state_cb once the stop completes. */
+    qemu_system_vmstop_request_prepare();
+    qemu_system_vmstop_request(RUN_STATE_PAUSED);
+}
+
+void sf_gate_on_connect(void)
+{
+    qemu_mutex_lock(&sf_gate_mtx);
+    sf_gate_connected = true;
+    qemu_mutex_unlock(&sf_gate_mtx);
+    sf_gate_flush();   /* if parked/stopped with an owed reply, announce it */
+}
+
+void sf_gate_on_disconnect(void)
+{
+    qemu_mutex_lock(&sf_gate_mtx);
+    sf_gate_connected = false;
+    /* Re-owe the current boundary/stopped reply so a reconnect re-sends it. */
+    if (sf_gate_state != SF_CS_RUNNING) {
+        sf_gate_pending = true;
+    }
+    qemu_mutex_unlock(&sf_gate_mtx);
+}
+
+/* ---- init (from sf_control_init, once chardev attached) ---- */
+
+void sf_gate_init(void)
+{
+    qemu_mutex_init(&sf_gate_mtx);
+    qemu_cond_init(&sf_gate_cond);
+    sf_gate_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, sf_gate_timer_fire, NULL);
+    sf_gate_state = SF_CS_RUNNING;
+    sf_gate_mode = SF_GATE_ALLOW;
+    sf_gate_timeout_ms = 0;     /* infinite until a 'T' command sets it */
+    sf_gate_have_cmd = false;
+    sf_gate_connected = false;
+    /* Flush the owed 't' once the deferred timeout vm_stop completes. */
+    qemu_add_vm_change_state_handler(sf_gate_vm_state_cb, NULL);
+}
+
+/* ---- channel.c read-callback routing (called with a parsed line) ---- */
+
+void sf_gate_route(const SfCtlCmd *cmd)
+{
+    SfCtlState st;
+
+    qemu_mutex_lock(&sf_gate_mtx);
+    st = sf_gate_state;
+    if (st == SF_CS_PARKED_CHECKPOINT || st == SF_CS_PARKED_SNAPSHOT
+        || st == SF_CS_PARKED_CRASH) {
+        /* hand the command to the parked vcpu via the condvar */
+        sf_gate_cmd = *cmd;
+        sf_gate_have_cmd = true;
+        qemu_cond_signal(&sf_gate_cond);
+        qemu_mutex_unlock(&sf_gate_mtx);
+        return;
+    }
+    qemu_mutex_unlock(&sf_gate_mtx);
+
+    if (st == SF_CS_STOPPED_TIMEOUT) {
+        sf_gate_stopped_cmd(cmd);   /* main-loop dispatch */
+    } else {
+        /* SF_CS_RUNNING: host sent a command mid-flight — protocol violation.
+         * ponytail: a hard 'e busy' reply is a deferred refinement; for now the
+         * rig never sends during flight, so drop + log. */
+        fprintf(stderr, "sf-gate: cmd '%d' during running — dropped\n",
+                (int)cmd->kind);
+    }
+}

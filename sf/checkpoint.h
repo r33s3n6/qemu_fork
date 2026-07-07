@@ -15,4 +15,10 @@
 #define SF_CP_SNAPSHOT   1
 #define SF_CP_RESTORE    2
 
+/* Host-side restore-generation accessors (kept in sf/checkpoint.c, updated by
+ * sf/control/gate.c on snapshot/restore so the single-site probe still tells
+ * gen 0 from gen k). */
+void sf_cp_generation_reset(void);   /* gen = 0 (after a snapshot) */
+void sf_cp_generation_inc(void);     /* gen++ (after a restore / cold-start) */
+
 #endif /* SF_CHECKPOINT_H */

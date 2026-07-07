@@ -1,6 +1,7 @@
 /*
  * sf/checkpoint — guest→host CHECKPOINT channel (design: research/plans/
- * 2026-07-05-03-restore-semantics-implementation-progress.md §CHECKPOINT 通道).
+ * 2026-07-05-03-restore-semantics-implementation-progress.md §CHECKPOINT 通道
+ * + 2026-07-07-m3-control-channel.md §5 slice 7).
  *
  * Terminal coherence mechanism (ARCHITECTURE.md §4.4/§5): snapshot AND restore
  * execute on the vcpu thread at an I/O-exit boundary — the guest is naturally
@@ -11,8 +12,13 @@
  * a command to SF_CP_PORT triggers it; reading returns the restore generation
  * counter (kept host-side, outside guest RAM, so restore does not roll it back).
  *
- * Step A: this file only proves the channel fires on the vcpu thread. Snapshot
- * and restore wiring land in Steps B/C.
+ * Slice 6: when a control channel is attached, a guest port write parks the
+ * guest and lets the host drive. Slice 7: the guest's port-write value now
+ * carries intent routed through the gate (ALLOW/DISABLE/STRICT), and a QEMU-
+ * internal timeout timer can stop the guest mid-flight; the brain (state machine,
+ * gate, timer, both dispatch contexts) is in sf/control/gate.c. This file is the
+ * vcpu-thread entry: it hands the guest cmd value to sf_gate_boundary_enter and
+ * runs the parked command loop via sf_gate_recv / sf_gate_boundary_cmd.
  *
  * Clean-room: no QEMU-Nyx code.
  */
@@ -24,17 +30,17 @@
 #include "system/address-spaces.h"
 #include "system/system.h"
 #include "hw/core/cpu.h"
-#include "qapi/error.h"
 #include "sf/sf.h"
 #include "sf/checkpoint.h"
-#include "sf/snap/node.h"       /* sf_snap_restore / sf_active / have_snapshot */
-#include "sf/snap/cold.h"       /* sf_cold_start */
-#include "sf/control/channel.h"
+#include "sf/control/gate.h"
 
 /* Host-side restore generation: 0 after snapshot, +1 per restore. Lives outside
  * guest RAM so a RAM rollback does not reset it — this is how the guest probe
  * tells "just snapshotted" (gen 0) from "just restored" (gen k) at the one site. */
 static uint32_t g_sf_cp_generation;
+
+void sf_cp_generation_reset(void)  { g_sf_cp_generation = 0; }
+void sf_cp_generation_inc(void)   { g_sf_cp_generation++; }
 
 static uint64_t sf_cp_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -42,95 +48,35 @@ static uint64_t sf_cp_read(void *opaque, hwaddr addr, unsigned size)
 }
 
 /*
- * Control-channel boundary (slice 6b). When a channel is attached, a guest port
- * write means "reached a boundary": park the guest and let the host drive.
- * sf_control_recv blocks on a condvar with the main loop free to receive commands,
- * so it MUST run BQL-free; we take the BQL only around save/restore/cold-start.
- * Under KVM the boundary is already BQL-free (lockless_io, slice 6a); under TCG the
- * I/O path enters with the BQL held (cputlb BQL_LOCK_GUARD), so drop it for the
- * duration and restore it on exit — the caller's invariant is preserved either way.
- * continue/restore/cold-start resume the guest; snapshot replies and loops (guest
- * stays parked). The guest command value (SNAPSHOT/RESTORE) is ignored — guest
- * agency is the gate's job (slice 7). The generation counter is kept in sync with
- * the standalone path so the single-site probe still tells snapshot (gen 0) from
- * restore (gen k).
+ * Control-channel boundary (slice 6b/7). When a channel is attached, a guest
+ * port write means "reached a boundary": park the guest and let the host drive.
+ * sf_gate_boundary_enter blocks on a condvar with the main loop free to receive
+ * commands (gate.c), so it MUST run BQL-free; the BQL is taken only around
+ * save/restore inside gate.c. Under KVM the boundary is already BQL-free
+ * (lockless_io, slice 6a); under TCG the I/O path enters with the BQL held
+ * (cputlb BQL_LOCK_GUARD), so drop it for the duration and restore it on exit —
+ * the caller's invariant is preserved either way. The guest cmd value routes
+ * through the gate; continue/restore/cold-start resume, snapshot replies and
+ * loops. The generation counter is kept in sync with the standalone path so the
+ * single-site probe still tells snapshot (gen 0) from restore (gen k).
  */
-static void sf_control_boundary(void)
+static void sf_control_boundary(uint64_t val)
 {
-    Error *err = NULL;
-    SfCtlCmd cmd;
-    char rsp[64];
     bool had_bql = bql_locked();
 
     if (had_bql) {
         bql_unlock();
     }
-    sf_control_boundary_enter();   /* emits 'c' = the response to the resume that ran us here */
+    if (sf_gate_boundary_enter(val)) {
+        goto out;              /* gate self-restored (ALLOW): resume to next boundary */
+    }
     for (;;) {
-        sf_control_recv(&cmd);     /* blocks; BQL not held */
-        switch (cmd.kind) {
-        case SF_CTL_CONTINUE:
-            sf_control_boundary_exit();
-            goto out;              /* resume to the next boundary */
-
-        case SF_CTL_SNAPSHOT:
-            bql_lock();
-            sf_checkpoint_snapshot();
-            bql_unlock();
-            g_sf_cp_generation = 0;
-            snprintf(rsp, sizeof(rsp), "s %u\n", sf_active ? sf_active->id : 0);
-            sf_control_reply(rsp);
-            break;                 /* stay parked, wait for the next command */
-
-        case SF_CTL_RESTORE: {
-            uint32_t id = cmd.has_id ? cmd.id
-                                     : (sf_active ? sf_active->id : 0);
-            if (!sf_snap_have_snapshot()) {
-                sf_control_reply("e no-snapshot\n");
-                break;
-            }
-            bql_lock();
-            int r = sf_snap_restore(id, NULL, &err);
-            bql_unlock();
-            if (r < 0) {
-                fprintf(stderr, "sf-ctl: restore %u failed: %s\n", id,
-                        error_get_pretty(err));
-                error_free(err);
-                err = NULL;
-                sf_control_reply("e restore-failed\n");
-                break;
-            }
-            g_sf_cp_generation++;
-            sf_control_boundary_exit();
-            goto out;              /* resume at the restored site */
+        SfCtlCmd cmd;
+        sf_gate_recv(&cmd);             /* blocks; BQL not held */
+        if (sf_gate_boundary_cmd(&cmd)) {
+            break;                      /* c/r/C: resume to the next boundary */
         }
-
-        case SF_CTL_COLDSTART: {
-            if (!cmd.dir[0] || !cmd.has_id) {
-                sf_control_reply("e cold-start-needs-dir-and-id\n");
-                break;
-            }
-            bql_lock();
-            int r = sf_cold_start(cmd.dir, cmd.id, &err);
-            bql_unlock();
-            if (r < 0) {
-                fprintf(stderr, "sf-ctl: cold-start %s/%u failed: %s\n",
-                        cmd.dir, cmd.id, error_get_pretty(err));
-                error_free(err);
-                err = NULL;
-                sf_control_reply("e cold-start-failed\n");
-                break;
-            }
-            g_sf_cp_generation++;
-            sf_control_boundary_exit();
-            goto out;              /* resume at the loaded+restored site */
-        }
-
-        case SF_CTL_BAD:
-        default:
-            sf_control_reply("e bad-command\n");
-            break;
-        }
+        /* else: stay parked, wait for the next command */
     }
 out:
     if (had_bql) {
@@ -148,10 +94,11 @@ static void sf_cp_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         return;
     }
 
-    /* Channel attached → host-driven boundary (slice 6b); the guest command value
-     * is ignored. Otherwise fall through to the standalone guest-driven path. */
+    /* Channel attached → host-driven boundary (slice 6b/7); the guest command
+     * value routes through the gate. Otherwise fall through to the standalone
+     * guest-driven path. */
     if (sf_control_active()) {
-        sf_control_boundary();
+        sf_control_boundary(val);
         return;
     }
 
@@ -203,8 +150,8 @@ static void sf_cp_machine_done(Notifier *n, void *unused)
                           "sf-checkpoint", SF_CP_PORT_SIZE);
     /* BQL-free dispatch: without this, prepare_mmio_access() would auto-take the
      * BQL around sf_cp_write for the duration of the access. We want the boundary
-     * to run lock-free (so a future control-channel wait doesn't hold the BQL) and
-     * take the BQL ourselves only around save/restore (plan §5.6). */
+     * to run lock-free (so a control-channel wait doesn't hold the BQL) and take
+     * the BQL ourselves only around save/restore (plan §5.6). */
     memory_region_enable_lockless_io(&sf_cp_io);
     memory_region_add_subregion(get_system_io(), SF_CP_PORT, &sf_cp_io);
     fprintf(stderr, "sf-cp: channel registered at port 0x%x (size %d)\n",

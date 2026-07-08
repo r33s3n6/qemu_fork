@@ -16,7 +16,8 @@
  * vm_stop — the single vCPU is already parked out of KVM_RUN with the BQL held.
  */
 void sf_checkpoint_snapshot(void);
-void sf_checkpoint_restore(void);
+/* sf_checkpoint_restore(uint32_t id) is declared in sf/checkpoint.h (it owns
+ * the guest→host CHECKPOINT ABI, incl. the id-based restore contract). */
 
 /* Test knob (defined in sf/snap/restore.c): true iff SF_CP_SKIP_TSC is set, so
  * the terminal snapshot path can omit the forced TSC refreeze and the phase1.5

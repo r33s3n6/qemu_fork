@@ -10,6 +10,8 @@
 #include "qemu/queue.h"
 #include "qemu/crc32c.h"
 #include "exec/cpu-common.h"
+#include "system/memory.h"
+#include "system/address-spaces.h"
 #include "system/ramblock.h"
 #include "system/ramlist.h"
 #include "sf/dirty/engine.h"
@@ -265,6 +267,26 @@ bool sf_host_to_key_safe(void *host_page, SfPageKey *out)
         }
     }
     return false;
+}
+
+/* Host address of guest-physical @gpa. Page-aligned inputs → aligned output,
+ * and the result is the SAME host pointer save/restore walks (sf_key_to_host +
+ * sf_blocks[i].host), because memory_region_get_ram_ptr returns the RAMBlock's
+ * host base — so it feeds straight into sf_exclude_add. Promoted here from
+ * selftest.c (its old static) so the guest NO_RESTORE ABI (sf/checkpoint.c) and
+ * selftest share one implementation. */
+void *sf_gpa_to_host(hwaddr gpa)
+{
+    MemoryRegionSection s = memory_region_find(get_system_memory(), gpa, 1);
+    void *host = NULL;
+
+    if (s.mr) {
+        if (memory_region_is_ram(s.mr)) {
+            host = memory_region_get_ram_ptr(s.mr) + s.offset_within_region;
+        }
+        memory_region_unref(s.mr);
+    }
+    return host;
 }
 
 uint8_t *sf_key_to_host(SfPageKey key)

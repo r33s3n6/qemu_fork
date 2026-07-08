@@ -172,6 +172,11 @@ bool       sf_host_to_key_safe(void *host_page, SfPageKey *out);  /* false if un
 uint8_t   *sf_key_to_host(SfPageKey key);        /* key → live host page base; NULL if bad */
 int        sf_key_cmp(const void *a, const void *b);  /* qsort/bsearch SfPageKey order */
 
+/* Host address backing guest-physical @gpa (RAM only); NULL if not RAM. The
+ * result is the same host pointer save/restore walks, so it feeds sf_exclude_add
+ * for the guest NO_RESTORE register ABI. */
+void      *sf_gpa_to_host(hwaddr gpa);
+
 /* ---- Ramstore ---- */
 int   sf_ramstore_create_anon(SfRamStore *s, uint32_t n_pages);
 void  sf_ramstore_destroy(SfRamStore *s);

@@ -63,21 +63,9 @@ static uint32_t sf_rd32(hwaddr gpa)
     return v;
 }
 
-/* Host address of guest-physical @gpa (page-aligned inputs -> aligned output,
- * matching what sf_kvm_collect_dirty reports). */
-static void *sf_gpa_to_host(hwaddr gpa)
-{
-    MemoryRegionSection s = memory_region_find(get_system_memory(), gpa, 1);
-    void *host = NULL;
-
-    if (s.mr) {
-        if (memory_region_is_ram(s.mr)) {
-            host = memory_region_get_ram_ptr(s.mr) + s.offset_within_region;
-        }
-        memory_region_unref(s.mr);
-    }
-    return host;
-}
+/* Host address of guest-physical @gpa — shared impl in sf/snap/node.c
+ * (sf_gpa_to_host). Page-aligned inputs -> aligned output, matching what
+ * sf_kvm_collect_dirty reports. */
 
 /* Let the guest run for ~@ms ms so its vcpus dirty RAM, then stop again. */
 static void sf_run_guest_ms(unsigned ms)

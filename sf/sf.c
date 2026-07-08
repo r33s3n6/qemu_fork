@@ -18,6 +18,7 @@
 #include "hw/core/cpu.h"
 #include "hw/i386/kvm/clock.h"
 #include "sf/sf.h"
+#include "sf/checkpoint.h"
 #include "sf/kvm_tsc.h"
 #include "sf/vmstate_replay/preparse.h"
 #include "sf/vmstate_replay/replay.h"
@@ -344,12 +345,16 @@ void sf_checkpoint_snapshot(void)
 }
 
 /*
- * Terminal restore — called from the CHECKPOINT ioport handler on the vcpu
- * thread. No vm_stop. sf_snap_restore applies device replay + RAM rollback +
- * CPU/TSC push + the explicit kvmclock/vapic tail (no vm_start here). The
- * SF_CP_SKIP env knob injects a device-replay skip to prove a gate has teeth.
+ * Terminal restore to an explicit node id — called from the CHECKPOINT ioport
+ * handler on the vcpu thread. No vm_stop. The engine sf_snap_restore(dst_id)
+ * already accepts any id; this wrapper just hands it through (the old form
+ * hardcoded sf_active->id). sf_snap_restore applies device replay + RAM
+ * rollback + CPU/TSC push + the explicit kvmclock/vapic tail (no vm_start
+ * here). The SF_CP_SKIP env knob injects a device-replay skip to prove a gate
+ * has teeth. Returns true on success, false on bad id / restore error so the
+ * caller can surface a 0xFFFFFFFF readback (plan 2026-07-08 T1 §2.1).
  */
-void sf_checkpoint_restore(void)
+bool sf_checkpoint_restore(uint32_t id)
 {
     Error *err = NULL;
     SfReplayDebug debug, *dbgp = NULL;
@@ -357,7 +362,13 @@ void sf_checkpoint_restore(void)
 
     if (!sf_snap_have_snapshot()) {
         fprintf(stderr, "sf-cp: restore with no snapshot — ignored\n");
-        return;
+        return false;
+    }
+    if (sf_active == NULL || id != sf_active->id) {
+        if (sf_node_find(id) == NULL) {
+            fprintf(stderr, "sf-cp: restore bad id=%u — not found\n", id);
+            return false;
+        }
     }
     if (skip && *skip && sf_active && sf_active->dev.have) {
         if (sf_parse_restore_debug(NULL, skip, &sf_active->dev.tables, &debug)) {
@@ -366,12 +377,13 @@ void sf_checkpoint_restore(void)
             fprintf(stderr, "sf-cp: bad SF_CP_SKIP='%s' — ignored\n", skip);
         }
     }
-    sf_snap_restore(sf_active->id, dbgp, &err);
+    sf_snap_restore(id, dbgp, &err);
     if (err) {
         fprintf(stderr, "sf-cp: restore failed: %s\n", error_get_pretty(err));
         error_free(err);
-        return;
+        return false;
     }
-    fprintf(stderr, "sf-cp: restore applied%s%s\n",
+    fprintf(stderr, "sf-cp: restore applied id=%u%s%s\n", id,
             dbgp ? " skip=" : "", dbgp ? skip : "");
+    return true;
 }

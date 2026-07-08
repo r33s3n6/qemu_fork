@@ -26,6 +26,7 @@
 #include "qemu/module.h"
 #include "qemu/main-loop.h"   /* bql_lock/bql_unlock */
 #include "qemu/notify.h"
+#include "system/kvm.h"         /* kvm_enabled() */
 #include "system/memory.h"
 #include "system/address-spaces.h"
 #include "system/system.h"
@@ -33,6 +34,7 @@
 #include "sf/sf.h"
 #include "sf/checkpoint.h"
 #include "sf/control/gate.h"
+#include "sf/kvm_tsc.h"        /* sf_kvm_put_rax (outl reply in %rax, Nyx-style) */
 #include "sf/snap/node.h"      /* sf_gpa_to_host */
 #include "sf/snap/exclude.h"   /* sf_exclude_add / sf_exclude_count */
 
@@ -125,8 +127,9 @@ static void sf_cp_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 
     /* Standalone ABI (plan 2026-07-08 T1 §2.1): eax = (id<<8) | cmd. cmd is the
      * low 8 bits; id (high 24) targets a node for RESTORE, ignored for SNAPSHOT/
-     * NOP. The inl readback (g_sf_cp_reply) carries the new node id after a
-     * SNAPSHOT and the generation after a RESTORE. */
+     * NOP. The reply is returned in %eax on the SAME outl (Nyx-style; pushed to
+     * KVM below): SNAPSHOT → new node id, RESTORE → generation (0xFFFFFFFF on
+     * bad id), NOP → generation. No inl needed. */
     uint32_t cmd = val & SF_CP_CMD_MASK;
     uint32_t id  = val >> SF_CP_ID_SHIFT;
 
@@ -159,6 +162,16 @@ static void sf_cp_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         fprintf(stderr, "sf-cp: unknown cmd %" PRIu64 "\n", val);
         g_sf_cp_reply = 0xFFFFFFFFu;
         break;
+    }
+
+    /* Return the reply in %RAX on the SAME outl that carried the command (Nyx
+     * NO_PT_NYX model): the guest reads it back via a `+a` outl constraint, no
+     * inl, no second vmexit. Push directly (KVM_GET_REGS→rax→KVM_SET_REGS) so it
+     * sticks regardless of the lazy dirty path — for restore, post_init already
+     * pushed the snapshot CPU; this overwrites only rax. Under KVM only (TCG
+     * reads g_sf_cp_reply via the inl read handler if it ever does one). */
+    if (kvm_enabled()) {
+        sf_kvm_put_rax(current_cpu, g_sf_cp_reply);
     }
 }
 
@@ -217,10 +230,15 @@ static void sf_nr_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         buf_id = 1;
     }
     sf_exclude_add((uint64_t)(uintptr_t)host, req.size, buf_id);
+    uint32_t cnt = (uint32_t)sf_exclude_count();
     fprintf(stderr, "sf-nr: registered gpa=0x%" PRIx64 " size=%" PRIu64
-            " → host=%p buf_id=%u (count=%zu)\n",
-            (uint64_t)req.gpa, (uint64_t)req.size, host, buf_id,
-            sf_exclude_count());
+            " → host=%p buf_id=%u (count=%u)\n",
+            (uint64_t)req.gpa, (uint64_t)req.size, host, buf_id, cnt);
+    /* Return the new exclude count in %eax on the same outl (Nyx-style), so the
+     * guest confirms the range landed without an inl. */
+    if (kvm_enabled() && current_cpu) {
+        sf_kvm_put_rax(current_cpu, cnt);
+    }
 }
 
 static uint64_t sf_nr_read(void *opaque, hwaddr addr, unsigned size)

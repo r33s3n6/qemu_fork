@@ -38,4 +38,10 @@ uint64_t sf_kvm_read_tsc(CPUState *cs);
  * restore/snapshot-freeze paths so the rewind actually sticks. */
 void sf_kvm_refreeze_tsc(CPUState *cs);
 
+/* Put @value into the guest's %RAX and push to KVM directly (KVM_GET_REGS → rax
+ * → KVM_SET_REGS). Used by the CHECKPOINT port write handler to return the
+ * snapshot/restore reply on the same outl that carried the command (Nyx-style:
+ * the guest reads it via a `+a` outl constraint, no inl). */
+void sf_kvm_put_rax(CPUState *cs, uint64_t value);
+
 #endif /* SF_KVM_TSC_H */

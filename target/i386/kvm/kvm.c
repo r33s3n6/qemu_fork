@@ -3934,6 +3934,24 @@ void sf_kvm_refreeze_tsc(CPUState *cs)
     sf_kvm_force_tsc(cs, X86_CPU(cs)->env.tsc);
 }
 
+/* Put @value into the guest's %RAX and push it to KVM directly (KVM_GET_REGS →
+ * set rax → KVM_SET_REGS), bypassing the lazy dirty-flag path. Used by the
+ * CHECKPOINT port write handler (sf/checkpoint.c sf_cp_write) to return the
+ * snapshot/restore reply in %eax on the SAME outl that carried the command —
+ * so the guest reads it back via a `+a` output constraint on the outl, no inl
+ * (the Nyx NO_PT_NYX model). RIP and all other regs come back from KVM_GET_REGS
+ * unchanged (for restore, that's the snapshot's RIP = outl-after). */
+void sf_kvm_put_rax(CPUState *cs, uint64_t value)
+{
+    struct kvm_regs regs;
+    if (kvm_vcpu_ioctl(cs, KVM_GET_REGS, &regs) < 0) {
+        return;
+    }
+    regs.rax = value;
+    kvm_vcpu_ioctl(cs, KVM_SET_REGS, &regs);
+    X86_CPU(cs)->env.regs[R_EAX] = value;
+}
+
 void kvm_put_apicbase(X86CPU *cpu, uint64_t value)
 {
     int ret;

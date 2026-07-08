@@ -20,6 +20,7 @@
  */
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/thread.h"
 #include "monitor/monitor.h"
 #include "system/runstate.h"
 #include "system/hw_accel.h"
@@ -455,18 +456,132 @@ static size_t sf_build_restore_w(SfSnapNode *src, SfSnapNode *dst, SfSnapNode *L
     return sf_w_filter_excluded(acc, sf_w_sort_uniq(acc));
 }
 
-/* Apply W: for each key, memcpy(store→live) from the ≤dst nearest owner. */
-static void sf_apply_w(SfSnapNode *dst, const SfPageKey *keys, size_t n)
+/* Apply a slice [start,end) of W: memcpy(store→live) from the ≤dst nearest owner.
+ * resolve() only reads the (immutable-during-restore) node tree and each key maps
+ * to a distinct host page (W is sort_uniq'd), so slices run concurrently unlocked. */
+static void sf_apply_slice(SfSnapNode *dst, const SfPageKey *keys,
+                           size_t start, size_t end)
 {
     size_t psize = qemu_real_host_page_size();
-
-    for (size_t i = 0; i < n; i++) {
+    for (size_t i = start; i < end; i++) {
         uint8_t *host = sf_key_to_host(keys[i]);
         uint8_t *src_page = sf_resolve(dst, keys[i]);
         if (host && src_page) {
             memcpy(host, src_page, psize);
         }
     }
+}
+
+/* One persistent background copy thread: main thread + it = 2-way memcpy (the
+ * measured sweet spot, ~×2; more threads saturate memory bandwidth — archive
+ * 2026-06-21-08). Created lazily on first parallel apply so there's no per-restore
+ * spawn cost. ram= is 80–90% of restore, so this ~halves the dominant phase. */
+typedef struct {
+    QemuThread thread;
+    QemuMutex  mtx;
+    QemuCond   cond_work;   /* main → worker: a slice is ready */
+    QemuCond   cond_done;   /* worker → main: slice finished */
+    SfSnapNode *dst;
+    const SfPageKey *keys;
+    size_t start, end;
+    bool have_work, done, started;
+} SfApplyWorker;
+
+static SfApplyWorker g_apply_worker;
+
+/* Below this W it's not worth the handoff — just run it on the caller. */
+#define SF_APPLY_PARALLEL_MIN 2048
+
+static void *sf_apply_worker_fn(void *opaque)
+{
+    SfApplyWorker *w = opaque;
+    qemu_mutex_lock(&w->mtx);
+    for (;;) {
+        while (!w->have_work) {
+            qemu_cond_wait(&w->cond_work, &w->mtx);
+        }
+        SfSnapNode *dst = w->dst;
+        const SfPageKey *keys = w->keys;
+        size_t s = w->start, e = w->end;
+        qemu_mutex_unlock(&w->mtx);
+
+        sf_apply_slice(dst, keys, s, e);
+
+        qemu_mutex_lock(&w->mtx);
+        w->have_work = false;
+        w->done = true;
+        qemu_cond_signal(&w->cond_done);
+    }
+    /* ponytail: never signalled to exit; the thread lives for the process and is
+     * reaped at exit (blocked in cond_wait). Add teardown only if a clean
+     * shutdown path ever needs it. */
+}
+
+/* Diagnostic (env SF_APPLY_SPLIT): single-threaded two-pass to separate the
+ * per-page resolve cost (tree walk / bsearch) from the raw memcpy, so we know how
+ * much of ram= is the multi-level tree overhead vs bandwidth. */
+static void sf_apply_w_profiled(SfSnapNode *dst, const SfPageKey *keys, size_t n)
+{
+    size_t psize = qemu_real_host_page_size();
+    uint8_t **host = g_malloc(n * sizeof(*host));
+    uint8_t **src  = g_malloc(n * sizeof(*src));
+
+    uint64_t t0 = sf_now_ns();
+    for (size_t i = 0; i < n; i++) {
+        host[i] = sf_key_to_host(keys[i]);
+        src[i]  = sf_resolve(dst, keys[i]);
+    }
+    uint64_t t1 = sf_now_ns();
+    for (size_t i = 0; i < n; i++) {
+        if (host[i] && src[i]) {
+            memcpy(host[i], src[i], psize);
+        }
+    }
+    uint64_t t2 = sf_now_ns();
+    fprintf(stderr, "sf-time: apply-split resolve=%.1fus copy=%.1fus (n=%zu, "
+            "%.3f+%.3f us/page)\n", (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, n,
+            (t1 - t0) / 1000.0 / n, (t2 - t1) / 1000.0 / n);
+    g_free(host);
+    g_free(src);
+}
+
+/* Apply W: split into two contiguous halves — the background worker takes the
+ * upper half, the caller runs the lower half, then waits for the worker. */
+static void sf_apply_w(SfSnapNode *dst, const SfPageKey *keys, size_t n)
+{
+    if (n && getenv("SF_APPLY_SPLIT")) {
+        sf_apply_w_profiled(dst, keys, n);
+        return;
+    }
+    if (n < SF_APPLY_PARALLEL_MIN) {
+        sf_apply_slice(dst, keys, 0, n);
+        return;
+    }
+
+    SfApplyWorker *w = &g_apply_worker;
+    if (!w->started) {
+        qemu_mutex_init(&w->mtx);
+        qemu_cond_init(&w->cond_work);
+        qemu_cond_init(&w->cond_done);
+        qemu_thread_create(&w->thread, "sf-apply", sf_apply_worker_fn, w,
+                           QEMU_THREAD_JOINABLE);
+        w->started = true;
+    }
+
+    size_t mid = n / 2;
+    qemu_mutex_lock(&w->mtx);
+    w->dst = dst; w->keys = keys; w->start = mid; w->end = n;
+    w->done = false; w->have_work = true;
+    qemu_cond_signal(&w->cond_work);
+    qemu_mutex_unlock(&w->mtx);
+
+    sf_apply_slice(dst, keys, 0, mid);   /* caller does the lower half */
+
+    qemu_mutex_lock(&w->mtx);
+    while (!w->done) {
+        qemu_cond_wait(&w->cond_done, &w->mtx);
+    }
+    qemu_mutex_unlock(&w->mtx);
 }
 
 /*

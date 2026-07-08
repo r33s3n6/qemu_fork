@@ -37,6 +37,7 @@
 #include "migration/savevm.h"
 #include "migration/qemu-file.h"
 #include "sf/dirty/engine.h"
+#include "sf/track/tracker.h"
 #include "sf/kvm_tsc.h"
 #include "sf/vmstate_replay/buffer.h"
 #include "sf/vmstate_replay/preparse.h"
@@ -110,6 +111,73 @@ static void report(Monitor *mon, bool *all_ok, const char *name, bool ok,
     if (!ok) {
         *all_ok = false;
     }
+}
+
+/* ---- R3: flat restore-store logic (plan 2026-07-08-03 §4) ----------------- *
+ * KVM-free: drives the store ops directly with synthetic dirty pages + a
+ * counting shadow resolve. Proves dedup, lazy+incremental src cache (resolve
+ * called once per page), BLIND keeps the plan across after_restore, FULL clears.
+ * BLIND path touches no KVM (runs both passes); FULL's after_restore calls
+ * sf_kvm_reset_ring so its sub-check is gated to the TCG pass. */
+struct sf_tst_rctx { uint8_t *region, *shadow; int calls; };
+static uint8_t *sf_tst_resolve(void *target, void *host, void *user)
+{
+    struct sf_tst_rctx *c = user;
+    (void)target;
+    c->calls++;
+    return c->shadow + ((uint8_t *)host - c->region);
+}
+
+static void sf_selftest_track(Monitor *mon, bool *all_ok)
+{
+    size_t psize = qemu_real_host_page_size();
+    size_t N = 8;
+    uint8_t *region = g_malloc(N * psize);
+    uint8_t *shadow = g_malloc(N * psize);
+    struct sf_tst_rctx c = { region, shadow, 0 };
+    SfBlockReg blk = { region, N * psize };
+    void *tgt = (void *)0x1;
+    char buf[160];
+    bool ok, full = true;
+
+    SfRestoreStore *st = sf_flat_store_new(&blk, 1, sf_tst_resolve, &c, SF_FLAT_BLIND);
+    const SfRestoreStoreOps *o = st->ops;
+
+    void *b1[] = { region + 0*psize, region + 1*psize, region + 0*psize };  /* p0 dup */
+    o->note_batch(st, b1, 3);
+    const SfRestorePlan *p = o->plan(st, tgt);
+    ok = (p->n == 2) && (c.calls == 2) &&
+         p->pages[0].dst == region && p->pages[0].src == shadow &&
+         p->pages[1].dst == region + psize && p->pages[1].src == shadow + psize;
+
+    void *b2[] = { region + 2*psize, region + 1*psize };   /* p2 new, p1 dup */
+    o->note_batch(st, b2, 2);
+    p = o->plan(st, tgt);
+    ok = ok && (p->n == 3) && (c.calls == 3) &&            /* only +1 resolve (incremental) */
+         p->pages[2].dst == region + 2*psize;
+
+    o->after_restore(st, tgt);      /* BLIND: keep plan, no re-resolve */
+    p = o->plan(st, tgt);
+    ok = ok && (p->n == 3) && (c.calls == 3);
+    o->free(st);
+
+    if (!kvm_enabled()) {           /* FULL after_restore calls sf_kvm_reset_ring */
+        struct sf_tst_rctx c2 = { region, shadow, 0 };
+        st = sf_flat_store_new(&blk, 1, sf_tst_resolve, &c2, SF_FLAT_FULL);
+        o = st->ops;
+        o->note_batch(st, b1, 3);
+        bool full1 = (o->plan(st, tgt)->n == 2);
+        o->after_restore(st, tgt);  /* FULL: reset + clear */
+        bool full0 = (o->plan(st, tgt)->n == 0);
+        full = full1 && full0;
+        o->free(st);
+    }
+
+    snprintf(buf, sizeof(buf), "dedup+incremental (resolves=%d) blind-keep%s",
+             c.calls, kvm_enabled() ? "" : " + full-clear");
+    report(mon, all_ok, "R3 flat-store logic", ok && full, buf);
+    g_free(region);
+    g_free(shadow);
 }
 
 /* ---- Device cases (④⑤) -------------------------------------------------- */
@@ -1876,6 +1944,7 @@ bool sf_selftest_all(Monitor *mon, Error **errp)
     sf_selftest_tsc(mon, &all_ok);
     sf_selftest_snap(mon, &all_ok);
     sf_selftest_tripwire(mon, &all_ok);
+    sf_selftest_track(mon, &all_ok);            /* R3 flat store logic; host-only */
     sf_selftest_ramstore_file(mon, &all_ok);   /* host-only; runs under TCG + KVM */
     sf_selftest_persist(mon, &all_ok);          /* needs KVM + dirty ring */
     sf_selftest_cold_start(mon, &all_ok);       /* needs KVM + dirty ring; destructive */

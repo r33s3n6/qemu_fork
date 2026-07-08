@@ -92,6 +92,27 @@ static void sf_run_guest_ms(unsigned ms)
     vm_stop(RUN_STATE_PAUSED);
 }
 
+/* Harness precheck (防呆): does the guest actively dirty the watched pages?
+ * Pure read/run/read — no snapshot, no dirty tracking, leaves no state behind.
+ * Tells "guest runs the sf-rig dirty workload (dirty.elf)" from "idle guest",
+ * so the dirty-dependent cases can abort with a clear message instead of a
+ * screen of false RED when someone points sf_selftest at the wrong guest. */
+static bool sf_st_guest_dirties(unsigned ms)
+{
+    uint32_t before[SF_ST_WATCH];
+
+    for (uint32_t i = 0; i < SF_ST_WATCH; i++) {
+        before[i] = sf_rd32(SF_ST_BASE + (hwaddr)i * SF_ST_PAGE);
+    }
+    sf_run_guest_ms(ms);
+    for (uint32_t i = 0; i < SF_ST_WATCH; i++) {
+        if (sf_rd32(SF_ST_BASE + (hwaddr)i * SF_ST_PAGE) != before[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void report(Monitor *mon, bool *all_ok, const char *name, bool ok,
                    const char *detail)
 {
@@ -1796,6 +1817,24 @@ bool sf_selftest_all(Monitor *mon, Error **errp)
     /* Compound-id encoding (snapshot-tree.md §6): pure allocator check, runs
      * before any active tree exists and needs no accel. */
     sf_selftest_compound_id(mon, &all_ok);
+
+    /* Harness guard (防呆): the RAM/resolve/save/persist/cold-start cases below
+     * need a guest actively dirtying SF_ST_BASE — the sf-rig dirty.elf workload.
+     * Under KVM+dirty-ring an idle guest dirties 0 pages, so those cases would
+     * ALL go RED for a harness reason (wrong guest), not a real bug — misleading.
+     * Detect it once and abort with a pointer to the runner instead. A real
+     * restore/save bug still surfaces: with the workload present pages do change,
+     * the guard passes, and the cases run and catch it. TCG (④⑤ device pass, no
+     * dirty ring) is unaffected. */
+    if (kvm_enabled() && sf_kvm_dirty_ring_enabled()
+        && !sf_st_guest_dirties(30)) {
+        monitor_printf(mon, "sf: selftest: ABORT — KVM dirty ring is on but the "
+                       "guest dirtied 0 pages at 0x%x in 30ms. The RAM/resolve/"
+                       "save/persist cases need the sf-rig dirty workload; run via "
+                       "tools/sf-rig/microvm/sf-selftest.sh (binds dirty.elf). "
+                       "Refusing to emit misleading RED.\n", SF_ST_BASE);
+        return false;
+    }
 
     /* Device work needs a stable state. */
     if (runstate_is_running()) {

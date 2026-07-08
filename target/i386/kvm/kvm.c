@@ -3952,6 +3952,16 @@ void sf_kvm_put_rax(CPUState *cs, uint64_t value)
     X86_CPU(cs)->env.regs[R_EAX] = value;
 }
 
+/* Read the guest's %RBX (pull from KVM first). Used by the NO_RESTORE register
+ * handler to receive a 64-bit request-struct GPA: the guest puts the high 32 bits
+ * in %rbx and the low 32 bits in %eax (outl data), since a single outl only carries
+ * 32 bits — and a >4GB guest (phase2 6GB) can have the req page above 4GB. */
+uint64_t sf_kvm_get_rbx(CPUState *cs)
+{
+    cpu_synchronize_state(cs);
+    return X86_CPU(cs)->env.regs[R_EBX];
+}
+
 void kvm_put_apicbase(X86CPU *cpu, uint64_t value)
 {
     int ret;

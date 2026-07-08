@@ -203,7 +203,11 @@ typedef struct __attribute__((packed)) SfNrReq {
 static void sf_nr_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     SfNrReq req;
-    hwaddr req_gpa = (hwaddr)val;
+    /* 64-bit request-struct GPA: low 32 in %eax (the outl data @val), high 32 in
+     * %rbx (the guest sets it before the outl). One outl only carries 32 bits,
+     * and a >4GB guest (phase2 6GB) can have the req page above 4GB. */
+    uint64_t hi = (current_cpu && kvm_enabled()) ? sf_kvm_get_rbx(current_cpu) : 0;
+    hwaddr req_gpa = ((hwaddr)hi << 32) | (uint32_t)val;
 
     /* The request struct lives in guest RAM; read it via its host pointer
      * (sf_gpa_to_host returns the same host address save/restore walks). A

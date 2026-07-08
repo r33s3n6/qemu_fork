@@ -44,4 +44,9 @@ void sf_kvm_refreeze_tsc(CPUState *cs);
  * the guest reads it via a `+a` outl constraint, no inl). */
 void sf_kvm_put_rax(CPUState *cs, uint64_t value);
 
+/* Read the guest's %RBX (pull from KVM first). The NO_RESTORE register handler
+ * receives a 64-bit request-struct GPA as low32=%eax (outl data) + high32=%rbx,
+ * since one outl only carries 32 bits and a >4GB guest can have the page >4GB. */
+uint64_t sf_kvm_get_rbx(CPUState *cs);
+
 #endif /* SF_KVM_TSC_H */

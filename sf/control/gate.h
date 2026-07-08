@@ -15,8 +15,8 @@
  * kvm-all.c to re-route it). Both are driven by the same channel; the host sees a
  * single serialized stop reason and never the race (plan §4).
  *
- * The state machine (below) lives here and is guarded by the channel's mutex
- * (sf_channel_lock/unlock, see channel.c). channel.c's read callback routes a
+ * The state machine (below) lives here and is guarded by gate.c's private
+ * sf_gate_mtx. channel.c's read callback routes a
  * parsed command by state: STOPPED_TIMEOUT -> sf_gate_stopped_cmd here;
  * PARKED_* -> condvar handoff to the vcpu boundary loop; RUNNING -> dropped.
  *
@@ -36,11 +36,7 @@ typedef enum {
     SF_CS_STOPPED_TIMEOUT,     /* timer fired -> vm_stop; main-loop dispatch; snapshot rejected; owed 't' */
 } SfCtlState;
 
-typedef enum {
-    SF_GATE_ALLOW,            /* default: guest may self snapshot/restore/stop */
-    SF_GATE_DISABLE,           /* any guest cmd yields -> 'c' (host decides) */
-    SF_GATE_STRICT,            /* non-stop guest cmd panics -> 'x' */
-} SfGateMode;
+/* Gate mode = SfCtlGateMode (channel.h): a=SF_CTL_GATE_ALLOW / d=DISABLE / s=STRICT. */
 
 /* One-time init (timer_new + defaults: ALLOW, timeout 0 = infinite). Called from
  * sf_control_init once the chardev is attached. */
@@ -54,14 +50,6 @@ void sf_gate_recv(SfCtlCmd *out);
  * condvar handoff to the vcpu; STOPPED_TIMEOUT -> main-loop dispatch; RUNNING ->
  * drop (protocol violation). */
 void sf_gate_route(const SfCtlCmd *cmd);
-
-/* Current state. Caller must hold sf_channel_lock(). */
-SfCtlState sf_gate_state_locked(void);
-
-/* True iff snapshot is allowed at the current parked state (plan §4: only a
- * checkpoint/snapshot boundary is persistable; timeout/crash stops reject).
- * Caller must hold sf_channel_lock(). */
-bool sf_gate_snapshot_ok_locked(void);
 
 /* ---- vcpu-thread boundary (called from sf/checkpoint.c) ---- */
 

@@ -18,12 +18,17 @@
 
 #define SF_CTL_CHARDEV_ID "sfctl"
 
+/* Longest legal line: a cold-start dir (SfCtlCmd.dir) + verb/id/spaces slack. A
+ * line past this is rejected with 'e line-too-long' rather than silently split. */
+#define SF_CTL_LINE_MAX (sizeof(((SfCtlCmd *)0)->dir) + 128)
+
 static CharFrontend sf_ctl_fe;
 static bool         sf_ctl_inited;
 
 /* Receive line buffer — main-loop-only (chardev read callback). */
-static char   sf_ctl_rx[1024];
+static char   sf_ctl_rx[SF_CTL_LINE_MAX];
 static size_t sf_ctl_rxlen;
+static bool   sf_ctl_overflow;   /* current line exceeded SF_CTL_LINE_MAX; drop to next '\n' */
 
 bool sf_control_active(void)
 {
@@ -101,8 +106,9 @@ static void sf_ctl_parse(char *line, SfCtlCmd *c)
 
 static int sf_ctl_can_read(void *opaque)
 {
-    /* Always leave room for a NUL; a line that overflows is dropped in read. */
-    return (int)(sizeof(sf_ctl_rx) - 1 - sf_ctl_rxlen);
+    /* Fixed hint: sf_ctl_read bounds the line itself and keeps draining even
+     * while dropping an overlong one, so we must never return 0 mid-line. */
+    return 512;
 }
 
 static void sf_ctl_read(void *opaque, const uint8_t *buf, int size)
@@ -110,15 +116,24 @@ static void sf_ctl_read(void *opaque, const uint8_t *buf, int size)
     for (int i = 0; i < size; i++) {
         char ch = (char)buf[i];
         if (ch == '\n') {
-            sf_ctl_rx[sf_ctl_rxlen] = '\0';
-            SfCtlCmd c;
-            sf_ctl_parse(sf_ctl_rx, &c);
+            if (sf_ctl_overflow) {
+                sf_control_reply("e line-too-long\n");
+                sf_ctl_overflow = false;
+            } else {
+                sf_ctl_rx[sf_ctl_rxlen] = '\0';
+                SfCtlCmd c;
+                sf_ctl_parse(sf_ctl_rx, &c);
+                sf_gate_route(&c);   /* brain routes by parking state */
+            }
             sf_ctl_rxlen = 0;
-            sf_gate_route(&c);   /* brain routes by parking state */
-        } else if (ch != '\r' && sf_ctl_rxlen < sizeof(sf_ctl_rx) - 1) {
+        } else if (ch == '\r') {
+            /* strip CR */
+        } else if (sf_ctl_overflow) {
+            /* swallow the rest of the overlong line until '\n' */
+        } else if (sf_ctl_rxlen < sizeof(sf_ctl_rx) - 1) {
             sf_ctl_rx[sf_ctl_rxlen++] = ch;
-        } else if (ch != '\r') {
-            sf_ctl_rxlen = 0;   /* overlong line — drop it, resync on next '\n' */
+        } else {
+            sf_ctl_overflow = true;   /* line exceeds bound → reject on '\n' */
         }
     }
 }

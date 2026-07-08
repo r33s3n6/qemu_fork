@@ -29,9 +29,9 @@ typedef enum {
 } SfCtlCmdKind;
 
 typedef enum {
-    SF_CTL_GATE_ALLOW,
-    SF_CTL_GATE_DISABLE,
-    SF_CTL_GATE_STRICT,
+    SF_CTL_GATE_ALLOW,     /* default: guest may self snapshot/restore/stop */
+    SF_CTL_GATE_DISABLE,    /* any guest cmd yields -> 'c' (host decides) */
+    SF_CTL_GATE_STRICT,     /* non-stop guest cmd panics -> 'x' */
 } SfCtlGateMode;
 
 typedef struct {

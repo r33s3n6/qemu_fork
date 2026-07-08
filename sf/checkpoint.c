@@ -68,7 +68,11 @@ static void sf_control_boundary(uint64_t val)
         bql_unlock();
     }
     if (sf_gate_boundary_enter(val)) {
-        goto out;              /* gate self-restored (ALLOW): resume to next boundary */
+        /* Resume without parking: either ALLOW self-restore (run to next
+         * boundary), or the timeout timer already won the race (state is
+         * STOPPED_TIMEOUT; return so the in-flight vm_stop parks the vcpu and
+         * the timer's 't' stands). */
+        goto out;
     }
     for (;;) {
         SfCtlCmd cmd;

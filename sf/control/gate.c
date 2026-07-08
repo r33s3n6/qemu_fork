@@ -34,8 +34,8 @@ static QemuCond  sf_gate_cond;
 static bool      sf_gate_have_cmd;
 static SfCtlCmd  sf_gate_cmd;
 
-static SfCtlState sf_gate_state = SF_CS_RUNNING;
-static SfGateMode sf_gate_mode   = SF_GATE_ALLOW;
+static SfCtlState    sf_gate_state = SF_CS_RUNNING;
+static SfCtlGateMode sf_gate_mode  = SF_CTL_GATE_ALLOW;
 static int64_t    sf_gate_timeout_ms;        /* 0 = infinite (no timer) */
 static QEMUTimer *sf_gate_timer;
 
@@ -64,6 +64,17 @@ static void sf_gate_owe_locked(const char *reply)
 {
     g_strlcpy(sf_gate_pending_reply, reply, sizeof(sf_gate_pending_reply));
     sf_gate_pending = true;
+}
+
+/* Park the vcpu at @state with @reply owed (the flush is the caller's job).
+ * Takes the mutex itself — callers are BQL-holding side-effect paths that must
+ * not nest sf_gate_mtx under the BQL for longer than the state write. */
+static void sf_gate_park(SfCtlState state, const char *reply)
+{
+    qemu_mutex_lock(&sf_gate_mtx);
+    sf_gate_state = state;
+    sf_gate_owe_locked(reply);
+    qemu_mutex_unlock(&sf_gate_mtx);
 }
 
 /* Send the owed reply if connected; callable from vcpu (boundary) or main loop
@@ -107,12 +118,10 @@ void sf_gate_recv(SfCtlCmd *out)
     qemu_mutex_unlock(&sf_gate_mtx);
 }
 
-SfCtlState sf_gate_state_locked(void)
-{
-    return sf_gate_state;   /* caller holds the lock */
-}
-
-bool sf_gate_snapshot_ok_locked(void)
+/* True iff snapshot is allowed at the current parked state (plan §4: only a
+ * checkpoint/snapshot boundary is persistable; timeout/crash stops reject).
+ * Caller holds sf_gate_mtx. */
+static bool sf_gate_snapshot_ok_locked(void)
 {
     return sf_gate_state == SF_CS_PARKED_CHECKPOINT
         || sf_gate_state == SF_CS_PARKED_SNAPSHOT;
@@ -127,7 +136,7 @@ bool sf_gate_snapshot_ok_locked(void)
  */
 bool sf_gate_boundary_enter(uint64_t val)
 {
-    SfGateMode mode;
+    SfCtlGateMode mode;
 
     qemu_mutex_lock(&sf_gate_mtx);
     if (sf_gate_state != SF_CS_RUNNING) {
@@ -147,7 +156,7 @@ bool sf_gate_boundary_enter(uint64_t val)
     bool resume = false;
 
     switch (mode) {
-    case SF_GATE_ALLOW:
+    case SF_CTL_GATE_ALLOW:
         if (val == SF_CP_SNAPSHOT) {
             bql_lock();
             sf_checkpoint_snapshot();
@@ -155,16 +164,10 @@ bool sf_gate_boundary_enter(uint64_t val)
             sf_cp_generation_reset();
             snprintf(rsp, sizeof(rsp), "s %u\n",
                       sf_active ? sf_active->id : 0);
-            qemu_mutex_lock(&sf_gate_mtx);
-            sf_gate_state = SF_CS_PARKED_SNAPSHOT;
-            sf_gate_owe_locked(rsp);
-            qemu_mutex_unlock(&sf_gate_mtx);
+            sf_gate_park(SF_CS_PARKED_SNAPSHOT, rsp);
         } else if (val == SF_CP_RESTORE) {
             if (!sf_snap_have_snapshot()) {
-                qemu_mutex_lock(&sf_gate_mtx);
-                sf_gate_state = SF_CS_PARKED_CHECKPOINT;
-                sf_gate_owe_locked("e no-snapshot\n");
-                qemu_mutex_unlock(&sf_gate_mtx);
+                sf_gate_park(SF_CS_PARKED_CHECKPOINT, "e no-snapshot\n");
             } else {
                 Error *err = NULL;
                 uint32_t id = sf_active ? sf_active->id : 0;
@@ -175,10 +178,7 @@ bool sf_gate_boundary_enter(uint64_t val)
                     fprintf(stderr, "sf-gate: self-restore %u failed: %s\n",
                             id, error_get_pretty(err));
                     error_free(err);
-                    qemu_mutex_lock(&sf_gate_mtx);
-                    sf_gate_state = SF_CS_PARKED_CHECKPOINT;
-                    sf_gate_owe_locked("e restore-failed\n");
-                    qemu_mutex_unlock(&sf_gate_mtx);
+                    sf_gate_park(SF_CS_PARKED_CHECKPOINT, "e restore-failed\n");
                 } else {
                     sf_cp_generation_inc();
                     qemu_mutex_lock(&sf_gate_mtx);
@@ -189,33 +189,21 @@ bool sf_gate_boundary_enter(uint64_t val)
             }
         } else {
             /* stop (0) or any unrecognized value: park as a checkpoint */
-            qemu_mutex_lock(&sf_gate_mtx);
-            sf_gate_state = SF_CS_PARKED_CHECKPOINT;
-            sf_gate_owe_locked("c\n");
-            qemu_mutex_unlock(&sf_gate_mtx);
+            sf_gate_park(SF_CS_PARKED_CHECKPOINT, "c\n");
         }
         break;
 
-    case SF_GATE_DISABLE:
+    case SF_CTL_GATE_DISABLE:
         /* any guest cmd yields -> 'c', host decides */
-        qemu_mutex_lock(&sf_gate_mtx);
-        sf_gate_state = SF_CS_PARKED_CHECKPOINT;
-        sf_gate_owe_locked("c\n");
-        qemu_mutex_unlock(&sf_gate_mtx);
+        sf_gate_park(SF_CS_PARKED_CHECKPOINT, "c\n");
         break;
 
-    case SF_GATE_STRICT:
+    case SF_CTL_GATE_STRICT:
         if (val == SF_CP_SNAPSHOT || val == SF_CP_RESTORE) {
             /* non-stop intent -> panic -> 'x' (snapshot now rejected) */
-            qemu_mutex_lock(&sf_gate_mtx);
-            sf_gate_state = SF_CS_PARKED_CRASH;
-            sf_gate_owe_locked("x\n");
-            qemu_mutex_unlock(&sf_gate_mtx);
+            sf_gate_park(SF_CS_PARKED_CRASH, "x\n");
         } else {
-            qemu_mutex_lock(&sf_gate_mtx);
-            sf_gate_state = SF_CS_PARKED_CHECKPOINT;
-            sf_gate_owe_locked("c\n");
-            qemu_mutex_unlock(&sf_gate_mtx);
+            sf_gate_park(SF_CS_PARKED_CHECKPOINT, "c\n");
         }
         break;
     }
@@ -251,10 +239,7 @@ bool sf_gate_boundary_cmd(const SfCtlCmd *cmd)
         sf_cp_generation_reset();
         char rsp[64];
         snprintf(rsp, sizeof(rsp), "s %u\n", sf_active ? sf_active->id : 0);
-        qemu_mutex_lock(&sf_gate_mtx);
-        sf_gate_state = SF_CS_PARKED_SNAPSHOT;
-        sf_gate_owe_locked(rsp);
-        qemu_mutex_unlock(&sf_gate_mtx);
+        sf_gate_park(SF_CS_PARKED_SNAPSHOT, rsp);
         sf_gate_flush();
         return false;
     }
@@ -500,7 +485,7 @@ void sf_gate_init(void)
     qemu_cond_init(&sf_gate_cond);
     sf_gate_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, sf_gate_timer_fire, NULL);
     sf_gate_state = SF_CS_RUNNING;
-    sf_gate_mode = SF_GATE_ALLOW;
+    sf_gate_mode = SF_CTL_GATE_ALLOW;
     sf_gate_timeout_ms = 0;     /* infinite until a 'T' command sets it */
     sf_gate_have_cmd = false;
     sf_gate_connected = false;

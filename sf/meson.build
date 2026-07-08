@@ -8,6 +8,7 @@ system_ss.add(files(
   'vmstate_replay/replay.c',
   'dirty/engine.c',
   'track/flat_store.c',
+  'track/tracker.c',
   'snap/node.c',
   'snap/restore.c',
   'snap/exclude.c',

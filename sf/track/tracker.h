@@ -82,11 +82,24 @@ SfRestoreStore *sf_flat_store_new(const SfBlockReg *blocks, size_t n_blocks,
                                   SfFlatPolicy policy);
 
 /* ---- tracker glue (defined in tracker.c at R4; declared here for wiring) ---- */
+/*
+ * Fine-grained surface: production restore interleaves device replay between the
+ * plan and the memcpy, and adds cross-node path pages, so it drives the steps
+ * rather than a monolithic restore. RAM-only callers just do drain→plan→apply→
+ * after_restore. begin arms KVM dirty tracking + a clean slate; end disarms.
+ */
 void sf_track_begin(const SfBlockReg *blocks, size_t n_blocks,
                     SfResolveFn resolve, void *user, SfRestoreStore *store);
-void sf_track_restore(void *target);
+void sf_track_end(void);
+
+void sf_track_drain(void);                        /* ring → store->note_batch */
+const SfRestorePlan *sf_track_plan(void *target); /* store->plan (live-dirty set) */
+void sf_track_apply(const SfPlanPage *pages, size_t n);  /* 2-thread memcpy */
+void sf_track_after_restore(void *target);        /* store->after_restore */
+void sf_track_after_drain(void);                  /* store->after_drain (ring-full) */
+uint8_t *sf_track_resolve(void *target, void *host); /* for the snap layer's path pages */
 void sf_track_set_active(void *node);
 void sf_track_invalidate(void *target);
-void sf_track_end(void);
+bool sf_track_active(void);                       /* is a tracker session armed? */
 
 #endif /* SF_TRACK_TRACKER_H */

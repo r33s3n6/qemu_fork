@@ -1506,6 +1506,23 @@ size_t sf_kvm_drain_ring(void **host_out, size_t max)
     return n;
 }
 
+/* Total ring capacity across vCPUs — the max pages one drain can yield, so the
+ * tracker sizes its host batch to never truncate. */
+size_t sf_kvm_ring_capacity(void)
+{
+    KVMState *s = kvm_state;
+    CPUState *cpu;
+    size_t ncpus = 0;
+
+    if (!s || !s->kvm_dirty_ring_size) {
+        return 0;
+    }
+    CPU_FOREACH(cpu) {
+        ncpus++;
+    }
+    return (size_t)s->kvm_dirty_ring_size * (ncpus ? ncpus : 1);
+}
+
 /* Reclaim the ring slots we've drained but not yet reset: mark [reset_index,
  * fetch_index) collected and KVM_RESET_DIRTY_RINGS. Stock KVM welds reclaim +
  * reprotect (reprotects exactly those pages). */

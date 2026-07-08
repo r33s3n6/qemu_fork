@@ -661,6 +661,7 @@ void sf_kvm_set_skip_flush(bool on);
  *    set, keep the rest writable); unavailable on stock (can_protect_set=false).
  */
 size_t sf_kvm_drain_ring(void **host_out, size_t max);
+size_t sf_kvm_ring_capacity(void);
 void sf_kvm_reset_ring(void);
 bool sf_kvm_can_protect_set(void);
 void sf_kvm_protect(void *const *host, size_t n);

@@ -70,6 +70,7 @@ int sf_cold_start(const char *dir, uint32_t dst_id, Error **errp)
         while (root->parent) {
             root = root->parent;
         }
+        sf_snap_hot_cache_invalidate();
         sf_node_destroy(root);
         sf_active = NULL;
     }

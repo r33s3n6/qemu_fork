@@ -52,6 +52,7 @@
 #include "kvm-cpus.h"
 #include "system/dirtylimit.h"
 #include "qemu/range.h"
+#include "sf/dirty/engine.h"
 
 #include "hw/core/boards.h"
 #include "system/stats.h"
@@ -1003,6 +1004,31 @@ static void dirty_gfn_set_collected(struct kvm_dirty_gfn *gfn)
     qatomic_store_release(&gfn->flags, KVM_DIRTY_GFN_F_RESET);
 }
 
+static bool kvm_dirty_ring_host_page(KVMState *s, struct kvm_dirty_gfn *gfn,
+                                     size_t psize, void **hostp)
+{
+    uint32_t as_id = gfn->slot >> 16;
+    uint32_t slot_id = gfn->slot & 0xffff;
+    KVMMemoryListener *kml;
+    KVMSlot *mem;
+
+    if (as_id >= s->nr_as) {
+        return false;
+    }
+    kml = s->as[as_id].ml;
+    if (!kml || slot_id >= kml->nr_slots_allocated) {
+        return false;
+    }
+    mem = &kml->slots[slot_id];
+    if (!mem->memory_size ||
+        gfn->offset >= mem->memory_size / psize ||
+        !mem->ram) {
+        return false;
+    }
+    *hostp = (uint8_t *)mem->ram + gfn->offset * psize;
+    return true;
+}
+
 /*
  * Should be with all slots_lock held for the address spaces.  It returns the
  * dirty page we've collected on this dirty ring.
@@ -1131,6 +1157,13 @@ static void kvm_cpu_synchronize_kick_all(void)
  *
  * This function must be called with BQL held.
  */
+static bool sf_kvm_dirty_ring_owned;
+static bool sf_kvm_ring_debug(void)
+{
+    const char *s = getenv("SF_RING_DEBUG");
+    return s && *s;
+}
+
 static void kvm_dirty_ring_flush(void)
 {
     trace_kvm_dirty_ring_flush(0);
@@ -1140,6 +1173,11 @@ static void kvm_dirty_ring_flush(void)
      * However, let's be sure of it.
      */
     assert(bql_locked());
+    if (sf_kvm_dirty_ring_owned) {
+        kvm_cpu_synchronize_kick_all();
+        trace_kvm_dirty_ring_flush(1);
+        return;
+    }
     /*
      * First make sure to flush the hardware buffers by kicking all
      * vcpus out in a synchronous way.
@@ -1162,29 +1200,156 @@ bool sf_kvm_dirty_ring_enabled(void)
 
 static bool sf_kvm_skip_flush; /* selftest fault injection */
 
+void sf_kvm_dirty_ring_set_owned(bool owned)
+{
+    sf_kvm_dirty_ring_owned = owned;
+}
+
 void sf_kvm_set_skip_flush(bool on)
 {
     sf_kvm_skip_flush = on;
 }
 
+static uint64_t sf_kvm_collect_dirty_one(KVMState *s, CPUState *cpu,
+                                         SfKvmDirtyPageFn cb, void *user)
+{
+    struct kvm_dirty_gfn *dirty_gfns = cpu->kvm_dirty_gfns, *cur;
+    uint32_t ring_size = s->kvm_dirty_ring_size;
+    uint32_t fetch = cpu->sf_kvm_fetch_index;
+    size_t psize = qemu_real_host_page_size();
+    uint64_t count = 0;
+
+    if (!cpu->created) {
+        return 0;
+    }
+
+    assert(dirty_gfns && ring_size);
+    while (true) {
+        void *host;
+
+        cur = &dirty_gfns[fetch % ring_size];
+        if (!dirty_gfn_is_dirtied(cur)) {
+            break;
+        }
+        if (kvm_dirty_ring_host_page(s, cur, psize, &host)) {
+            if (cb) {
+                cb(host, psize, user);
+            }
+            count++;
+        }
+        trace_kvm_dirty_ring_page(cpu->cpu_index, fetch, cur->offset);
+        fetch++;
+    }
+    cpu->sf_kvm_fetch_index = fetch;
+    return count;
+}
+
+static uint64_t sf_kvm_collect_dirty_bitmap(KVMState *s, SfKvmDirtyPageFn cb,
+                                            void *user);
+
 uint64_t sf_kvm_collect_dirty(SfKvmDirtyPageFn cb, void *user)
 {
     KVMState *s = kvm_state;
-    size_t psize = qemu_real_host_page_size();
-    uint64_t visited = 0;
-    int as_id;
+    CPUState *cpu;
+    uint64_t total = 0;
 
     if (!s || !s->kvm_dirty_ring_size) {
         return 0;
     }
 
-    /*
-     * Flush hardware buffers + drain every ring into the per-slot bitmaps and
-     * reprotect the collected pages. After this, cur-dirty pages live in the
-     * accumulated KVMSlot.dirty_bmap (nobody clears it until we do).
-     */
     if (!sf_kvm_skip_flush) {
-        kvm_dirty_ring_flush();
+        kvm_cpu_synchronize_kick_all();
+    }
+
+    kvm_slots_lock();
+    CPU_FOREACH(cpu) {
+        uint32_t before = cpu->sf_kvm_fetch_index;
+        uint64_t one = sf_kvm_collect_dirty_one(s, cpu, cb, user);
+        total += one;
+        if (sf_kvm_ring_debug()) {
+            fprintf(stderr, "sf-ring: collect cpu=%d fetch %u->%u n=%" PRIu64
+                    " cb=%d\n", cpu->cpu_index, before,
+                    cpu->sf_kvm_fetch_index, one, cb != NULL);
+        }
+    }
+    kvm_slots_unlock();
+
+    if (!total && cb && !sf_kvm_skip_flush && current_cpu) {
+        total = sf_kvm_collect_dirty_bitmap(s, cb, user);
+    }
+
+    return total;
+}
+
+static uint64_t sf_kvm_mark_harvested_one(KVMState *s, CPUState *cpu)
+{
+    struct kvm_dirty_gfn *dirty_gfns = cpu->kvm_dirty_gfns, *cur;
+    uint32_t ring_size = s->kvm_dirty_ring_size;
+    uint32_t reset = cpu->sf_kvm_reset_index;
+    uint32_t fetch = cpu->sf_kvm_fetch_index;
+    uint64_t count = 0;
+
+    if (!cpu->created || reset == fetch) {
+        return 0;
+    }
+
+    assert(dirty_gfns && ring_size);
+    while (reset != fetch) {
+        cur = &dirty_gfns[reset % ring_size];
+        if (dirty_gfn_is_dirtied(cur)) {
+            dirty_gfn_set_collected(cur);
+            count++;
+        }
+        reset++;
+    }
+    cpu->sf_kvm_reset_index = reset;
+    return count;
+}
+
+static uint64_t sf_kvm_reset_harvested(KVMState *s)
+{
+    CPUState *cpu;
+    uint64_t total = 0;
+    int ret;
+
+    CPU_FOREACH(cpu) {
+        uint32_t before = cpu->sf_kvm_reset_index;
+        uint64_t one = sf_kvm_mark_harvested_one(s, cpu);
+        total += one;
+        if (sf_kvm_ring_debug() && one) {
+            fprintf(stderr, "sf-ring: mark cpu=%d reset %u->%u n=%" PRIu64 "\n",
+                    cpu->cpu_index, before, cpu->sf_kvm_reset_index, one);
+        }
+    }
+    if (total) {
+        ret = kvm_vm_ioctl(s, KVM_RESET_DIRTY_RINGS);
+        if (ret < 0) {
+            error_report("sf: KVM_RESET_DIRTY_RINGS failed: %s",
+                         strerror(-ret));
+        } else if (ret != total && getenv("SF_RING_DEBUG")) {
+            warn_report("sf: KVM_RESET_DIRTY_RINGS reset %d entries, "
+                        "sf expected %" PRIu64, ret, total);
+        }
+    }
+    return total;
+}
+
+static uint64_t sf_kvm_collect_dirty_bitmap(KVMState *s, SfKvmDirtyPageFn cb,
+                                            void *user)
+{
+    size_t psize = qemu_real_host_page_size();
+    CPUState *cpu;
+    uint64_t visited = 0;
+    bool owned = sf_kvm_dirty_ring_owned;
+    int as_id;
+
+    sf_kvm_dirty_ring_owned = false;
+    kvm_dirty_ring_flush();
+    sf_kvm_dirty_ring_owned = owned;
+
+    CPU_FOREACH(cpu) {
+        cpu->sf_kvm_fetch_index = cpu->kvm_fetch_index;
+        cpu->sf_kvm_reset_index = cpu->kvm_fetch_index;
     }
 
     kvm_slots_lock();
@@ -1206,27 +1371,23 @@ uint64_t sf_kvm_collect_dirty(SfKvmDirtyPageFn cb, void *user)
             for (bit = find_first_bit(mem->dirty_bmap, nbits);
                  bit < nbits;
                  bit = find_next_bit(mem->dirty_bmap, nbits, bit + 1)) {
-                if (cb) {
-                    cb((uint8_t *)mem->ram + bit * psize, psize, user);
-                }
+                cb((uint8_t *)mem->ram + bit * psize, psize, user);
                 visited++;
             }
         }
     }
     kvm_slots_unlock();
 
+    if (sf_kvm_ring_debug()) {
+        fprintf(stderr, "sf-ring: bitmap-fallback n=%" PRIu64 "\n", visited);
+    }
     return visited;
 }
 
-void sf_kvm_dirty_reset_all(void)
+static void sf_kvm_dirty_bitmap_clear_all(KVMState *s)
 {
-    KVMState *s = kvm_state;
     int as_id;
 
-    if (!s) {
-        return;
-    }
-    kvm_slots_lock();
     for (as_id = 0; as_id < s->nr_as; as_id++) {
         KVMMemoryListener *kml = s->as[as_id].ml;
         unsigned int i;
@@ -1237,11 +1398,55 @@ void sf_kvm_dirty_reset_all(void)
         for (i = 0; i < kml->nr_slots_allocated; i++) {
             KVMSlot *mem = &kml->slots[i];
 
-            if (mem->dirty_bmap) {
-                kvm_slot_reset_dirty_pages(mem);
+            if (!mem->memory_size || !mem->dirty_bmap) {
+                continue;
             }
+            kvm_slot_reset_dirty_pages(mem);
         }
     }
+}
+
+void sf_kvm_dirty_reset_all(void)
+{
+    KVMState *s = kvm_state;
+
+    if (!s) {
+        return;
+    }
+    kvm_slots_lock();
+    sf_kvm_reset_harvested(s);
+    sf_kvm_dirty_bitmap_clear_all(s);
+    kvm_slots_unlock();
+}
+
+void sf_kvm_dirty_clean_slate(void)
+{
+    KVMState *s = kvm_state;
+    CPUState *cpu;
+    bool owned;
+
+    if (!s || !s->kvm_dirty_ring_size) {
+        return;
+    }
+
+    if (!current_cpu) {
+        sf_kvm_collect_dirty(NULL, NULL);
+        sf_kvm_dirty_reset_all();
+        return;
+    }
+
+    owned = sf_kvm_dirty_ring_owned;
+    sf_kvm_dirty_ring_owned = false;
+    kvm_dirty_ring_flush();
+    sf_kvm_dirty_ring_owned = owned;
+
+    CPU_FOREACH(cpu) {
+        cpu->sf_kvm_fetch_index = cpu->kvm_fetch_index;
+        cpu->sf_kvm_reset_index = cpu->kvm_fetch_index;
+    }
+
+    kvm_slots_lock();
+    sf_kvm_dirty_bitmap_clear_all(s);
     kvm_slots_unlock();
 }
 
@@ -3655,16 +3860,21 @@ int kvm_cpu_exec(CPUState *cpu)
              */
             trace_kvm_dirty_ring_full(cpu->cpu_index);
             bql_lock();
-            /*
-             * We throttle vCPU by making it sleep once it exit from kernel
-             * due to dirty ring full. In the dirtylimit scenario, reaping
-             * all vCPUs after a single vCPU dirty ring get full result in
-             * the miss of sleep, so just reap the ring-fulled vCPU.
-             */
-            if (dirtylimit_in_service()) {
-                kvm_dirty_ring_reap(kvm_state, cpu);
+            if (sf_kvm_dirty_ring_owned) {
+                sf_kvm_collect_dirty(sf_dirty_note_page, NULL);
+                sf_kvm_dirty_reset_all();
             } else {
-                kvm_dirty_ring_reap(kvm_state, NULL);
+                /*
+                 * We throttle vCPU by making it sleep once it exit from kernel
+                 * due to dirty ring full. In the dirtylimit scenario, reaping
+                 * all vCPUs after a single vCPU dirty ring get full result in
+                 * the miss of sleep, so just reap the ring-fulled vCPU.
+                 */
+                if (dirtylimit_in_service()) {
+                    kvm_dirty_ring_reap(kvm_state, cpu);
+                } else {
+                    kvm_dirty_ring_reap(kvm_state, NULL);
+                }
             }
             bql_unlock();
             dirtylimit_vcpu_execute(cpu);

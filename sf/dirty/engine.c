@@ -51,6 +51,7 @@ static GHashTable  *g_hot;
 static void   **g_dirty;      /* host page addresses, this generation */
 static size_t   g_dirty_n;    /* count */
 static size_t   g_dirty_cap;  /* capacity (kept across generations) */
+static GHashTable *g_dirty_set; /* membership for ring-full duplicate harvests */
 
 static inline size_t sf_page_size(void)
 {
@@ -62,8 +63,22 @@ static GHashTable *sf_set(void)
     return g_hash_table_new(g_direct_hash, g_direct_equal);
 }
 
+static SfResetPolicy sf_reset_policy(void)
+{
+    const char *s = getenv("SF_BLIND");
+
+    return (s && *s) ? SF_RESET_ALL_HOT : SF_RESET_FULL;
+}
+
 static inline void sf_dirty_push(void *host)
 {
+    if (!g_dirty_set) {
+        g_dirty_set = sf_set();
+    }
+    if (g_hash_table_contains(g_dirty_set, host)) {
+        return;
+    }
+    g_hash_table_add(g_dirty_set, host);
     if (g_dirty_n == g_dirty_cap) {
         g_dirty_cap = g_dirty_cap ? g_dirty_cap * 2 : 4096;
         g_dirty = g_renew(void *, g_dirty, g_dirty_cap);
@@ -100,6 +115,7 @@ void sf_dirty_destroy(void)
     g_free(g_dirty);
     g_dirty = NULL;
     g_dirty_n = g_dirty_cap = 0;
+    g_clear_pointer(&g_dirty_set, g_hash_table_destroy);
     /* g_hot (policy) intentionally persists across snapshots. */
     g_have_snapshot = false;
 }
@@ -118,6 +134,7 @@ static int sf_dirty_start_tracking(Error **errp)
         }
         g_log_started = true;
     }
+    sf_kvm_dirty_ring_set_owned(true);
     return 0;
 }
 
@@ -128,13 +145,9 @@ static void sf_dirty_clean_slate(void)
     }
     g_have_snapshot = true;
 
-    /*
-     * Start tracking from a clean slate: drain whatever is pending (this also
-     * reprotects those pages via KVM_RESET_DIRTY_RINGS) and clear the bitmaps
-     * so the next collect() only sees writes made after this snapshot.
-     */
-    sf_kvm_collect_dirty(NULL, NULL);
-    sf_kvm_dirty_reset_all();
+    /* Start tracking from a clean slate: re-protect pages dirtied before this
+     * snapshot and align sf's private ring cursors after that baseline. */
+    sf_kvm_dirty_clean_slate();
 }
 
 bool sf_dirty_have_snapshot(void)
@@ -164,6 +177,9 @@ void sf_dirty_iter_hot(void (*cb)(void *host_page, void *user), void *user)
 void sf_dirty_clear_collected(void)
 {
     g_dirty_n = 0;
+    if (g_dirty_set) {
+        g_hash_table_remove_all(g_dirty_set);
+    }
 }
 
 int sf_dirty_snapshot(Error **errp)
@@ -241,9 +257,27 @@ int sf_dirty_use_external_shadows(const SfDirtyShadowDesc *descs, size_t n_descs
 /* Fault injection (selftest only): a page collect() must pretend it never saw. */
 static void *g_inject_skip_page;
 
+static void sf_dirty_drop_collected(void *host_page)
+{
+    size_t out = 0;
+
+    for (size_t i = 0; i < g_dirty_n; i++) {
+        if (g_dirty[i] != host_page) {
+            g_dirty[out++] = g_dirty[i];
+        }
+    }
+    g_dirty_n = out;
+    if (g_dirty_set) {
+        g_hash_table_remove(g_dirty_set, host_page);
+    }
+}
+
 void sf_dirty_inject_collect_skip(void *host_page)
 {
     g_inject_skip_page = host_page;
+    if (host_page) {
+        sf_dirty_drop_collected(host_page);
+    }
 }
 
 static void sf_collect_cb(void *host, size_t page_size, void *user)
@@ -253,7 +287,15 @@ static void sf_collect_cb(void *host, size_t page_size, void *user)
     if (host == g_inject_skip_page) {
         return; /* injected loss: this dirty page is dropped on the floor */
     }
+    if (sf_reset_policy() == SF_RESET_ALL_HOT) {
+        sf_dirty_mark_hot((uint64_t)(uintptr_t)host);
+    }
     sf_dirty_push(host);
+}
+
+void sf_dirty_note_page(void *host_page, size_t page_size, void *user)
+{
+    sf_collect_cb(host_page, page_size, user);
 }
 
 uint64_t sf_dirty_collect(void)
@@ -300,11 +342,19 @@ uint32_t sf_dirty_restore(void)
         }
     }
 
-    g_dirty_n = 0; /* clear for next generation, keep capacity */
+    sf_dirty_clear_collected(); /* clear for next generation, keep capacity */
     return copied;
 }
 
 void sf_dirty_reset_ring(void)
+{
+    if (sf_reset_policy() == SF_RESET_ALL_HOT) {
+        return;
+    }
+    sf_dirty_force_reset_ring();
+}
+
+void sf_dirty_force_reset_ring(void)
 {
     sf_kvm_dirty_reset_all();
 }
@@ -323,4 +373,9 @@ void sf_dirty_mark_hot(uint64_t page_addr)
         g_hot = sf_set();
     }
     g_hash_table_add(g_hot, (gpointer)(uintptr_t)page_addr);
+}
+
+bool sf_dirty_is_hot(void *host_page)
+{
+    return g_hot && g_hash_table_contains(g_hot, host_page);
 }

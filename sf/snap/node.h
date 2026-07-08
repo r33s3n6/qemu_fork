@@ -219,6 +219,7 @@ int   sf_snap_save(SfSnapKind kind, Error **errp);
 /* @debug is an optional device-replay skip-knob (HMP debug=/terminal SF_CP_SKIP);
  * NULL for a normal restore. */
 int   sf_snap_restore(uint32_t dst_id, const SfReplayDebug *debug, Error **errp);
+void  sf_snap_hot_cache_invalidate(void);
 
 /* ---- RAM-only cores (selftest / building blocks; no device, no guard) ----
  * Production save/restore wrap these with device capture (T4) + clock tail.

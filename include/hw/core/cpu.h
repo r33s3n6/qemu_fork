@@ -470,6 +470,10 @@ struct qemu_work_item;
  *    ring is enabled.
  * @kvm_fetch_index: Keeps the index that we last fetched from the per-vCPU
  *    dirty ring structure.
+ * @sf_kvm_fetch_index: sf-owned dirty-ring cursor. Unlike @kvm_fetch_index it
+ *    only reads entries; it does not publish them to QEMU's dirty bitmap.
+ * @sf_kvm_reset_index: first sf-owned ring entry not yet handed to
+ *    KVM_RESET_DIRTY_RINGS.
  *
  * @neg_align: The CPUState is the common part of a concrete ArchCPU
  * which is allocated when an individual CPU instance is created. As
@@ -550,6 +554,8 @@ struct CPUState {
     struct kvm_run *kvm_run;
     struct kvm_dirty_gfn *kvm_dirty_gfns;
     uint32_t kvm_fetch_index;
+    uint32_t sf_kvm_fetch_index;
+    uint32_t sf_kvm_reset_index;
     uint64_t dirty_pages;
     int kvm_vcpu_stats_fd;
 

@@ -296,6 +296,7 @@ SfSnapNode *sf_snap_ram_root(Error **errp)
     if (sf_active) {
         SfSnapNode *root = sf_active;
         while (root->parent) { root = root->parent; }
+        sf_snap_hot_cache_invalidate();
         sf_node_destroy(root);
         sf_active = NULL;
     }
@@ -422,7 +423,7 @@ SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, Error **errp
     /* Step 6: INV-B — clear the vector + reset the ring so the next generation
      * is relative to this new node. */
     sf_dirty_clear_collected();
-    sf_dirty_reset_ring();
+    sf_dirty_force_reset_ring();
     return node;
 }
 
@@ -456,18 +457,81 @@ static size_t sf_build_restore_w(SfSnapNode *src, SfSnapNode *dst, SfSnapNode *L
     return sf_w_filter_excluded(acc, sf_w_sort_uniq(acc));
 }
 
-/* Apply a slice [start,end) of W: memcpy(store→live) from the ≤dst nearest owner.
- * resolve() only reads the (immutable-during-restore) node tree and each key maps
- * to a distinct host page (W is sort_uniq'd), so slices run concurrently unlocked. */
-static void sf_apply_slice(SfSnapNode *dst, const SfPageKey *keys,
-                           size_t start, size_t end)
+typedef struct SfApplyPage {
+    uint8_t *host;
+    uint8_t *src;
+} SfApplyPage;
+
+typedef struct SfHotCache {
+    SfSnapNode *dst;
+    GHashTable *src_by_key; /* SfPageKey -> src page */
+} SfHotCache;
+
+static SfHotCache g_hot_cache;
+
+void sf_snap_hot_cache_invalidate(void)
 {
-    size_t psize = qemu_real_host_page_size();
-    for (size_t i = start; i < end; i++) {
+    if (g_hot_cache.src_by_key) {
+        g_hash_table_remove_all(g_hot_cache.src_by_key);
+    }
+    g_hot_cache.dst = NULL;
+}
+
+static void sf_hot_cache_reset(SfSnapNode *dst)
+{
+    if (!g_hot_cache.src_by_key) {
+        g_hot_cache.src_by_key = g_hash_table_new(g_direct_hash, g_direct_equal);
+    }
+    if (g_hot_cache.dst != dst) {
+        g_hash_table_remove_all(g_hot_cache.src_by_key);
+        g_hot_cache.dst = dst;
+    }
+}
+
+static uint8_t *sf_hot_cache_lookup(SfSnapNode *dst, SfPageKey key)
+{
+    if (!g_hot_cache.src_by_key || g_hot_cache.dst != dst) {
+        return NULL;
+    }
+    return g_hash_table_lookup(g_hot_cache.src_by_key,
+                               (gpointer)(uintptr_t)key);
+}
+
+static void sf_hot_cache_put(SfSnapNode *dst, SfPageKey key, uint8_t *src)
+{
+    sf_hot_cache_reset(dst);
+    g_hash_table_insert(g_hot_cache.src_by_key, (gpointer)(uintptr_t)key, src);
+}
+
+static void sf_apply_resolve(SfSnapNode *dst, const SfPageKey *keys,
+                             SfApplyPage *pages, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
         uint8_t *host = sf_key_to_host(keys[i]);
-        uint8_t *src_page = sf_resolve(dst, keys[i]);
-        if (host && src_page) {
-            memcpy(host, src_page, psize);
+        uint8_t *src = NULL;
+
+        if (host && sf_dirty_is_hot(host)) {
+            src = sf_hot_cache_lookup(dst, keys[i]);
+        }
+        if (host && !src) {
+            src = sf_resolve(dst, keys[i]);
+            if (src && sf_dirty_is_hot(host)) {
+                sf_hot_cache_put(dst, keys[i], src);
+            }
+        }
+        pages[i].host = host;
+        pages[i].src = src;
+    }
+}
+
+/* Copy a pre-resolved slice [start,end). Each key maps to a distinct host page
+ * (W is sort_uniq'd), so slices run concurrently unlocked. */
+static void sf_copy_slice(const SfApplyPage *pages, size_t start, size_t end,
+                          size_t psize)
+{
+    for (size_t i = start; i < end; i++) {
+        if (pages[i].host && pages[i].src) {
+            memcpy(pages[i].host, pages[i].src, psize);
         }
     }
 }
@@ -481,8 +545,8 @@ typedef struct {
     QemuMutex  mtx;
     QemuCond   cond_work;   /* main → worker: a slice is ready */
     QemuCond   cond_done;   /* worker → main: slice finished */
-    SfSnapNode *dst;
-    const SfPageKey *keys;
+    const SfApplyPage *pages;
+    size_t psize;
     size_t start, end;
     bool have_work, done, started;
 } SfApplyWorker;
@@ -500,12 +564,12 @@ static void *sf_apply_worker_fn(void *opaque)
         while (!w->have_work) {
             qemu_cond_wait(&w->cond_work, &w->mtx);
         }
-        SfSnapNode *dst = w->dst;
-        const SfPageKey *keys = w->keys;
+        const SfApplyPage *pages = w->pages;
+        size_t psize = w->psize;
         size_t s = w->start, e = w->end;
         qemu_mutex_unlock(&w->mtx);
 
-        sf_apply_slice(dst, keys, s, e);
+        sf_copy_slice(pages, s, e, psize);
 
         qemu_mutex_lock(&w->mtx);
         w->have_work = false;
@@ -517,71 +581,66 @@ static void *sf_apply_worker_fn(void *opaque)
      * shutdown path ever needs it. */
 }
 
-/* Diagnostic (env SF_APPLY_SPLIT): single-threaded two-pass to separate the
- * per-page resolve cost (tree walk / bsearch) from the raw memcpy, so we know how
- * much of ram= is the multi-level tree overhead vs bandwidth. */
-static void sf_apply_w_profiled(SfSnapNode *dst, const SfPageKey *keys, size_t n)
-{
-    size_t psize = qemu_real_host_page_size();
-    uint8_t **host = g_malloc(n * sizeof(*host));
-    uint8_t **src  = g_malloc(n * sizeof(*src));
-
-    uint64_t t0 = sf_now_ns();
-    for (size_t i = 0; i < n; i++) {
-        host[i] = sf_key_to_host(keys[i]);
-        src[i]  = sf_resolve(dst, keys[i]);
-    }
-    uint64_t t1 = sf_now_ns();
-    for (size_t i = 0; i < n; i++) {
-        if (host[i] && src[i]) {
-            memcpy(host[i], src[i], psize);
-        }
-    }
-    uint64_t t2 = sf_now_ns();
-    fprintf(stderr, "sf-time: apply-split resolve=%.1fus copy=%.1fus (n=%zu, "
-            "%.3f+%.3f us/page)\n", (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, n,
-            (t1 - t0) / 1000.0 / n, (t2 - t1) / 1000.0 / n);
-    g_free(host);
-    g_free(src);
-}
-
-/* Apply W: split into two contiguous halves — the background worker takes the
- * upper half, the caller runs the lower half, then waits for the worker. */
+/* Apply W: resolve all (host,src) pairs first, then split memcpy into two
+ * contiguous halves. The background worker takes the upper half, the caller
+ * runs the lower half, then waits for the worker. */
 static void sf_apply_w(SfSnapNode *dst, const SfPageKey *keys, size_t n)
 {
-    if (n && getenv("SF_APPLY_SPLIT")) {
-        sf_apply_w_profiled(dst, keys, n);
+    size_t psize = qemu_real_host_page_size();
+    SfApplyPage *pages;
+    bool split = getenv("SF_APPLY_SPLIT") != NULL;
+    uint64_t t0 = 0, t1 = 0, t2 = 0;
+
+    if (!n) {
         return;
     }
+    pages = g_new(SfApplyPage, n);
+    if (split) { t0 = sf_now_ns(); }
+    sf_apply_resolve(dst, keys, pages, n);
+    if (split) { t1 = sf_now_ns(); }
+
     if (n < SF_APPLY_PARALLEL_MIN) {
-        sf_apply_slice(dst, keys, 0, n);
-        return;
+        sf_copy_slice(pages, 0, n, psize);
+        if (split) { t2 = sf_now_ns(); }
+        goto out;
     }
 
-    SfApplyWorker *w = &g_apply_worker;
-    if (!w->started) {
-        qemu_mutex_init(&w->mtx);
-        qemu_cond_init(&w->cond_work);
-        qemu_cond_init(&w->cond_done);
-        qemu_thread_create(&w->thread, "sf-apply", sf_apply_worker_fn, w,
-                           QEMU_THREAD_JOINABLE);
-        w->started = true;
+    {
+        SfApplyWorker *w = &g_apply_worker;
+        if (!w->started) {
+            qemu_mutex_init(&w->mtx);
+            qemu_cond_init(&w->cond_work);
+            qemu_cond_init(&w->cond_done);
+            qemu_thread_create(&w->thread, "sf-apply", sf_apply_worker_fn, w,
+                               QEMU_THREAD_JOINABLE);
+            w->started = true;
+        }
+
+        size_t mid = n / 2;
+        qemu_mutex_lock(&w->mtx);
+        w->pages = pages; w->psize = psize; w->start = mid; w->end = n;
+        w->done = false; w->have_work = true;
+        qemu_cond_signal(&w->cond_work);
+        qemu_mutex_unlock(&w->mtx);
+
+        sf_copy_slice(pages, 0, mid, psize);   /* caller does the lower half */
+
+        qemu_mutex_lock(&w->mtx);
+        while (!w->done) {
+            qemu_cond_wait(&w->cond_done, &w->mtx);
+        }
+        qemu_mutex_unlock(&w->mtx);
+        if (split) { t2 = sf_now_ns(); }
     }
 
-    size_t mid = n / 2;
-    qemu_mutex_lock(&w->mtx);
-    w->dst = dst; w->keys = keys; w->start = mid; w->end = n;
-    w->done = false; w->have_work = true;
-    qemu_cond_signal(&w->cond_work);
-    qemu_mutex_unlock(&w->mtx);
-
-    sf_apply_slice(dst, keys, 0, mid);   /* caller does the lower half */
-
-    qemu_mutex_lock(&w->mtx);
-    while (!w->done) {
-        qemu_cond_wait(&w->cond_done, &w->mtx);
+out:
+    if (split) {
+        fprintf(stderr, "sf-time: apply-split resolve=%.1fus copy=%.1fus "
+                "(n=%zu, %.3f+%.3f us/page)\n",
+                (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, n,
+                (t1 - t0) / 1000.0 / n, (t2 - t1) / 1000.0 / n);
     }
-    qemu_mutex_unlock(&w->mtx);
+    g_free(pages);
 }
 
 /*
@@ -612,7 +671,11 @@ int sf_snap_delta_restore(uint32_t dst_id, Error **errp)
     g_free(acc.keys);
 
     sf_dirty_clear_collected();
-    sf_dirty_reset_ring();
+    if (src == dst) {
+        sf_dirty_reset_ring();
+    } else {
+        sf_dirty_force_reset_ring();
+    }
     sf_active = dst;
     return 0;
 }
@@ -823,7 +886,11 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
 
     /* Step 7: INV-B — clear the vector + reset the ring for the next generation. */
     sf_dirty_clear_collected();
-    sf_dirty_reset_ring();
+    if (src == dst) {
+        sf_dirty_reset_ring();
+    } else {
+        sf_dirty_force_reset_ring();
+    }
 
     if (timing) {
         t4 = sf_now_ns();

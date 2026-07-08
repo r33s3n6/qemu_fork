@@ -621,26 +621,34 @@ typedef void (*SfKvmDirtyPageFn)(void *host, size_t page_size, void *user);
 bool sf_kvm_dirty_ring_enabled(void);
 
 /*
- * Drain every vCPU dirty ring into the per-slot dirty bitmaps (stock reap +
- * KVM_RESET_DIRTY_RINGS reprotect), then walk all per-slot bitmaps and hand
- * each dirty guest page's host address to @cb. Draining first means pages
- * already reaped by the background reaper or by a KVM_EXIT_DIRTY_RING_FULL
- * exit are still visited — they live in the accumulated per-slot bitmap.
- * This is the "ring-full is first-class, zero page loss" invariant: read the
- * authoritative bitmap, not the live ring. Returns pages visited. Must hold
- * BQL. Does NOT clear bitmaps — call sf_kvm_dirty_reset_all() to start a
- * fresh tracking round.
+ * Read every vCPU dirty ring through sf's private cursor and hand each newly
+ * harvested guest page's host address to @cb. This does not publish pages to
+ * QEMU's per-slot dirty bitmap and does not call KVM_RESET_DIRTY_RINGS.
+ * Returns pages visited. Must hold BQL.
  */
 uint64_t sf_kvm_collect_dirty(SfKvmDirtyPageFn cb, void *user);
 
-/* Clear all per-slot dirty bitmaps (begin a fresh tracking round). BQL. */
+/*
+ * Mark sf-harvested ring entries as collected and execute KVM_RESET_DIRTY_RINGS
+ * to release/reprotect them. Also clears legacy per-slot dirty bitmaps so old
+ * reaper state cannot leak into sf's next generation. BQL.
+ */
 void sf_kvm_dirty_reset_all(void);
 
 /*
- * Fault injection (selftest only): when @on, sf_kvm_collect_dirty() skips the
- * ring drain and reads only the already-accumulated bitmap. This reproduces
- * the "read the live ring but forget to account for drained pages" bug — under
- * ring-full it loses pages, so a correct zero-loss check must go RED.
+ * Establish a clean tracking baseline: use the stock KVM dirty-ring reap/reset
+ * once, clear QEMU's accumulated bitmaps, and align sf private cursors after the
+ * stock cursor. Use when arming a new root/active snapshot, not per restore.
+ */
+void sf_kvm_dirty_clean_slate(void);
+
+/* Claim/release dirty-ring ownership from QEMU's background reaper paths. */
+void sf_kvm_dirty_ring_set_owned(bool owned);
+
+/*
+ * Fault injection (selftest only): when @on, sf_kvm_collect_dirty() skips
+ * kicking vCPUs before reading the sf cursor. This reproduces missing the
+ * hardware dirty buffer at the boundary.
  */
 void sf_kvm_set_skip_flush(bool on);
 

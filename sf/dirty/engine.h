@@ -19,6 +19,11 @@
  */
 typedef enum { SF_PAGE_COLD = 0, SF_PAGE_HOT } SfPagePolicy;
 
+typedef enum {
+    SF_RESET_FULL = 0,   /* reset/reprotect at every generation boundary */
+    SF_RESET_ALL_HOT,    /* same-active restore rounds keep harvested pages hot */
+} SfResetPolicy;
+
 typedef struct SfDirtyShadowDesc {
     void    *host;    /* live RAMBlock host base */
     uint64_t len;     /* RAMBlock used_length */
@@ -52,14 +57,20 @@ uint64_t sf_dirty_collect(void);
  */
 uint32_t sf_dirty_restore(void);
 
-/* Clear per-slot dirty bitmaps to begin a fresh tracking round. */
+/* Policy-aware generation boundary reset. SF_BLIND/ALL_HOT may defer it. */
 void sf_dirty_reset_ring(void);
+
+/* Unconditionally release/reprotect harvested ring entries. Use at layer switch. */
+void sf_dirty_force_reset_ring(void);
 
 /* Policy of a guest page (keyed by host page address; see note above). */
 SfPagePolicy sf_reprotect_policy(uint64_t page_addr);
 
 /* Mark a guest page HOT (keyed by host page address). Default COLD. */
 void sf_dirty_mark_hot(uint64_t page_addr);
+
+/* Query HOT membership by host page address. */
+bool sf_dirty_is_hot(void *host_page);
 
 /* Free the shadow + policy/to-restore sets. */
 void sf_dirty_destroy(void);
@@ -103,5 +114,12 @@ void sf_dirty_iter_hot(void (*cb)(void *host_page, void *user), void *user);
  * (collect appends; without a clear, consecutive collects accumulate).
  */
 void sf_dirty_clear_collected(void);
+
+/*
+ * KVM ring-full handler hook: record a page harvested outside the regular
+ * restore collect() path. Same semantics as collect(): page enters this
+ * generation's restore set.
+ */
+void sf_dirty_note_page(void *host_page, size_t page_size, void *user);
 
 #endif /* SF_DIRTY_ENGINE_H */

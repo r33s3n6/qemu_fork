@@ -282,6 +282,7 @@ static void sf_selftest_ram(Monitor *mon, bool *all_ok)
     Error *err = NULL;
     char buf[160];
     uint32_t *exp;
+    uint32_t rollback_copied = 0;
 
     if (!sf_kvm_dirty_ring_enabled()) {
         monitor_printf(mon, "sf: selftest[1-3 RAM]: SKIPPED "
@@ -303,10 +304,36 @@ static void sf_selftest_ram(Monitor *mon, bool *all_ok)
             sf_dirty_reset_ring();
             uint32_t mism = sf_count_mismatch(exp, SF_ST_WATCH);
             bool ok = (changed > 0) && (mism == 0);
+            rollback_copied = copied;
             snprintf(buf, sizeof(buf), "%u/%u pages changed then restored, "
                      "%u still wrong, copied-back=%u", changed, SF_ST_WATCH,
                      mism, copied);
             report(mon, all_ok, "1 rollback", ok, buf);
+        }
+    }
+
+    /* ①b HOT+dirty dedup: a HOT page dirtied in the same generation must be
+     * restored once, not once from dirty and again from HOT.  Use a non-P0 page
+     * so later P0 loss teeth still test the intended missing-diff path. */
+    {
+        void *hot = sf_gpa_to_host(SF_ST_BASE + (hwaddr)(SF_ST_WATCH - 1) *
+                                   SF_ST_PAGE);
+        sf_dirty_mark_hot((uint64_t)(uintptr_t)hot);
+        uint32_t changed = sf_snapshot_and_dirty(exp, SF_ST_WATCH, 20, &err);
+        if (changed == UINT32_MAX) {
+            report(mon, all_ok, "1b HOT+dirty dedup", false,
+                   error_get_pretty(err));
+            error_free(err); err = NULL;
+        } else {
+            sf_dirty_collect();
+            uint32_t copied = sf_dirty_restore();
+            sf_dirty_reset_ring();
+            uint32_t mism = sf_count_mismatch(exp, SF_ST_WATCH);
+            bool ok = (changed > 0) && (mism == 0) &&
+                      rollback_copied && (copied == rollback_copied);
+            snprintf(buf, sizeof(buf), "changed=%u copied-back=%u base=%u "
+                     "mism=%u", changed, copied, rollback_copied, mism);
+            report(mon, all_ok, "1b HOT+dirty dedup", ok, buf);
         }
     }
 

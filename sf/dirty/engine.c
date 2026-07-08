@@ -22,6 +22,7 @@
 #include "system/ramlist.h"
 #include "system/memory.h"
 #include "system/kvm.h"
+#include "qemu/bitmap.h"
 #include "sf/dirty/engine.h"
 
 /* One shadow copy per RAMBlock (host-contiguous). */
@@ -37,30 +38,19 @@ static size_t       g_n_shadows;
 static bool         g_have_snapshot;
 static bool         g_log_started;
 
-/* HOT policy set: keyed by host page address, queried for membership → hash set. */
-static GHashTable  *g_hot;
-
-/* Pages dirtied this generation → a flat, append-only vector of host page
- * addresses. The KVM dirty ring logs each page at most once per generation (a
- * page enters the ring on its clean->dirty write fault, then stays writable
- * until the next reset), so there are no intra-generation duplicates to dedup.
- * Only add/iterate/clear are ever needed (never membership) → a plain vector
- * beats both a hash set (was ~150ns/page of hashing, ~500us/3000 pages) and a
- * bitmap+stack (no bitmap memory, no per-append bit test). A duplicate (a HOT
- * page also dirtied) at worst costs one redundant, harmless memcpy. */
-static void   **g_dirty;      /* host page addresses, this generation */
-static size_t   g_dirty_n;    /* count */
-static size_t   g_dirty_cap;  /* capacity (kept across generations) */
-static GHashTable *g_dirty_set; /* membership for ring-full duplicate harvests */
+/* Single restore vector, partitioned as [HOT prefix | dirty-only suffix].
+ * Bitmap membership makes ring-full duplicate harvests cheap without a hash
+ * table; the vector is the only iterable state. */
+static void **g_restore;
+static size_t g_restore_n;
+static size_t g_restore_cap;
+static size_t g_hot_n;
+static unsigned long *g_in_restore_bmap;
+static unsigned long *g_hot_bmap;
 
 static inline size_t sf_page_size(void)
 {
     return qemu_real_host_page_size();
-}
-
-static GHashTable *sf_set(void)
-{
-    return g_hash_table_new(g_direct_hash, g_direct_equal);
 }
 
 static SfResetPolicy sf_reset_policy(void)
@@ -70,20 +60,146 @@ static SfResetPolicy sf_reset_policy(void)
     return (s && *s) ? SF_RESET_ALL_HOT : SF_RESET_FULL;
 }
 
-static inline void sf_dirty_push(void *host)
+static long sf_shadow_npages(const SfRamShadow *s)
 {
-    if (!g_dirty_set) {
-        g_dirty_set = sf_set();
+    return DIV_ROUND_UP(s->len, sf_page_size());
+}
+
+static bool sf_dirty_page_index(void *host, long *idxp)
+{
+    long base = 0;
+
+    for (size_t i = 0; i < g_n_shadows; i++) {
+        SfRamShadow *s = &g_shadows[i];
+        if (host >= s->host && (uint8_t *)host < (uint8_t *)s->host + s->len) {
+            uint64_t off = (uint8_t *)host - (uint8_t *)s->host;
+            *idxp = base + off / sf_page_size();
+            return true;
+        }
+        base += sf_shadow_npages(s);
     }
-    if (g_hash_table_contains(g_dirty_set, host)) {
+    return false;
+}
+
+static void sf_restore_reserve(size_t need)
+{
+    if (need <= g_restore_cap) {
         return;
     }
-    g_hash_table_add(g_dirty_set, host);
-    if (g_dirty_n == g_dirty_cap) {
-        g_dirty_cap = g_dirty_cap ? g_dirty_cap * 2 : 4096;
-        g_dirty = g_renew(void *, g_dirty, g_dirty_cap);
+    while (g_restore_cap < need) {
+        g_restore_cap = g_restore_cap ? g_restore_cap * 2 : 4096;
     }
-    g_dirty[g_dirty_n++] = host;
+    g_restore = g_renew(void *, g_restore, g_restore_cap);
+}
+
+static bool sf_restore_contains(void *host, size_t start, size_t end)
+{
+    for (size_t i = start; i < end; i++) {
+        if (g_restore[i] == host) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void sf_restore_append_dirty(void *host)
+{
+    long idx;
+
+    if (g_in_restore_bmap && sf_dirty_page_index(host, &idx)) {
+        if (test_and_set_bit(idx, g_in_restore_bmap)) {
+            return;
+        }
+    } else if (sf_restore_contains(host, 0, g_restore_n)) {
+        return;
+    }
+
+    sf_restore_reserve(g_restore_n + 1);
+    g_restore[g_restore_n++] = host;
+}
+
+static void sf_restore_append_hot(void *host)
+{
+    long idx;
+    bool was_in_restore = false;
+
+    if (g_hot_bmap && sf_dirty_page_index(host, &idx)) {
+        if (test_and_set_bit(idx, g_hot_bmap)) {
+            return;
+        }
+        was_in_restore = test_bit(idx, g_in_restore_bmap);
+        set_bit(idx, g_in_restore_bmap);
+    } else if (sf_restore_contains(host, 0, g_hot_n)) {
+        return;
+    }
+
+    if (was_in_restore || sf_restore_contains(host, g_hot_n, g_restore_n)) {
+        for (size_t i = g_hot_n; i < g_restore_n; i++) {
+            if (g_restore[i] == host) {
+                void *tmp = g_restore[g_hot_n];
+                g_restore[g_hot_n] = host;
+                g_restore[i] = tmp;
+                g_hot_n++;
+                return;
+            }
+        }
+    }
+
+    sf_restore_reserve(g_restore_n + 1);
+    g_restore[g_restore_n++] = host;
+    if (g_hot_n != g_restore_n - 1) {
+        void *tmp = g_restore[g_hot_n];
+        g_restore[g_hot_n] = host;
+        g_restore[g_restore_n - 1] = tmp;
+    }
+    g_hot_n++;
+}
+
+static void sf_dirty_clear_collected_suffix(void)
+{
+    for (size_t i = g_hot_n; i < g_restore_n; i++) {
+        long idx;
+        if (g_in_restore_bmap && sf_dirty_page_index(g_restore[i], &idx)) {
+            clear_bit(idx, g_in_restore_bmap);
+        }
+    }
+    g_restore_n = g_hot_n;
+}
+
+static void sf_dirty_rebuild_bitmaps(void)
+{
+    long nbits = 0;
+    size_t out = 0;
+
+    g_free(g_in_restore_bmap);
+    g_free(g_hot_bmap);
+    g_in_restore_bmap = NULL;
+    g_hot_bmap = NULL;
+
+    for (size_t i = 0; i < g_n_shadows; i++) {
+        nbits += sf_shadow_npages(&g_shadows[i]);
+    }
+    if (!nbits) {
+        g_restore_n = g_hot_n = 0;
+        return;
+    }
+
+    g_in_restore_bmap = bitmap_new(nbits);
+    g_hot_bmap = bitmap_new(nbits);
+
+    for (size_t i = 0; i < g_hot_n; i++) {
+        long idx;
+        void *host = g_restore[i];
+
+        if (!sf_dirty_page_index(host, &idx) ||
+            test_and_set_bit(idx, g_hot_bmap)) {
+            continue;
+        }
+        set_bit(idx, g_in_restore_bmap);
+        g_restore[out++] = host;
+    }
+    g_hot_n = out;
+    g_restore_n = out;
 }
 
 /* Locate the shadow that owns host page @p; return its shadow ptr + bytes
@@ -102,7 +218,7 @@ uint8_t *sf_dirty_shadow_for(void *p, uint64_t *remain)
     return NULL;
 }
 
-void sf_dirty_destroy(void)
+static void sf_dirty_drop_snapshot(bool keep_hot)
 {
     for (size_t i = 0; i < g_n_shadows; i++) {
         if (g_shadows[i].owned) {
@@ -112,12 +228,22 @@ void sf_dirty_destroy(void)
     g_free(g_shadows);
     g_shadows = NULL;
     g_n_shadows = 0;
-    g_free(g_dirty);
-    g_dirty = NULL;
-    g_dirty_n = g_dirty_cap = 0;
-    g_clear_pointer(&g_dirty_set, g_hash_table_destroy);
-    /* g_hot (policy) intentionally persists across snapshots. */
+    g_free(g_in_restore_bmap);
+    g_free(g_hot_bmap);
+    g_in_restore_bmap = NULL;
+    g_hot_bmap = NULL;
+    sf_dirty_clear_collected_suffix();
+    if (!keep_hot) {
+        g_free(g_restore);
+        g_restore = NULL;
+        g_restore_n = g_restore_cap = g_hot_n = 0;
+    }
     g_have_snapshot = false;
+}
+
+void sf_dirty_destroy(void)
+{
+    sf_dirty_drop_snapshot(true);
 }
 
 static int sf_dirty_start_tracking(Error **errp)
@@ -140,9 +266,6 @@ static int sf_dirty_start_tracking(Error **errp)
 
 static void sf_dirty_clean_slate(void)
 {
-    if (!g_hot) {
-        g_hot = sf_set();
-    }
     g_have_snapshot = true;
 
     /* Start tracking from a clean slate: re-protect pages dirtied before this
@@ -157,29 +280,23 @@ bool sf_dirty_have_snapshot(void)
 
 void *const *sf_dirty_collected(size_t *n)
 {
-    *n = g_dirty_n;
-    return g_dirty;
+    *n = g_restore_n - g_hot_n;
+    return (void *const *)(g_restore + g_hot_n);
 }
 
 void sf_dirty_iter_hot(void (*cb)(void *host_page, void *user), void *user)
 {
-    if (!g_hot || !cb) {
+    if (!cb) {
         return;
     }
-    GHashTableIter it;
-    gpointer key;
-    g_hash_table_iter_init(&it, g_hot);
-    while (g_hash_table_iter_next(&it, &key, NULL)) {
-        cb(key, user);
+    for (size_t i = 0; i < g_hot_n; i++) {
+        cb(g_restore[i], user);
     }
 }
 
 void sf_dirty_clear_collected(void)
 {
-    g_dirty_n = 0;
-    if (g_dirty_set) {
-        g_hash_table_remove_all(g_dirty_set);
-    }
+    sf_dirty_clear_collected_suffix();
 }
 
 int sf_dirty_snapshot(Error **errp)
@@ -193,8 +310,8 @@ int sf_dirty_snapshot(Error **errp)
         return ret;
     }
 
-    /* Drop any previous snapshot (keep HOT policy set). */
-    sf_dirty_destroy();
+    /* Drop any previous snapshot, preserving the HOT prefix across roots. */
+    sf_dirty_drop_snapshot(true);
 
     WITH_RCU_READ_LOCK_GUARD() {
         RAMBLOCK_FOREACH(block) {
@@ -217,6 +334,7 @@ int sf_dirty_snapshot(Error **errp)
 
     g_shadows = shadows;
     g_n_shadows = n;
+    sf_dirty_rebuild_bitmaps();
     sf_dirty_clean_slate();
     return 0;
 }
@@ -235,7 +353,7 @@ int sf_dirty_use_external_shadows(const SfDirtyShadowDesc *descs, size_t n_descs
         return -EINVAL;
     }
 
-    sf_dirty_destroy();
+    sf_dirty_drop_snapshot(true);
     shadows = g_new0(SfRamShadow, n_descs);
     for (size_t i = 0; i < n_descs; i++) {
         if (!descs[i].host || !descs[i].len || !descs[i].shadow) {
@@ -250,6 +368,7 @@ int sf_dirty_use_external_shadows(const SfDirtyShadowDesc *descs, size_t n_descs
     }
     g_shadows = shadows;
     g_n_shadows = n_descs;
+    sf_dirty_rebuild_bitmaps();
     sf_dirty_clean_slate();
     return 0;
 }
@@ -260,15 +379,17 @@ static void *g_inject_skip_page;
 static void sf_dirty_drop_collected(void *host_page)
 {
     size_t out = 0;
+    long idx;
 
-    for (size_t i = 0; i < g_dirty_n; i++) {
-        if (g_dirty[i] != host_page) {
-            g_dirty[out++] = g_dirty[i];
+    for (size_t i = g_hot_n; i < g_restore_n; i++) {
+        if (g_restore[i] != host_page) {
+            g_restore[g_hot_n + out++] = g_restore[i];
         }
     }
-    g_dirty_n = out;
-    if (g_dirty_set) {
-        g_hash_table_remove(g_dirty_set, host_page);
+    g_restore_n = g_hot_n + out;
+    if (g_in_restore_bmap && sf_dirty_page_index(host_page, &idx) &&
+        !test_bit(idx, g_hot_bmap)) {
+        clear_bit(idx, g_in_restore_bmap);
     }
 }
 
@@ -289,8 +410,9 @@ static void sf_collect_cb(void *host, size_t page_size, void *user)
     }
     if (sf_reset_policy() == SF_RESET_ALL_HOT) {
         sf_dirty_mark_hot((uint64_t)(uintptr_t)host);
+    } else {
+        sf_restore_append_dirty(host);
     }
-    sf_dirty_push(host);
 }
 
 void sf_dirty_note_page(void *host_page, size_t page_size, void *user)
@@ -326,20 +448,8 @@ uint32_t sf_dirty_restore(void)
         return 0;
     }
 
-    /* Pages dirtied this generation (flat vector, O(dirty), no hashing). */
-    for (size_t i = 0; i < g_dirty_n; i++) {
-        copied += sf_restore_one(g_dirty[i], psize);
-    }
-
-    /* HOT pages: restored unconditionally. May overlap the dirtied set (HOT is
-     * opt-in and small) → a redundant but correct recopy, not deduped. */
-    if (g_hot) {
-        GHashTableIter it;
-        gpointer key;
-        g_hash_table_iter_init(&it, g_hot);
-        while (g_hash_table_iter_next(&it, &key, NULL)) {
-            copied += sf_restore_one(key, psize);
-        }
+    for (size_t i = 0; i < g_restore_n; i++) {
+        copied += sf_restore_one(g_restore[i], psize);
     }
 
     sf_dirty_clear_collected(); /* clear for next generation, keep capacity */
@@ -361,21 +471,21 @@ void sf_dirty_force_reset_ring(void)
 
 SfPagePolicy sf_reprotect_policy(uint64_t page_addr)
 {
-    if (g_hot && g_hash_table_contains(g_hot, (gpointer)(uintptr_t)page_addr)) {
-        return SF_PAGE_HOT;
-    }
-    return SF_PAGE_COLD;
+    return sf_dirty_is_hot((void *)(uintptr_t)page_addr) ? SF_PAGE_HOT :
+                                                           SF_PAGE_COLD;
 }
 
 void sf_dirty_mark_hot(uint64_t page_addr)
 {
-    if (!g_hot) {
-        g_hot = sf_set();
-    }
-    g_hash_table_add(g_hot, (gpointer)(uintptr_t)page_addr);
+    sf_restore_append_hot((void *)(uintptr_t)page_addr);
 }
 
 bool sf_dirty_is_hot(void *host_page)
 {
-    return g_hot && g_hash_table_contains(g_hot, host_page);
+    long idx;
+
+    if (g_hot_bmap && sf_dirty_page_index(host_page, &idx)) {
+        return test_bit(idx, g_hot_bmap);
+    }
+    return sf_restore_contains(host_page, 0, g_hot_n);
 }

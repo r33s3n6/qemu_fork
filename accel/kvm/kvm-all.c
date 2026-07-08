@@ -1004,6 +1004,8 @@ static void dirty_gfn_set_collected(struct kvm_dirty_gfn *gfn)
     qatomic_store_release(&gfn->flags, KVM_DIRTY_GFN_F_RESET);
 }
 
+static bool sf_kvm_dirty_ring_owned;
+
 static bool kvm_dirty_ring_host_page(KVMState *s, struct kvm_dirty_gfn *gfn,
                                      size_t psize, void **hostp)
 {
@@ -1108,6 +1110,10 @@ static uint64_t kvm_dirty_ring_reap(KVMState *s, CPUState *cpu)
 {
     uint64_t total;
 
+    if (sf_kvm_dirty_ring_owned) {
+        return 0;
+    }
+
     /*
      * We need to lock all kvm slots for all address spaces here,
      * because:
@@ -1157,7 +1163,6 @@ static void kvm_cpu_synchronize_kick_all(void)
  *
  * This function must be called with BQL held.
  */
-static bool sf_kvm_dirty_ring_owned;
 static bool sf_kvm_ring_debug(void)
 {
     const char *s = getenv("SF_RING_DEBUG");
@@ -1986,7 +1991,14 @@ static void kvm_set_phys_mem(KVMMemoryListener *kml,
                  *
                  * Not easy.  Let's cross the fingers until it's fixed.
                  */
-                if (kvm_state->kvm_dirty_ring_size) {
+                if (kvm_state->kvm_dirty_ring_size && sf_kvm_dirty_ring_owned) {
+                    sf_kvm_collect_dirty(NULL, NULL);
+                    sf_kvm_dirty_reset_all();
+                    if (kvm_state->kvm_dirty_ring_with_bitmap) {
+                        kvm_slot_sync_dirty_pages(mem);
+                        kvm_slot_get_dirty_log(kvm_state, mem);
+                    }
+                } else if (kvm_state->kvm_dirty_ring_size) {
                     kvm_dirty_ring_reap_locked(kvm_state, NULL);
                     if (kvm_state->kvm_dirty_ring_with_bitmap) {
                         kvm_slot_sync_dirty_pages(mem);

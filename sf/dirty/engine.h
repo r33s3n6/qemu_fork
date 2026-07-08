@@ -72,7 +72,7 @@ void sf_dirty_mark_hot(uint64_t page_addr);
 /* Query HOT membership by host page address. */
 bool sf_dirty_is_hot(void *host_page);
 
-/* Free the shadow + policy/to-restore sets. */
+/* Free the shadow + current dirty suffix. HOT policy persists across roots. */
 void sf_dirty_destroy(void);
 
 /*

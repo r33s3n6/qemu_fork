@@ -1455,6 +1455,87 @@ void sf_kvm_dirty_clean_slate(void)
     kvm_slots_unlock();
 }
 
+/* ---- R1: restore-tracker redesign primitives (plan 2026-07-08-03) ----------
+ * Clean split of the two welded stock ops: drain (read ring, no reset) vs
+ * reset_ring (reclaim slots + reprotect). The tracker (sf/track) drives these;
+ * protect(set) is the I.3 keep-writable seam. See plan §3.1.
+ */
+
+/* Flush the HW dirty buffer into the ring, then read every vCPU's new
+ * private-cursor entries into @host_out (advancing sf_kvm_fetch_index, NOT
+ * resetting). Returns host pages written (≤ @max). No per-page callback — the
+ * tracker converts host→page-idx itself. Size @max ≥ ring_size (single vCPU)
+ * so one call drains fully; the ring can never hold more than ring_size
+ * dirtied entries. Multi-vCPU unions rings (DP-A, deferred). */
+size_t sf_kvm_drain_ring(void **host_out, size_t max)
+{
+    KVMState *s = kvm_state;
+    CPUState *cpu;
+    size_t psize = qemu_real_host_page_size();
+    size_t n = 0;
+
+    if (!s || !s->kvm_dirty_ring_size || !host_out) {
+        return 0;
+    }
+    if (!sf_kvm_skip_flush) {
+        kvm_cpu_synchronize_kick_all();
+    }
+    kvm_slots_lock();
+    CPU_FOREACH(cpu) {
+        struct kvm_dirty_gfn *gfns = cpu->kvm_dirty_gfns, *cur;
+        uint32_t ring_size = s->kvm_dirty_ring_size;
+        uint32_t fetch = cpu->sf_kvm_fetch_index;
+
+        if (!cpu->created || !gfns) {
+            continue;
+        }
+        while (n < max) {
+            void *host;
+            cur = &gfns[fetch % ring_size];
+            if (!dirty_gfn_is_dirtied(cur)) {
+                break;
+            }
+            if (kvm_dirty_ring_host_page(s, cur, psize, &host)) {
+                host_out[n++] = host;
+            }
+            fetch++;
+        }
+        cpu->sf_kvm_fetch_index = fetch;
+    }
+    kvm_slots_unlock();
+    return n;
+}
+
+/* Reclaim the ring slots we've drained but not yet reset: mark [reset_index,
+ * fetch_index) collected and KVM_RESET_DIRTY_RINGS. Stock KVM welds reclaim +
+ * reprotect (reprotects exactly those pages). */
+void sf_kvm_reset_ring(void)
+{
+    KVMState *s = kvm_state;
+
+    if (!s) {
+        return;
+    }
+    kvm_slots_lock();
+    sf_kvm_reset_harvested(s);
+    kvm_slots_unlock();
+}
+
+/* I.3 (kvm-keep-writable) seam: reprotect exactly @host[0..n), keeping every
+ * other page writable. Stock KVM has no such ioctl (reclaim+reprotect welded,
+ * prefix-only) — callers gate on sf_kvm_can_protect_set(). */
+bool sf_kvm_can_protect_set(void)
+{
+    return false;
+}
+
+void sf_kvm_protect(void *const *host, size_t n)
+{
+    (void)host;
+    (void)n;
+    g_assert_not_reached();   /* not reachable until can_protect_set() is true */
+}
+
 /**
  * kvm_physical_sync_dirty_bitmap - Sync dirty bitmap from kernel space
  *

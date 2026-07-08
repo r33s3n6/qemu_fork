@@ -652,4 +652,17 @@ void sf_kvm_dirty_ring_set_owned(bool owned);
  */
 void sf_kvm_set_skip_flush(bool on);
 
+/*
+ * Restore-tracker redesign primitives (plan 2026-07-08-03 §3.1). Split the two
+ * stock-welded ops so the tracker (sf/track) can drive them independently.
+ *  - sf_kvm_drain_ring: read new ring entries into host_out[] (no reset).
+ *  - sf_kvm_reset_ring: reclaim drained ring slots + reprotect (stock: welded).
+ *  - sf_kvm_protect / can_protect_set: I.3 keep-writable seam (reprotect a chosen
+ *    set, keep the rest writable); unavailable on stock (can_protect_set=false).
+ */
+size_t sf_kvm_drain_ring(void **host_out, size_t max);
+void sf_kvm_reset_ring(void);
+bool sf_kvm_can_protect_set(void);
+void sf_kvm_protect(void *const *host, size_t n);
+
 #endif

@@ -102,4 +102,9 @@ void sf_track_set_active(void *node);
 void sf_track_invalidate(void *target);
 bool sf_track_active(void);                       /* is a tracker session armed? */
 
+/* Fault injection (selftest only): drop @host from the next drains so it never
+ * enters the restore set, simulating a lost dirty page. NULL disables. A correct
+ * restore-correctness check must go RED when a page the guest changed is dropped. */
+void sf_track_inject_drop(void *host);
+
 #endif /* SF_TRACK_TRACKER_H */

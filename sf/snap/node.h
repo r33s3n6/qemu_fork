@@ -219,7 +219,13 @@ int   sf_snap_save(SfSnapKind kind, Error **errp);
 /* @debug is an optional device-replay skip-knob (HMP debug=/terminal SF_CP_SKIP);
  * NULL for a normal restore. */
 int   sf_snap_restore(uint32_t dst_id, const SfReplayDebug *debug, Error **errp);
-void  sf_snap_hot_cache_invalidate(void);
+
+/* Restore-tracker lifecycle (plan 2026-07-08-03 R4). Build the flat restore-store
+ * over the current sf_blocks + arm KVM dirty tracking (@active = restore-target
+ * hint); disarm frees the store. ram_root/cold-start/promote drive these; every
+ * other save/restore just drains/plans/applies through the armed session. */
+int   sf_snap_tracker_arm(SfSnapNode *active, Error **errp);
+void  sf_snap_tracker_disarm(void);
 
 /* ---- RAM-only cores (selftest / building blocks; no device, no guard) ----
  * Production save/restore wrap these with device capture (T4) + clock tail.
@@ -232,10 +238,9 @@ int   sf_snap_delta_restore(uint32_t dst_id, Error **errp);  /* RAM delta-restor
 
 /* ---- selftest fault injection (test-only; production never calls these) ----
  * Each forces the RAM diff/delta machinery down a wrong path so a correctness
- * check goes RED — proving the mechanism has teeth. Pass id=0xFFFFFFFF / false
- * to disable. */
+ * check goes RED — proving the mechanism has teeth. Pass id=0xFFFFFFFF to
+ * disable. Dirty-page loss injection lives in the tracker (sf_track_inject_drop). */
 void sf_resolve_inject_skip_node(uint32_t node_id);   /* sf_resolve skips this node */
-void sf_snap_inject_skip_hot(bool skip);              /* build_diff omits the HOT union */
 
 int   sf_snap_delete(uint32_t id, Error **errp);
 void  sf_snap_tree(Monitor *mon);

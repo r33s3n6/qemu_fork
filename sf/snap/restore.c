@@ -31,7 +31,7 @@
 #include "hw/nvram/fw_cfg.h"
 #include "migration/vmstate.h"
 #include "sf/kvm_tsc.h"
-#include "sf/dirty/engine.h"
+#include "sf/track/tracker.h"
 #include "sf/vmstate_replay/preparse.h"
 #include "sf/vmstate_replay/replay.h"
 #include "sf/snap/node.h"
@@ -165,20 +165,22 @@ static bool sf_validate_hot_profile(Monitor *mon, const SfReplayTables *t)
 }
 
 /*
- * Root-creation self-check (T1 teeth for the new block-table / key / resolve
- * machinery, which T2/T3 will rely on): for every registered block, the
- * host<->key round-trip and root owner-resolution must return the engine shadow
- * that backs the same host page. Cheap (O(blocks)); runs only under SF_TIME so
- * it never weighs on a real run. Failures abort the snapshot.
+ * Root-creation self-check (teeth for the block-table / key / resolve machinery):
+ * for every registered block, the host<->key round-trip must hold and root
+ * owner-resolution must land on the root backing page for that host page. Cheap
+ * (O(blocks)); runs only under SF_TIME so it never weighs on a real run.
+ * Failures abort the snapshot.
  */
 static int sf_root_selfcheck(Monitor *mon)
 {
+    SfSnapNode *root = sf_active;
+    while (root && root->parent) { root = root->parent; }
+
     for (size_t i = 0; i < sf_n_blocks; i++) {
         SfBlockDesc *b = &sf_blocks[i];
         uint8_t *host = (uint8_t *)b->host;
-        uint64_t remain = 0;
         SfPageKey key;
-        uint8_t *back, *shadow;
+        uint8_t *back, *page;
 
         if (!sf_host_to_key_safe(host, &key) ||
             SF_KEY_BLOCK(key) != i || SF_KEY_PFN(key) != 0) {
@@ -192,85 +194,77 @@ static int sf_root_selfcheck(Monitor *mon)
                            i);
             return -EIO;
         }
-        /* resolve(root, key) must yield the engine shadow for this host page. */
-        shadow = sf_dirty_shadow_for(host, &remain);
-        if (!shadow || sf_resolve(sf_active, key) != shadow) {
-            monitor_printf(mon, "sf: selfcheck FAIL block %zu resolve != shadow\n",
-                           i);
+        /* resolve(root, key) must land on the root backing for this host page. */
+        page = sf_rootstore_page(root ? &root->ram : NULL, key);
+        if (!page || sf_resolve(sf_active, key) != page) {
+            monitor_printf(mon, "sf: selfcheck FAIL block %zu resolve != root "
+                           "backing\n", i);
             return -EIO;
         }
     }
     return 0;
 }
 
-/* ---- W key-set builder (shared by save diff + delta restore) ---- */
+/* ---- restore-tracker session (plan 2026-07-08-03 R4) --------------------- *
+ * One flat restore-store per snapshot tree, armed over the block registry. The
+ * store holds the persistent collect∪HOT set; the snap layer adds cross-node
+ * path pages at restore time. Resolve is injected: host → key → sf_resolve, with
+ * NO_RESTORE pages resolving to NULL (never rolled back). */
 
-/* selftest injection: build_diff omits the HOT union (proves HOT∪ is required
- * under blind — plan -04 §7 case 4). Test-only. */
-static bool g_inject_skip_hot;
-void sf_snap_inject_skip_hot(bool skip) { g_inject_skip_hot = skip; }
+static SfRestoreStore *g_snap_store;
+static SfBlockReg     *g_snap_blockregs;   /* borrowed by g_snap_store */
 
-typedef struct SfWAcc {
-    SfPageKey *keys;
-    size_t     n, cap;
-} SfWAcc;
-
-static void sf_w_push(SfWAcc *a, SfPageKey k)
+static uint8_t *sf_snap_resolve_cb(void *target, void *host, void *user)
 {
-    if (a->n == a->cap) {
-        a->cap = a->cap ? a->cap * 2 : 4096;
-        a->keys = g_renew(SfPageKey, a->keys, a->cap);
+    SfPageKey key;
+    (void)user;
+    if (sf_excluded(host)) {
+        return NULL;   /* NO_RESTORE: not saved, not rolled back */
     }
-    a->keys[a->n++] = k;
+    if (!sf_host_to_key_safe(host, &key)) {
+        return NULL;
+    }
+    return sf_resolve((SfSnapNode *)target, key);
 }
 
-static void sf_w_push_host(void *host, void *user)
+static SfFlatPolicy sf_snap_flat_policy(void)
 {
-    SfPageKey k;
-    if (sf_host_to_key_safe(host, &k)) {
-        sf_w_push((SfWAcc *)user, k);
-    }
+    const char *s = getenv("SF_BLIND");
+    return (s && *s) ? SF_FLAT_BLIND : SF_FLAT_FULL;
 }
 
-/* Sort + unique in place; return the unique count. */
-static size_t sf_w_sort_uniq(SfWAcc *a)
+void sf_snap_tracker_disarm(void)
 {
-    qsort(a->keys, a->n, sizeof(SfPageKey), sf_key_cmp);
-    size_t u = 0;
-    for (size_t i = 0; i < a->n; i++) {
-        if (i == 0 || a->keys[i] != a->keys[i - 1]) {
-            a->keys[u++] = a->keys[i];
-        }
+    sf_track_end();
+    if (g_snap_store) {
+        g_snap_store->ops->free(g_snap_store);
+        g_snap_store = NULL;
     }
-    return u;
+    g_free(g_snap_blockregs);
+    g_snap_blockregs = NULL;
 }
 
-/* W -= NO_RESTORE 排除区 (plan 2026-07-06-06 §1 接入点): drop keys whose host
- * page is excluded. Empty table → no-op (one branch per key). */
-static size_t sf_w_filter_excluded(SfWAcc *a, size_t n)
+int sf_snap_tracker_arm(SfSnapNode *active, Error **errp)
 {
-    size_t u = 0;
-    for (size_t i = 0; i < n; i++) {
-        uint8_t *host = sf_key_to_host(a->keys[i]);
-        /* Each key is one page-aligned page → point query (bsearch), not the
-         * linear range scan. */
-        if (host && sf_excluded(host)) {
-            continue;   /* NO_RESTORE: not saved, not restored */
-        }
-        a->keys[u++] = a->keys[i];
+    if (!sf_kvm_dirty_ring_enabled()) {
+        error_setg(errp, "KVM dirty ring not enabled "
+                   "(need -accel kvm,dirty-ring-size=N)");
+        return -ENOTSUP;
     }
-    return u;
-}
+    sf_snap_tracker_disarm();   /* idempotent: drop any prior session */
 
-/* Push every index key of a diff node into W (for the restore path union). */
-static void sf_w_push_index(SfWAcc *a, const SfRamStore *s)
-{
-    if (!s->index) {
-        return;
+    g_snap_blockregs = g_new(SfBlockReg, sf_n_blocks);
+    for (size_t i = 0; i < sf_n_blocks; i++) {
+        g_snap_blockregs[i].host = sf_blocks[i].host;
+        g_snap_blockregs[i].len  = sf_blocks[i].len;
     }
-    for (uint32_t i = 0; i < s->n_pages; i++) {
-        sf_w_push(a, s->index[i]);
-    }
+    g_snap_store = sf_flat_store_new(g_snap_blockregs, sf_n_blocks,
+                                     sf_snap_resolve_cb, NULL,
+                                     sf_snap_flat_policy());
+    sf_track_begin(g_snap_blockregs, sf_n_blocks, sf_snap_resolve_cb, NULL,
+                   g_snap_store);
+    sf_track_set_active(active);
+    return 0;
 }
 
 /* ---- RAM-only cores (selftest / building blocks; no device, no guard) ----
@@ -279,24 +273,22 @@ static void sf_w_push_index(SfWAcc *a, const SfRamStore *s)
  * microvm hot-profile guard refuses the full preparse. */
 
 /*
- * RAM-only root: engine full-shadow + block registry + root node, sets sf_active.
- * No device preparse, no hot-profile guard. The selftest and the production
- * ROOT save both build on this (production adds preparse+guard+kvm.tsc).
+ * RAM-only root: full-shadow the live RAM into the root backing, arm the restore
+ * tracker over the block registry, set sf_active. No device preparse, no
+ * hot-profile guard. The selftest and the production ROOT save both build on this
+ * (production adds preparse+guard+kvm.tsc).
  */
 SfSnapNode *sf_snap_ram_root(Error **errp)
 {
     Error *err = NULL;
     SfSnapNode *node;
-    SfDirtyShadowDesc *shadows = NULL;
     const char *root_dir = getenv("SF_ROOT_DIR");
     char *root_path = NULL;
 
-    /* Drop any previous tree + block table; the engine snapshot drops the old
-     * shadow itself. */
+    /* Drop any previous tree + tracker (root teardown disarms the tracker). */
     if (sf_active) {
         SfSnapNode *root = sf_active;
         while (root->parent) { root = root->parent; }
-        sf_snap_hot_cache_invalidate();
         sf_node_destroy(root);
         sf_active = NULL;
     }
@@ -331,24 +323,18 @@ SfSnapNode *sf_snap_ram_root(Error **errp)
         return NULL;
     }
 
-    shadows = g_new0(SfDirtyShadowDesc, sf_n_blocks);
+    /* The root backing IS the restore source (sf_resolve's root兜底 reads it). */
     for (size_t i = 0; i < sf_n_blocks; i++) {
         SfBlockDesc *b = &sf_blocks[i];
-        uint8_t *dst = node->ram.data + b->root_off;
-        memcpy(dst, b->host, b->len);
-        shadows[i].host = b->host;
-        shadows[i].len = b->len;
-        shadows[i].shadow = dst;
+        memcpy(node->ram.data + b->root_off, b->host, b->len);
     }
 
-    if (sf_dirty_use_external_shadows(shadows, sf_n_blocks, &err) < 0) {
+    if (sf_snap_tracker_arm(node, &err) < 0) {
         error_propagate(errp, err);
-        g_free(shadows);
         sf_node_destroy(node);
         sf_blocks_destroy();
         return NULL;
     }
-    g_free(shadows);
     if (kvm_enabled() && current_cpu) {
         node->kvm.tsc = sf_kvm_read_tsc(current_cpu);
     }
@@ -361,299 +347,139 @@ SfSnapNode *sf_snap_ram_root(Error **errp)
 }
 
 /*
- * RAM-only non-root diff: collect this generation's dirty pages (the diff vs the
- * active node = parent), union the HOT set, build a diff ramstore copying live
- * pages into it (eager, live→store). Resets the ring (INV-B) so the next
- * generation is relative to this new node. Does NOT set sf_active (the caller
- * decides — production save does, after device capture; selftest controls it).
+ * RAM-only non-root diff: the dirtied set since the parent (the tracker's
+ * persistent plan) becomes this node's diff. Copy the live pages into a fresh
+ * diff store, keyed + sorted for bsearch. after_restore re-baselines the
+ * generation to this new node (FULL: reset ring + clear; BLIND: keep). Does NOT
+ * set sf_active (the caller decides — production save does, after device
+ * capture; selftest controls it).
  */
 SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, Error **errp)
 {
     size_t psize = qemu_real_host_page_size();
-    SfWAcc acc = { 0 };
     SfSnapNode *node;
-    size_t n_dirty, n_uniq;
-    void *const *dirty;
+    const SfRestorePlan *plan;
+    SfPageKey *keys;
+    size_t nk = 0;
 
     if (!parent) {
         error_setg(errp, "sf_snap_build_diff: parent required");
         return NULL;
     }
-    if (!sf_dirty_have_snapshot()) {
-        error_setg(errp, "sf_snap_build_diff: no root shadow (build root first)");
+    if (!sf_track_active()) {
+        error_setg(errp, "sf_snap_build_diff: no active tracker (build root first)");
         return NULL;
     }
 
-    /* Step 1: collect this generation's dirty pages (diff vs active = parent). */
-    sf_dirty_collect();
-    dirty = sf_dirty_collected(&n_dirty);
-    for (size_t i = 0; i < n_dirty; i++) {
+    /* The dirty set vs the parent = the tracker's persistent plan. */
+    sf_track_drain();
+    plan = sf_track_plan(parent);
+
+    /* Keys to save (drop NO_RESTORE), sorted for bsearch. The plan is already
+     * deduped (membership bitmap), so a plain sort suffices — no uniq pass. */
+    keys = g_new(SfPageKey, plan->n ? plan->n : 1);
+    for (size_t i = 0; i < plan->n; i++) {
         SfPageKey k;
-        if (sf_host_to_key_safe(dirty[i], &k)) {
-            sf_w_push(&acc, k);
+        void *host = plan->pages[i].dst;
+        if (sf_excluded(host)) {
+            continue;   /* NO_RESTORE: not diffed */
+        }
+        if (sf_host_to_key_safe(host, &k)) {
+            keys[nk++] = k;
         }
     }
-    /* Step 2: ∪ HOT (保守超集 today; 正确性必需 once I.3 blind lands — plan §3).
-     * g_inject_skip_hot (test-only) omits this to prove HOT∪ is required. */
-    if (!g_inject_skip_hot) {
-        sf_dirty_iter_hot(sf_w_push_host, &acc);
-    }
-    /* Step 3: W -= NO_RESTORE 排除区 (plan 2026-07-06-06; table empty → no-op). */
-
-    n_uniq = sf_w_sort_uniq(&acc);
-    n_uniq = sf_w_filter_excluded(&acc, n_uniq);
+    qsort(keys, nk, sizeof(SfPageKey), sf_key_cmp);
 
     node = sf_node_new(parent, kind);
-    if (sf_ramstore_create_anon(&node->ram, (uint32_t)n_uniq) < 0) {
+    if (sf_ramstore_create_anon(&node->ram, (uint32_t)nk) < 0) {
         error_setg(errp, "sf_snap_build_diff: ramstore oom");
         sf_node_destroy(node);
-        g_free(acc.keys);
+        g_free(keys);
         return NULL;
     }
-    /* Step 4: eager copy live→store, parallel to the sorted index. */
-    for (size_t i = 0; i < n_uniq; i++) {
-        uint8_t *host = sf_key_to_host(acc.keys[i]);
-        node->ram.index[i] = acc.keys[i];
+    for (size_t i = 0; i < nk; i++) {
+        uint8_t *host = sf_key_to_host(keys[i]);
+        node->ram.index[i] = keys[i];
         if (host) {
             memcpy(node->ram.data + i * psize, host, psize);
         }
     }
-    g_free(acc.keys);
+    g_free(keys);
 
-    /* Step 6: INV-B — clear the vector + reset the ring so the next generation
-     * is relative to this new node. */
-    sf_dirty_clear_collected();
-    sf_dirty_force_reset_ring();
+    /* Re-baseline: next generation is relative to this new node. */
+    sf_track_after_restore(node);
     return node;
 }
 
-/*
- * Build the restore W set (plan §4): collect (live dirty to roll back) ∪ HOT ∪
- * path(src→L] (undo src-side layers) ∪ path(dst→L] (apply dst-side layers),
- * sorted + unique. Side effect: collect() called. Caller applies W then resets.
- */
-static size_t sf_build_restore_w(SfSnapNode *src, SfSnapNode *dst, SfSnapNode *L,
-                                 SfWAcc *acc)
+/* ---- restore apply (RAM) -------------------------------------------------- *
+ * The tracker's plan(dst) gives the live-dirty set already resolved to dst. For
+ * a cross-node restore (src != dst) the src/dst-side path layers must also roll
+ * to dst — append those pages (resolved to dst) into a scratch array. Path pages
+ * that also sit in the plan are copied twice, but idempotently (same src for the
+ * same dst), so no dedup is needed on this slow rebuild path.
+ * ponytail: cross-node is the non-hot rebuild path; add path-page dedup only if
+ * it ever shows up hot. */
+static size_t sf_push_path_pages(SfSnapNode *target, const SfRamStore *s,
+                                 SfPlanPage *out)
 {
-    size_t n_dirty;
-    void *const *dirty;
-
-    sf_dirty_collect();
-    dirty = sf_dirty_collected(&n_dirty);
-    for (size_t i = 0; i < n_dirty; i++) {
-        SfPageKey k;
-        if (sf_host_to_key_safe(dirty[i], &k)) {
-            sf_w_push(acc, k);
-        }
+    size_t k = 0;
+    if (!s->index) {
+        return 0;
     }
-    sf_dirty_iter_hot(sf_w_push_host, acc);
+    for (uint32_t i = 0; i < s->n_pages; i++) {
+        uint8_t *host = sf_key_to_host(s->index[i]);
+        if (!host || sf_excluded(host)) {
+            continue;
+        }
+        out[k].dst = host;
+        out[k].src = sf_track_resolve(target, host);
+        k++;
+    }
+    return k;
+}
+
+/* Apply the plan (+ cross-node path pages) rolling live RAM back to dst; returns
+ * the number of pages applied. */
+static size_t sf_restore_apply_ram(SfSnapNode *dst, SfSnapNode *src,
+                                   const SfRestorePlan *plan)
+{
+    SfSnapNode *L;
+    SfPlanPage *scratch;
+    size_t cap, ns;
+
+    if (src == dst) {
+        sf_track_apply(plan->pages, plan->n);   /* in-place fast path */
+        return plan->n;
+    }
+
+    L = sf_node_lca(src, dst);
+    cap = plan->n;
+    for (SfSnapNode *n = src; n != L; n = n->parent) { cap += n->ram.n_pages; }
+    for (SfSnapNode *n = dst; n != L; n = n->parent) { cap += n->ram.n_pages; }
+
+    scratch = g_new(SfPlanPage, cap ? cap : 1);
+    memcpy(scratch, plan->pages, plan->n * sizeof(SfPlanPage));
+    ns = plan->n;
     for (SfSnapNode *n = src; n != L; n = n->parent) {
-        sf_w_push_index(acc, &n->ram);
+        ns += sf_push_path_pages(dst, &n->ram, scratch + ns);
     }
     for (SfSnapNode *n = dst; n != L; n = n->parent) {
-        sf_w_push_index(acc, &n->ram);
+        ns += sf_push_path_pages(dst, &n->ram, scratch + ns);
     }
-    /* W -= NO_RESTORE 排除区 (plan 06; table empty → no-op). */
-    return sf_w_filter_excluded(acc, sf_w_sort_uniq(acc));
-}
-
-typedef struct SfApplyPage {
-    uint8_t *host;
-    uint8_t *src;
-} SfApplyPage;
-
-typedef struct SfHotCache {
-    SfSnapNode *dst;
-    GHashTable *src_by_key; /* SfPageKey -> src page */
-} SfHotCache;
-
-static SfHotCache g_hot_cache;
-
-void sf_snap_hot_cache_invalidate(void)
-{
-    if (g_hot_cache.src_by_key) {
-        g_hash_table_remove_all(g_hot_cache.src_by_key);
-    }
-    g_hot_cache.dst = NULL;
-}
-
-static void sf_hot_cache_reset(SfSnapNode *dst)
-{
-    if (!g_hot_cache.src_by_key) {
-        g_hot_cache.src_by_key = g_hash_table_new(g_direct_hash, g_direct_equal);
-    }
-    if (g_hot_cache.dst != dst) {
-        g_hash_table_remove_all(g_hot_cache.src_by_key);
-        g_hot_cache.dst = dst;
-    }
-}
-
-static uint8_t *sf_hot_cache_lookup(SfSnapNode *dst, SfPageKey key)
-{
-    if (!g_hot_cache.src_by_key || g_hot_cache.dst != dst) {
-        return NULL;
-    }
-    return g_hash_table_lookup(g_hot_cache.src_by_key,
-                               (gpointer)(uintptr_t)key);
-}
-
-static void sf_hot_cache_put(SfSnapNode *dst, SfPageKey key, uint8_t *src)
-{
-    sf_hot_cache_reset(dst);
-    g_hash_table_insert(g_hot_cache.src_by_key, (gpointer)(uintptr_t)key, src);
-}
-
-static void sf_apply_resolve(SfSnapNode *dst, const SfPageKey *keys,
-                             SfApplyPage *pages, size_t n)
-{
-    for (size_t i = 0; i < n; i++) {
-        uint8_t *host = sf_key_to_host(keys[i]);
-        uint8_t *src = NULL;
-
-        if (host && sf_dirty_is_hot(host)) {
-            src = sf_hot_cache_lookup(dst, keys[i]);
-        }
-        if (host && !src) {
-            src = sf_resolve(dst, keys[i]);
-            if (src && sf_dirty_is_hot(host)) {
-                sf_hot_cache_put(dst, keys[i], src);
-            }
-        }
-        pages[i].host = host;
-        pages[i].src = src;
-    }
-}
-
-/* Copy a pre-resolved slice [start,end). Each key maps to a distinct host page
- * (W is sort_uniq'd), so slices run concurrently unlocked. */
-static void sf_copy_slice(const SfApplyPage *pages, size_t start, size_t end,
-                          size_t psize)
-{
-    for (size_t i = start; i < end; i++) {
-        if (pages[i].host && pages[i].src) {
-            memcpy(pages[i].host, pages[i].src, psize);
-        }
-    }
-}
-
-/* One persistent background copy thread: main thread + it = 2-way memcpy (the
- * measured sweet spot, ~×2; more threads saturate memory bandwidth — archive
- * 2026-06-21-08). Created lazily on first parallel apply so there's no per-restore
- * spawn cost. ram= is 80–90% of restore, so this ~halves the dominant phase. */
-typedef struct {
-    QemuThread thread;
-    QemuMutex  mtx;
-    QemuCond   cond_work;   /* main → worker: a slice is ready */
-    QemuCond   cond_done;   /* worker → main: slice finished */
-    const SfApplyPage *pages;
-    size_t psize;
-    size_t start, end;
-    bool have_work, done, started;
-} SfApplyWorker;
-
-static SfApplyWorker g_apply_worker;
-
-/* Below this W it's not worth the handoff — just run it on the caller. */
-#define SF_APPLY_PARALLEL_MIN 2048
-
-static void *sf_apply_worker_fn(void *opaque)
-{
-    SfApplyWorker *w = opaque;
-    qemu_mutex_lock(&w->mtx);
-    for (;;) {
-        while (!w->have_work) {
-            qemu_cond_wait(&w->cond_work, &w->mtx);
-        }
-        const SfApplyPage *pages = w->pages;
-        size_t psize = w->psize;
-        size_t s = w->start, e = w->end;
-        qemu_mutex_unlock(&w->mtx);
-
-        sf_copy_slice(pages, s, e, psize);
-
-        qemu_mutex_lock(&w->mtx);
-        w->have_work = false;
-        w->done = true;
-        qemu_cond_signal(&w->cond_done);
-    }
-    /* ponytail: never signalled to exit; the thread lives for the process and is
-     * reaped at exit (blocked in cond_wait). Add teardown only if a clean
-     * shutdown path ever needs it. */
-}
-
-/* Apply W: resolve all (host,src) pairs first, then split memcpy into two
- * contiguous halves. The background worker takes the upper half, the caller
- * runs the lower half, then waits for the worker. */
-static void sf_apply_w(SfSnapNode *dst, const SfPageKey *keys, size_t n)
-{
-    size_t psize = qemu_real_host_page_size();
-    SfApplyPage *pages;
-    bool split = getenv("SF_APPLY_SPLIT") != NULL;
-    uint64_t t0 = 0, t1 = 0, t2 = 0;
-
-    if (!n) {
-        return;
-    }
-    pages = g_new(SfApplyPage, n);
-    if (split) { t0 = sf_now_ns(); }
-    sf_apply_resolve(dst, keys, pages, n);
-    if (split) { t1 = sf_now_ns(); }
-
-    if (n < SF_APPLY_PARALLEL_MIN) {
-        sf_copy_slice(pages, 0, n, psize);
-        if (split) { t2 = sf_now_ns(); }
-        goto out;
-    }
-
-    {
-        SfApplyWorker *w = &g_apply_worker;
-        if (!w->started) {
-            qemu_mutex_init(&w->mtx);
-            qemu_cond_init(&w->cond_work);
-            qemu_cond_init(&w->cond_done);
-            qemu_thread_create(&w->thread, "sf-apply", sf_apply_worker_fn, w,
-                               QEMU_THREAD_JOINABLE);
-            w->started = true;
-        }
-
-        size_t mid = n / 2;
-        qemu_mutex_lock(&w->mtx);
-        w->pages = pages; w->psize = psize; w->start = mid; w->end = n;
-        w->done = false; w->have_work = true;
-        qemu_cond_signal(&w->cond_work);
-        qemu_mutex_unlock(&w->mtx);
-
-        sf_copy_slice(pages, 0, mid, psize);   /* caller does the lower half */
-
-        qemu_mutex_lock(&w->mtx);
-        while (!w->done) {
-            qemu_cond_wait(&w->cond_done, &w->mtx);
-        }
-        qemu_mutex_unlock(&w->mtx);
-        if (split) { t2 = sf_now_ns(); }
-    }
-
-out:
-    if (split) {
-        fprintf(stderr, "sf-time: apply-split resolve=%.1fus copy=%.1fus "
-                "(n=%zu, %.3f+%.3f us/page)\n",
-                (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, n,
-                (t1 - t0) / 1000.0 / n, (t2 - t1) / 1000.0 / n);
-    }
-    g_free(pages);
+    sf_track_apply(scratch, ns);
+    g_free(scratch);
+    return ns;
 }
 
 /*
- * RAM-only delta-restore (no device, no cpu/clock tail): build W, apply via
- * resolve, reset (INV-B), set sf_active=dst. For selftest + as the RAM core the
- * production restore wraps (production interleaves device replay between
- * sf_build_restore_w and sf_apply_w — plan §3 step 3).
+ * RAM-only delta-restore (no device, no cpu/clock tail): drain, plan, apply,
+ * re-baseline, set sf_active=dst. For selftest + as the RAM core the production
+ * restore wraps (production interleaves device replay between plan and apply).
  */
 int sf_snap_delta_restore(uint32_t dst_id, Error **errp)
 {
-    SfSnapNode *src = sf_active, *dst, *L;
-    SfWAcc acc = { 0 };
-    size_t n;
+    SfSnapNode *src = sf_active, *dst;
+    const SfRestorePlan *plan;
 
     if (!src) {
         error_setg(errp, "sf_snap_delta_restore: no active snapshot");
@@ -665,17 +491,10 @@ int sf_snap_delta_restore(uint32_t dst_id, Error **errp)
         return -ENOENT;
     }
 
-    L = sf_node_lca(src, dst);
-    n = sf_build_restore_w(src, dst, L, &acc);
-    sf_apply_w(dst, acc.keys, n);
-    g_free(acc.keys);
-
-    sf_dirty_clear_collected();
-    if (src == dst) {
-        sf_dirty_reset_ring();
-    } else {
-        sf_dirty_force_reset_ring();
-    }
+    sf_track_drain();
+    plan = sf_track_plan(dst);
+    sf_restore_apply_ram(dst, src, plan);
+    sf_track_after_restore(dst);
     sf_active = dst;
     return 0;
 }
@@ -758,8 +577,7 @@ int sf_snap_save(SfSnapKind kind, Error **errp)
         }
         if (timing) { tb = sf_now_ns(); }
         if (sf_snap_dev_capture(node, true) < 0) {   /* root keeps its stream */
-            sf_node_destroy(node);
-            sf_dirty_destroy();
+            sf_node_destroy(node);   /* root teardown disarms the tracker */
             sf_blocks_destroy();
             sf_active = NULL;
             error_setg(errp, "sf_snap_save: hot-profile guard failed");
@@ -835,29 +653,28 @@ int sf_snap_save(SfSnapKind kind, Error **errp)
 }
 
 /*
- * Restore core — delta-restore (plan -04 §3): build W (collect ∪ HOT ∪ src/dst
- * path diffs), device replay, apply W via owner resolution, push CPU regs +
- * forced TSC rewind, reset (INV-B). Caller owns quiescence + sets sf_active.
- * Does NOT do the kvmclock/vapic tail (HMP via vm_start; terminal via
- * sf_apply_clock_tail). @debug optional.
+ * Restore core — delta-restore (plan 2026-07-08-03 R4b): drain + persistent plan
+ * (resolved to dst), device replay, apply RAM (in-place fast path, or plan ∪
+ * cross-node path pages), push CPU regs + forced TSC rewind, re-baseline. Caller
+ * owns quiescence + sets sf_active. Does NOT do the kvmclock/vapic tail (HMP via
+ * vm_start; terminal via sf_apply_clock_tail). @debug optional.
  */
 static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
 {
-    SfSnapNode *src = sf_active, *L;
-    SfWAcc acc = { 0 };
+    SfSnapNode *src = sf_active;
+    const SfRestorePlan *plan;
     size_t n;
     bool timing = sf_timing();
     uint64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0;
 
     if (timing) { t0 = sf_now_ns(); }
 
-    /* Step 1-2: LCA + build the restore set W (collect ∪ HOT ∪ path(src→L] ∪
-     * path(dst→L]). collect() is called inside sf_build_restore_w. */
-    L = sf_node_lca(src, dst);
-    n = sf_build_restore_w(src, dst, L, &acc);
+    /* Step 1: drain the ring + get the persistent plan, resolved to dst. */
+    sf_track_drain();
+    plan = sf_track_plan(dst);
     if (timing) { t1 = sf_now_ns(); }
 
-    /* Step 3: device replay (registers; restores env->tsc etc. for step 5). */
+    /* Step 2: device replay (registers; restores env->tsc etc. for step 4). */
     if (dst->dev.have) {
         if (debug) {
             sf_replay_with_debug(&dst->dev.tables, debug);
@@ -867,12 +684,11 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
     }
     if (timing) { t2 = sf_now_ns(); }
 
-    /* Step 4: RAM delta-restore — copy each W page from the ≤dst nearest owner. */
-    sf_apply_w(dst, acc.keys, n);
-    g_free(acc.keys);
+    /* Step 3: RAM delta-restore — plan (+ cross-node path pages) → live guest. */
+    n = sf_restore_apply_ram(dst, src, plan);
     if (timing) { t3 = sf_now_ns(); }
 
-    /* Step 5: push the replayed CPUState into the KVM vCPU + force the TSC
+    /* Step 4: push the replayed CPUState into the KVM vCPU + force the TSC
      * rewind. CPU_FOREACH future-proofs for multi-vCPU (DP-A). */
     {
         CPUState *cpu;
@@ -884,18 +700,14 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
         }
     }
 
-    /* Step 7: INV-B — clear the vector + reset the ring for the next generation. */
-    sf_dirty_clear_collected();
-    if (src == dst) {
-        sf_dirty_reset_ring();
-    } else {
-        sf_dirty_force_reset_ring();
-    }
+    /* Step 5: re-baseline for the next generation (FULL: reset ring + clear;
+     * BLIND: keep pages writable). */
+    sf_track_after_restore(dst);
 
     if (timing) {
         t4 = sf_now_ns();
         fprintf(stderr,
-                "sf-time: restore build_w=%.1fus device=%.1fus ram=%.1fus "
+                "sf-time: restore plan=%.1fus device=%.1fus ram=%.1fus "
                 "cpusync+reset=%.1fus total=%.1fus (W=%zu)\n",
                 (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (t3 - t2) / 1000.0,
                 (t4 - t3) / 1000.0, (t4 - t0) / 1000.0, n);
@@ -977,6 +789,9 @@ int sf_snap_delete(uint32_t id, Error **errp)
             return -EPERM;
         }
     }
+    /* Drop any cached src the store resolved to n, so a later node reusing n's
+     * address can't collide with a stale plan_target. */
+    sf_track_invalidate(n);
     sf_node_destroy(n);
     return 0;
 }

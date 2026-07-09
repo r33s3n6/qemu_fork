@@ -8,7 +8,6 @@
 #include "qobject/qdict.h"
 #include "qobject/qlist.h"
 #include "qobject/qjson.h"
-#include "sf/dirty/engine.h"
 #include "sf/snap/node.h"
 #include "sf/snap/tripwire.h"
 #include "sf/snap/exclude.h"
@@ -409,23 +408,6 @@ static int sf_persist_ensure_dirs(const char *dir, Error **errp)
     return 0;
 }
 
-static int sf_rebind_root_store(SfSnapNode *root, Error **errp)
-{
-    SfDirtyShadowDesc *shadows;
-    int ret;
-
-    shadows = g_new0(SfDirtyShadowDesc, sf_n_blocks);
-    for (size_t i = 0; i < sf_n_blocks; i++) {
-        SfBlockDesc *b = &sf_blocks[i];
-        shadows[i].host = b->host;
-        shadows[i].len = b->len;
-        shadows[i].shadow = root->ram.data + b->root_off;
-    }
-    ret = sf_dirty_use_external_shadows(shadows, sf_n_blocks, errp);
-    g_free(shadows);
-    return ret;
-}
-
 static int sf_promote_root_ram(SfSnapNode *root, const char *dir, Error **errp)
 {
     char *path = g_build_filename(dir, "root.ram", NULL);
@@ -453,12 +435,12 @@ static int sf_promote_root_ram(SfSnapNode *root, const char *dir, Error **errp)
         ret = sf_rootstore_seal(&fs, errp);
     }
     if (ret == 0) {
+        /* Swap the root backing in place; sf_resolve reads root->ram.data live,
+         * so no re-registration is needed (the tracker keys off live RAM, not a
+         * separate shadow pointer). */
         sf_ramstore_destroy(&root->ram);
         root->ram = fs;
-        ret = sf_rebind_root_store(root, errp);
-        if (ret == 0) {
-            root->state = SF_SNAP_PERSISTED;
-        }
+        root->state = SF_SNAP_PERSISTED;
     } else {
         sf_ramstore_destroy(&fs);
     }

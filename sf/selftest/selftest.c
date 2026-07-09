@@ -36,7 +36,6 @@
 #include "hw/core/cpu.h"
 #include "migration/savevm.h"
 #include "migration/qemu-file.h"
-#include "sf/dirty/engine.h"
 #include "sf/track/tracker.h"
 #include "sf/kvm_tsc.h"
 #include "sf/vmstate_replay/buffer.h"
@@ -312,13 +311,14 @@ static void sf_selftest_device(Monitor *mon, bool *all_ok)
 
 /* ---- RAM cases (①②③) --------------------------------------------------- */
 
-/* Snapshot, record watched pages, run the guest, return #pages that changed. */
+/* Build a fresh RAM root (full shadow + armed tracker), record watched pages,
+ * run the guest, return #pages that changed. */
 static uint32_t sf_snapshot_and_dirty(uint32_t *exp, uint32_t npages,
                                       unsigned run_ms, Error **errp)
 {
     uint32_t changed = 0;
 
-    if (sf_dirty_snapshot(errp) < 0) {
+    if (!sf_snap_ram_root(errp)) {
         return UINT32_MAX;
     }
     for (uint32_t i = 0; i < npages; i++) {
@@ -331,6 +331,19 @@ static uint32_t sf_snapshot_and_dirty(uint32_t *exp, uint32_t npages,
         }
     }
     return changed;
+}
+
+/* In-place RAM rollback to the active node via the tracker (drain → plan →
+ * 2-thread apply → re-baseline). Returns pages copied back. No device/CPU tail. */
+static size_t sf_tst_rollback(void)
+{
+    const SfRestorePlan *p;
+
+    sf_track_drain();
+    p = sf_track_plan(sf_active);
+    sf_track_apply(p->pages, p->n);
+    sf_track_after_restore(sf_active);
+    return p->n;
 }
 
 /* After a restore, count watched pages that did NOT return to snapshot value. */
@@ -350,7 +363,6 @@ static void sf_selftest_ram(Monitor *mon, bool *all_ok)
     Error *err = NULL;
     char buf[160];
     uint32_t *exp;
-    uint32_t rollback_copied = 0;
 
     if (!sf_kvm_dirty_ring_enabled()) {
         monitor_printf(mon, "sf: selftest[1-3 RAM]: SKIPPED "
@@ -367,57 +379,30 @@ static void sf_selftest_ram(Monitor *mon, bool *all_ok)
             report(mon, all_ok, "1 rollback", false, error_get_pretty(err));
             error_free(err); err = NULL;
         } else {
-            sf_dirty_collect();
-            uint32_t copied = sf_dirty_restore();
-            sf_dirty_reset_ring();
+            size_t copied = sf_tst_rollback();
             uint32_t mism = sf_count_mismatch(exp, SF_ST_WATCH);
             bool ok = (changed > 0) && (mism == 0);
-            rollback_copied = copied;
             snprintf(buf, sizeof(buf), "%u/%u pages changed then restored, "
-                     "%u still wrong, copied-back=%u", changed, SF_ST_WATCH,
+                     "%u still wrong, copied-back=%zu", changed, SF_ST_WATCH,
                      mism, copied);
             report(mon, all_ok, "1 rollback", ok, buf);
         }
     }
 
-    /* ①b HOT+dirty dedup: a HOT page dirtied in the same generation must be
-     * restored once, not once from dirty and again from HOT.  Use a non-P0 page
-     * so later P0 loss teeth still test the intended missing-diff path. */
-    {
-        void *hot = sf_gpa_to_host(SF_ST_BASE + (hwaddr)(SF_ST_WATCH - 1) *
-                                   SF_ST_PAGE);
-        sf_dirty_mark_hot((uint64_t)(uintptr_t)hot);
-        uint32_t changed = sf_snapshot_and_dirty(exp, SF_ST_WATCH, 20, &err);
-        if (changed == UINT32_MAX) {
-            report(mon, all_ok, "1b HOT+dirty dedup", false,
-                   error_get_pretty(err));
-            error_free(err); err = NULL;
-        } else {
-            sf_dirty_collect();
-            uint32_t copied = sf_dirty_restore();
-            sf_dirty_reset_ring();
-            uint32_t mism = sf_count_mismatch(exp, SF_ST_WATCH);
-            bool ok = (changed > 0) && (mism == 0) &&
-                      rollback_copied && (copied == rollback_copied);
-            snprintf(buf, sizeof(buf), "changed=%u copied-back=%u base=%u "
-                     "mism=%u", changed, copied, rollback_copied, mism);
-            report(mon, all_ok, "1b HOT+dirty dedup", ok, buf);
-        }
-    }
-
-    /* ② teeth: drop one dirtied page in collect -> it stays wrong (detected). */
+    /* ② teeth: drop one dirtied page from the drain -> it stays wrong. Inject
+     * BEFORE the run so the ring-full auto-drains during it also skip the page
+     * (else the page would sneak into the persistent set before the roll-back). */
     {
         void *host0 = sf_gpa_to_host(SF_ST_BASE);
+        sf_track_inject_drop(host0);
         uint32_t changed = sf_snapshot_and_dirty(exp, 1, 20, &err);
         if (changed == UINT32_MAX) {
+            sf_track_inject_drop(NULL);
             report(mon, all_ok, "2 dropped-page teeth", false, error_get_pretty(err));
             error_free(err); err = NULL;
         } else {
-            sf_dirty_inject_collect_skip(host0);
-            sf_dirty_collect();
-            sf_dirty_restore();
-            sf_dirty_reset_ring();
-            sf_dirty_inject_collect_skip(NULL);
+            sf_tst_rollback();
+            sf_track_inject_drop(NULL);
             uint32_t mism = sf_count_mismatch(exp, 1);
             /* teeth = the injected loss is observable (page not rolled back). */
             bool ok = (changed > 0) && (mism == 1);
@@ -428,17 +413,15 @@ static void sf_selftest_ram(Monitor *mon, bool *all_ok)
         }
     }
 
-    /* ③ ring-full: zero loss across 4096 pages on a 1024-entry ring; and
-     *   skipping the drain must lose pages. */
+    /* ③ ring-full: zero loss across 4096 pages on a 1024-entry ring. The
+     *   ring-full exits during the run drain into the persistent store. */
     {
         uint32_t changed = sf_snapshot_and_dirty(exp, SF_ST_NPAGES, 30, &err);
         if (changed == UINT32_MAX) {
             report(mon, all_ok, "3 ring-full zero-loss", false, error_get_pretty(err));
             error_free(err); err = NULL;
         } else {
-            sf_dirty_collect();
-            sf_dirty_restore();
-            sf_dirty_reset_ring();
+            sf_tst_rollback();
             uint32_t mism = sf_count_mismatch(exp, SF_ST_NPAGES);
             /* changed > ring size proves the ring-full path was exercised. */
             bool ok = (changed > 1024) && (mism == 0);
@@ -448,20 +431,20 @@ static void sf_selftest_ram(Monitor *mon, bool *all_ok)
         }
 
         /* teeth: under the same ring-full pressure, drop one dirtied page ->
-         * the zero-loss check must catch it (deterministic). */
+         * the zero-loss check must catch it (inject before the run so every
+         * ring-full drain skips it too). */
         {
             void *hostK = sf_gpa_to_host(SF_ST_BASE + 100 * SF_ST_PAGE);
+            sf_track_inject_drop(hostK);
             changed = sf_snapshot_and_dirty(exp, SF_ST_NPAGES, 30, &err);
             if (changed == UINT32_MAX) {
+                sf_track_inject_drop(NULL);
                 report(mon, all_ok, "3-neg dropped-page teeth", false,
                        error_get_pretty(err));
                 error_free(err); err = NULL;
             } else {
-                sf_dirty_inject_collect_skip(hostK);
-                sf_dirty_collect();
-                sf_dirty_restore();
-                sf_dirty_reset_ring();
-                sf_dirty_inject_collect_skip(NULL);
+                sf_tst_rollback();
+                sf_track_inject_drop(NULL);
                 uint32_t mism = sf_count_mismatch(exp, SF_ST_NPAGES);
                 bool teeth = (mism >= 1);
                 snprintf(buf, sizeof(buf), "%s under ring-full: %u page(s) wrong",
@@ -470,16 +453,14 @@ static void sf_selftest_ram(Monitor *mon, bool *all_ok)
                 report(mon, all_ok, "3-neg dropped-page teeth", teeth, buf);
             }
 
-            /* Info (not gated): skipping the explicit drain still loses ~0 pages
-             * because KVM_EXIT_DIRTY_RING_FULL exits + the background reaper
-             * drain into the bitmap too — the drain-then-read-bitmap design is
-             * redundantly robust. A naive live-ring reader would lose thousands. */
+            /* Info (not gated): skipping the explicit drain flush still loses ~0
+             * pages because the KVM_EXIT_DIRTY_RING_FULL exits during the run
+             * already drained into the store. A naive live-ring reader would lose
+             * thousands. */
             changed = sf_snapshot_and_dirty(exp, SF_ST_NPAGES, 30, &err);
             if (changed != UINT32_MAX) {
                 sf_kvm_set_skip_flush(true);
-                sf_dirty_collect();
-                sf_dirty_restore();
-                sf_dirty_reset_ring();
+                sf_tst_rollback();
                 sf_kvm_set_skip_flush(false);
                 uint32_t mism2 = sf_count_mismatch(exp, SF_ST_NPAGES);
                 monitor_printf(mon, "sf: selftest[3-info skip-explicit-drain]: "
@@ -553,7 +534,7 @@ static void sf_selftest_cpu(Monitor *mon, bool *all_ok)
         error_free(err);
         return;
     }
-    if (sf_dirty_snapshot(&err) < 0) {
+    if (!sf_snap_ram_root(&err)) {
         report(mon, all_ok, "6 cpu-state", false, error_get_pretty(err));
         error_free(err);
         sf_replay_tables_destroy(&t);
@@ -572,9 +553,7 @@ static void sf_selftest_cpu(Monitor *mon, bool *all_ok)
     /* Diagnostic: did sf_replay restore the QEMU CPUState? Read it back before
      * any KVM pull (vcpu_dirty still true from vm_stop, so save reads CPUState). */
     s_replay = sf_save_dev(&l_replay, &err); error_free(err); err = NULL;
-    sf_dirty_collect();
-    sf_dirty_restore();
-    sf_dirty_reset_ring();
+    sf_tst_rollback();
     cpu_synchronize_post_init(cpu);   /* push replayed CPUState into KVM vCPU */
 
     sf_pull_vcpu_from_kvm(cpu);   /* read real vCPU */
@@ -631,7 +610,7 @@ static void sf_selftest_tsc(Monitor *mon, bool *all_ok)
         error_free(err);
         return;
     }
-    if (sf_dirty_snapshot(&err) < 0) {
+    if (!sf_snap_ram_root(&err)) {
         report(mon, all_ok, "7 tsc-freeze", false, error_get_pretty(err));
         error_free(err);
         sf_replay_tables_destroy(&t);
@@ -644,9 +623,7 @@ static void sf_selftest_tsc(Monitor *mon, bool *all_ok)
 
     /* Restore inline, plain path first (no forced rewind). */
     sf_replay(&t);
-    sf_dirty_collect();
-    sf_dirty_restore();
-    sf_dirty_reset_ring();
+    sf_tst_rollback();
     cpu_synchronize_post_init(cpu);              /* plain KVM_SET_MSRS(TSC=T0) */
     uint64_t tsc_plain = sf_kvm_read_tsc(cpu);
 
@@ -764,16 +741,18 @@ static void sf_selftest_snap(Monitor *mon, bool *all_ok)
         sf_resolve_inject_skip_node(0xFFFFFFFFU);
     }
 
-    /* ---- Case B: save-integrity teeth (collect_skip drops a diff page) ---- */
+    /* ---- Case B: save-integrity teeth (drop a diff page) ---- */
     {
         if (!sf_snap_root(mon)) { *all_ok = false; return; }
         uint32_t v0 = sf_rd32(SF_ST_BASE);
+        void *host0 = sf_gpa_to_host(SF_ST_BASE);
+        /* Drop P0 from every drain (incl. ring-full auto-drains during the run)
+         * so build_diff never sees it → L1's diff omits P0. */
+        sf_track_inject_drop(host0);
         sf_run_guest_ms(20);
         uint32_t v1 = sf_rd32(SF_ST_BASE);
-        void *host0 = sf_gpa_to_host(SF_ST_BASE);
-        sf_dirty_inject_collect_skip(host0);   /* build_diff's collect drops P0 */
         SfSnapNode *L1 = sf_make_layer(mon, all_ok);
-        sf_dirty_inject_collect_skip(NULL);
+        sf_track_inject_drop(NULL);
         if (!L1) { return; }
         sf_run_guest_ms(20);
         sf_snap_delta_restore(L1->id, &err); error_free(err); err = NULL;
@@ -806,44 +785,9 @@ static void sf_selftest_snap(Monitor *mon, bool *all_ok)
         report(mon, all_ok, "C multi-level undo", ok, buf);
     }
 
-    /* ---- Case D: HOT blind-spot teeth (HOT∪ saves a blind page) ---- */
-    {
-        void *host0 = sf_gpa_to_host(SF_ST_BASE);
-        sf_dirty_mark_hot((uint64_t)(uintptr_t)host0);
-
-        /* positive: P0 HOT + collect_skip (blind) ⇒ build_diff still saves P0. */
-        if (!sf_snap_root(mon)) { *all_ok = false; return; }
-        uint32_t v0 = sf_rd32(SF_ST_BASE);
-        sf_run_guest_ms(20);
-        uint32_t v1 = sf_rd32(SF_ST_BASE);
-        sf_dirty_inject_collect_skip(host0);
-        SfSnapNode *L1 = sf_make_layer(mon, all_ok);
-        sf_dirty_inject_collect_skip(NULL);
-        if (!L1) { return; }
-        sf_run_guest_ms(20);
-        sf_snap_delta_restore(L1->id, &err); error_free(err); err = NULL;
-        bool pos = (sf_rd32(SF_ST_BASE) == v1);
-
-        /* teeth: same but skip the HOT union ⇒ P0 not saved ⇒ restore misses it. */
-        if (!sf_snap_root(mon)) { *all_ok = false; return; }
-        sf_run_guest_ms(20);
-        uint32_t v1b = sf_rd32(SF_ST_BASE);
-        sf_dirty_inject_collect_skip(host0);
-        sf_snap_inject_skip_hot(true);
-        SfSnapNode *L1b = sf_make_layer(mon, all_ok);
-        sf_snap_inject_skip_hot(false);
-        sf_dirty_inject_collect_skip(NULL);
-        if (!L1b) { return; }
-        sf_run_guest_ms(20);
-        sf_snap_delta_restore(L1b->id, &err); error_free(err); err = NULL;
-        uint32_t got = sf_rd32(SF_ST_BASE);
-        bool teeth = (got != v1b);
-        (void)v0;
-        snprintf(buf, sizeof(buf), "pos=%d teeth=%s (got=%u saved=%u)",
-                 pos, teeth ? "RED detected" : "BUG: HOT skip hidden",
-                 got, v1b);
-        report(mon, all_ok, "D HOT blind-spot (pos+teeth)", pos && teeth, buf);
-    }
+    /* Case D (per-page HOT blind-spot) retired: HOT is subsumed by the flat
+     * store's BLIND policy (whole plan kept), verified KVM-free by the R3
+     * flat-store case; save-integrity teeth are Case B. */
 
     /* ---- Case E (T8): tree fork + cross-sibling restore + resolve teeth ---- */
     {
@@ -986,7 +930,7 @@ bool sf_r3_spike_run(Monitor *mon, hwaddr gpa)
     }
 
     /* Start dirty logging so the post-remap guest write is trackable. */
-    if (sf_dirty_snapshot(&err) < 0) {
+    if (!sf_snap_ram_root(&err)) {
         monitor_printf(mon, "sf-r3: snapshot failed: %s\n", error_get_pretty(err));
         error_free(err);
         return false;
@@ -1033,7 +977,8 @@ bool sf_r3_spike_run(Monitor *mon, hwaddr gpa)
     uint32_t pre = sf_rd32(gpa);
     sf_run_guest_ms(60);
     uint32_t post = sf_rd32(gpa);
-    uint64_t collected = sf_dirty_collect();
+    sf_track_drain();
+    uint64_t collected = sf_track_plan(sf_active)->n;
 
     bool survived = true;   /* we're here → guest did not crash */
     bool advanced = (post != pre);          /* guest write reached the new page */
@@ -1141,7 +1086,7 @@ bool sf_remap_all_run(Monitor *mon)
 
     /* Enable KVM dirty logging so post-remap writes are tracked. The memslot's
      * userspace address is unchanged (MAP_FIXED keeps it); KVM logs by GPA. */
-    if (sf_dirty_snapshot(&err) < 0) {
+    if (!sf_snap_ram_root(&err)) {
         monitor_printf(mon, "sf-remap-all: snapshot failed: %s\n",
                        error_get_pretty(err));
         error_free(err);
@@ -1180,7 +1125,8 @@ bool sf_remap_all_run(Monitor *mon)
     pre = sf_rd32(SF_ST_BASE);
     sf_run_guest_ms(60);
     post = sf_rd32(SF_ST_BASE);
-    collected = sf_dirty_collect();
+    sf_track_drain();
+    collected = sf_track_plan(sf_active)->n;
 
     survived = true;            /* we're here → no stale-EPT crash */
     advanced = (post != pre);   /* guest write reached a CoW-private page */
@@ -1708,8 +1654,8 @@ out:
  *
  * Why this is TCG-only and tree-less: sf_preparse_stream re-loads device state
  * into the live VM, which under KVM asserts (kvm_put_apicbase) — same constraint
- * as ④⑤, so run under TCG. And sf_snap_persist needs the engine RAM shadow
- * (sf_dirty_snapshot → KVM dirty ring), unavailable under TCG. So the full
+ * as ④⑤, so run under TCG. And sf_snap_persist needs the root RAM shadow
+ * (sf_snap_ram_root → KVM dirty ring), unavailable under TCG. So the full
  * sf_snap_persist/load .dev integration is verified at microvm cold start
  * (selftest 8, deferred); this case verifies the stream+reparse mechanics that
  * underpin it, using the real sf_device_stream_capture + sf_preparse_stream.

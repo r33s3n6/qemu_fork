@@ -52,7 +52,7 @@
 #include "kvm-cpus.h"
 #include "system/dirtylimit.h"
 #include "qemu/range.h"
-#include "sf/dirty/engine.h"
+#include "sf/track/tracker.h"
 
 #include "hw/core/boards.h"
 #include "system/stats.h"
@@ -1192,8 +1192,8 @@ static void kvm_dirty_ring_flush(void)
     trace_kvm_dirty_ring_flush(1);
 }
 
-/* ---- sf/ (M0-S dirty-page engine, Task 6) ------------------------------ *
- * Hooks for the stalefuzz restore engine (sf/dirty/engine.c). Declared in
+/* ---- sf/ (restore dirty-ring primitives) ------------------------------- *
+ * KVM-side primitives for the stalefuzz restore tracker (sf/track). Declared in
  * include/system/kvm.h. Kept here because they need the static reap machinery
  * and the KVMSlot layout. Clean-room: no Nyx code.
  */
@@ -3970,9 +3970,11 @@ int kvm_cpu_exec(CPUState *cpu)
              */
             trace_kvm_dirty_ring_full(cpu->cpu_index);
             bql_lock();
-            if (sf_kvm_dirty_ring_owned) {
-                sf_kvm_collect_dirty(sf_dirty_note_page, NULL);
-                sf_kvm_dirty_reset_all();
+            if (sf_track_active()) {
+                /* sf owns the ring: drain the full ring into the restore store
+                 * and reclaim the slots (store's after_drain policy). */
+                sf_track_drain();
+                sf_track_after_drain();
             } else {
                 /*
                  * We throttle vCPU by making it sleep once it exit from kernel

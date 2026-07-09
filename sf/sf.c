@@ -22,7 +22,6 @@
 #include "sf/kvm_tsc.h"
 #include "sf/vmstate_replay/preparse.h"
 #include "sf/vmstate_replay/replay.h"
-#include "sf/dirty/engine.h"
 #include "sf/snap/node.h"
 #include "sf/snap/cold.h"
 #include "sf/snap/persist.h"

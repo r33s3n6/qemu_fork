@@ -22,6 +22,15 @@ static bool              g_armed;
 static void  **g_hostbuf;
 static size_t  g_hostbuf_cap;
 
+/* Fault injection (selftest only): a host page the drain must pretend it never
+ * saw, so it never enters the store's restore set. */
+static void   *g_inject_drop;
+
+void sf_track_inject_drop(void *host)
+{
+    g_inject_drop = host;
+}
+
 bool sf_track_active(void)
 {
     return g_armed && g_store;
@@ -71,6 +80,15 @@ void sf_track_drain(void)
         return;
     }
     n = sf_kvm_drain_ring(g_hostbuf, g_hostbuf_cap);
+    if (g_inject_drop) {   /* selftest: elide the injected page from the batch */
+        size_t w = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (g_hostbuf[i] != g_inject_drop) {
+                g_hostbuf[w++] = g_hostbuf[i];
+            }
+        }
+        n = w;
+    }
     g_store->ops->note_batch(g_store, g_hostbuf, n);
 }
 

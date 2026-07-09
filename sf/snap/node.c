@@ -14,7 +14,6 @@
 #include "system/address-spaces.h"
 #include "system/ramblock.h"
 #include "system/ramlist.h"
-#include "sf/dirty/engine.h"
 #include "sf/snap/node.h"
 #include "sf/snap/tripwire.h"   /* disarm on root teardown */
 
@@ -135,7 +134,7 @@ void sf_node_destroy(SfSnapNode *n)
      * tripwire (no snapshot RAM to protect anymore). */
     if (n->parent == NULL) {
         sf_tripwire_arm(false);
-        sf_dirty_destroy();      /* drops borrowed root backing pointers first */
+        sf_snap_tracker_disarm();   /* end KVM tracking + free the restore store */
     }
     sf_node_destroy_rec(n);
 }
@@ -642,19 +641,7 @@ uint8_t *sf_resolve(SfSnapNode *dst, SfPageKey key)
     /* root兜底: prefer the root node's backing. The dirty engine borrows the
      * same slices for restore, so there is no second root shadow on M3 paths. */
     SfSnapNode *root = sf_root_of(dst);
-    uint8_t *page = sf_rootstore_page(root ? &root->ram : NULL, key);
-    if (page) {
-        return page;
-    }
-
-    /* Legacy/selftest fallback for code paths that call sf_dirty_snapshot()
-     * directly without constructing a root node. */
-    uint8_t *host = sf_key_to_host(key);
-    if (host) {
-        uint64_t remain = 0;
-        return sf_dirty_shadow_for(host, &remain);
-    }
-    return NULL;
+    return sf_rootstore_page(root ? &root->ram : NULL, key);
 }
 
 bool sf_snap_have_snapshot(void)

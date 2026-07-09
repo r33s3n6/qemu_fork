@@ -5,7 +5,6 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "system/runstate.h"
-#include "sf/dirty/engine.h"
 #include "sf/snap/cold.h"
 #include "sf/snap/node.h"
 #include "sf/snap/persist.h"
@@ -36,22 +35,6 @@ static int sf_cold_remap_live_ram(int fd, Error **errp)
     return 0;
 }
 
-static int sf_cold_register_root_backing(SfSnapNode *root, Error **errp)
-{
-    SfDirtyShadowDesc *shadows = g_new0(SfDirtyShadowDesc, sf_n_blocks);
-    int ret;
-
-    for (size_t i = 0; i < sf_n_blocks; i++) {
-        SfBlockDesc *b = &sf_blocks[i];
-        shadows[i].host = b->host;
-        shadows[i].len = b->len;
-        shadows[i].shadow = root->ram.data + b->root_off;
-    }
-    ret = sf_dirty_use_external_shadows(shadows, sf_n_blocks, errp);
-    g_free(shadows);
-    return ret;
-}
-
 int sf_cold_start(const char *dir, uint32_t dst_id, Error **errp)
 {
     SfSnapNode *loaded = NULL;
@@ -70,8 +53,7 @@ int sf_cold_start(const char *dir, uint32_t dst_id, Error **errp)
         while (root->parent) {
             root = root->parent;
         }
-        sf_snap_hot_cache_invalidate();
-        sf_node_destroy(root);
+        sf_node_destroy(root);   /* root teardown disarms the tracker */
         sf_active = NULL;
     }
     sf_blocks_destroy();
@@ -105,7 +87,7 @@ int sf_cold_start(const char *dir, uint32_t dst_id, Error **errp)
     if (sf_rootstore_open_file(&loaded->ram, root_path, errp) < 0) {
         goto out;
     }
-    if (sf_cold_register_root_backing(loaded, errp) < 0) {
+    if (sf_snap_tracker_arm(loaded, errp) < 0) {
         goto out;
     }
 

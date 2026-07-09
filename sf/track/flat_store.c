@@ -26,6 +26,13 @@ typedef struct {
     void             *plan_target;   /* target the src[0..resolved_upto) resolve to */
     void             *active;        /* set_active hint (fast path == plan_target) */
     SfRestorePlan     out;           /* returned by pointer */
+
+    /* A3 debug trace (SF_DIRTY_TRACE): running intersection/union of per-round
+     * member = 共享脏页 common set. FULL only (blind's member accumulates, no
+     * per-round isolation). Untouched + unallocated unless enabled → hot path 零侵入. */
+    bool              dbg_on;
+    size_t            dbg_rounds;
+    unsigned long    *dbg_common, *dbg_union;
 } FlatStore;
 
 /* host → dense page-index. ponytail: linear over the few RAMBlocks; if this
@@ -82,6 +89,34 @@ static const SfRestorePlan *flat_plan(SfRestoreStore *s, void *target)
     return &f->out;
 }
 
+/* A3: fold this round's member into the running common (AND) / union (OR) and
+ * print, before FULL clears it. Meaningful over the steady (inplace) tail —
+ * the first few notes are setup/build_diff diffs and only tighten the AND. */
+static void flat_dbg_note(FlatStore *f)
+{
+    size_t nbits = f->blk_pgbase[f->n_blocks];
+    size_t nwords = BITS_TO_LONGS(nbits);
+    size_t pc_this = 0, pc_common = 0, pc_union = 0;
+
+    if (f->dbg_rounds == 0) {
+        memcpy(f->dbg_common, f->member, nwords * sizeof(long));
+        memcpy(f->dbg_union, f->member, nwords * sizeof(long));
+    } else {
+        for (size_t i = 0; i < nwords; i++) {
+            f->dbg_common[i] &= f->member[i];
+            f->dbg_union[i] |= f->member[i];
+        }
+    }
+    f->dbg_rounds++;
+    for (size_t i = 0; i < nwords; i++) {
+        pc_this += __builtin_popcountl(f->member[i]);
+        pc_common += __builtin_popcountl(f->dbg_common[i]);
+        pc_union += __builtin_popcountl(f->dbg_union[i]);
+    }
+    fprintf(stderr, "sf-dirty-trace: round=%zu this=%zu common=%zu union=%zu\n",
+            f->dbg_rounds, pc_this, pc_common, pc_union);
+}
+
 static void flat_clear_generation(FlatStore *f)
 {
     bitmap_zero(f->member, f->blk_pgbase[f->n_blocks]);   /* [n_blocks] = total pages */
@@ -94,6 +129,9 @@ static void flat_after_restore(SfRestoreStore *s, void *target)
     FlatStore *f = (FlatStore *)s;
     (void)target;
 
+    if (f->dbg_on) {
+        flat_dbg_note(f);      /* A3: fold member before clear (FULL per-round set) */
+    }
     if (f->policy == SF_FLAT_BLIND) {
         return;   /* keep writable + keep plan; no reset (periodic clear = knob) */
     }
@@ -129,6 +167,8 @@ static void flat_free(SfRestoreStore *s)
     g_free(f->member);
     g_free(f->plan);
     g_free(f->blk_pgbase);
+    g_free(f->dbg_common);
+    g_free(f->dbg_union);
     g_free(f);
 }
 
@@ -167,5 +207,11 @@ SfRestoreStore *sf_flat_store_new(const SfBlockReg *blocks, size_t n_blocks,
     }
     f->blk_pgbase[n_blocks] = base;
     f->member = bitmap_new(base ? base : 1);
+
+    f->dbg_on = getenv("SF_DIRTY_TRACE") != NULL;   /* A3: opt-in, FULL diagnostic */
+    if (f->dbg_on) {
+        f->dbg_common = bitmap_new(base ? base : 1);
+        f->dbg_union = bitmap_new(base ? base : 1);
+    }
     return &f->base;
 }

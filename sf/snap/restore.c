@@ -730,9 +730,10 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
     if (timing) {
         t4 = sf_now_ns();
         fprintf(stderr,
-                "sf-time: restore plan=%.1fus device=%.1fus ram=%.1fus "
+                "sf-time: restore dst=%u kind=%s plan=%.1fus device=%.1fus ram=%.1fus "
                 "cpusync+reset=%.1fus total=%.1fus (W=%zu) "
                 "guest_active=%" PRIu64 "us pf_taken=%" PRIu64 "\n",
+                dst->id, src == dst ? "inplace" : "cross",
                 (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (t3 - t2) / 1000.0,
                 (t4 - t3) / 1000.0, (t4 - t0) / 1000.0, n,
                 guest_active_us, pf_taken);

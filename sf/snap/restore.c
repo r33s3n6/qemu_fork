@@ -372,7 +372,11 @@ SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, bool activat
                                Error **errp)
 {
     size_t psize = qemu_real_host_page_size();
-    bool memcmp_all = getenv("SF_DIFF_MEMCMP_ALL") != NULL;
+    /* Default: confirm the WHOLE tracked set against the parent (memcmp ≈0.2-0.3us/
+     * page, cheaper than a page fault; drops ~9-26% write-same pages from the diff).
+     * SF_DIFF_UNSURE_ONLY restricts the confirm to the carried/unsure prefix
+     * [0,unsure_n) — the pos-split fast path for save-latency-sensitive workloads. */
+    bool memcmp_all = getenv("SF_DIFF_UNSURE_ONLY") == NULL;
     SfSnapNode *node;
     const SfRestorePlan *plan;
     SfPageKey *keys;
@@ -422,16 +426,13 @@ SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, bool activat
         if (sf_excluded(host)) {
             continue;   /* NO_RESTORE: not diffed */
         }
-        /* Unsure-page confirm (plan 09-01 §4 D): by default memcmp only the carried/
-         * unsure prefix [0,unsure_n) — pages dirtied in an earlier round, restored
-         * back, never re-touched (common under BLIND keep) → likely == parent. Drop
-         * the matches: restore resolves through to the parent for them anyway. The
-         * suffix [unsure_n,n) came straight from this drain's ring — "written", not
-         * necessarily "changed", so it still holds write-same pages (~8-22% measured),
-         * but they're the minority so we skip the memcmp there by default.
-         * SF_DIFF_MEMCMP_ALL extends the confirm to the whole set to also drop those
-         * — trades save-side memcmp (see SF_DIFF_STAT memcmp_all_us) for a smaller
-         * diff. Correctness identical either way (dropped pages equal the parent). */
+        /* Diff dedup vs parent (plan 09-01 §4 D): drop pages that already equal the
+         * parent — restore resolves through to the parent for them anyway, so they
+         * only bloat the diff. KVM dirty = "written", not "changed", so even the
+         * net-increment [unsure_n,n) holds write-same pages (~8-22% measured); the
+         * default memcmps the whole set to catch them. SF_DIFF_UNSURE_ONLY limits it
+         * to the carried prefix [0,unsure_n) (the ones restored back → most likely
+         * ==parent) to save memcmp. Correctness identical (dropped pages == parent). */
         if ((memcmp_all || i < plan->unsure_n) && src &&
             memcmp(host, src, psize) == 0) {
             continue;

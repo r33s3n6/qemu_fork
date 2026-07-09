@@ -217,6 +217,14 @@ static int sf_root_selfcheck(Monitor *mon)
 static SfRestoreStore *g_snap_store;
 static SfBlockReg     *g_snap_blockregs;   /* borrowed by g_snap_store */
 
+static void sf_snap_set_active_node(SfSnapNode *node)
+{
+    sf_active = node;
+    if (sf_track_active()) {
+        sf_track_set_active(node);
+    }
+}
+
 static uint8_t *sf_snap_resolve_cb(void *target, void *host, void *user)
 {
     SfPageKey key;
@@ -341,7 +349,7 @@ SfSnapNode *sf_snap_ram_root(Error **errp)
     if (kvm_enabled() && current_cpu) {
         node->kvm.tsc = sf_kvm_read_tsc(current_cpu);
     }
-    sf_active = node;
+    sf_snap_set_active_node(node);
     /* Arm the tripwire: a snapshot tree now exists, host writes to its RAM
      * must be caught. Stays armed until the tree is torn down (sf_node_destroy
      * on the root disarms). */
@@ -505,7 +513,7 @@ int sf_snap_delta_restore(uint32_t dst_id, Error **errp)
     plan = sf_track_plan(dst);
     sf_restore_apply_ram(dst, src, plan);
     sf_track_after_restore(dst);
-    sf_active = dst;
+    sf_snap_set_active_node(dst);
     return 0;
 }
 
@@ -643,7 +651,7 @@ int sf_snap_save(SfSnapKind kind, Error **errp)
         error_setg(errp, "sf_snap_save: hot-profile guard failed");
         return -EIO;
     }
-    sf_active = node;
+    sf_snap_set_active_node(node);
     if (timing) {
         tc = sf_now_ns();
         fprintf(stderr,
@@ -784,7 +792,7 @@ int sf_snap_restore(uint32_t dst_id, const SfReplayDebug *debug, Error **errp)
 
     sf_snap_restore_core(dst, (SfReplayDebug *)debug);
     sf_apply_clock_tail(dst);
-    sf_active = dst;
+    sf_snap_set_active_node(dst);
     return 0;
 }
 

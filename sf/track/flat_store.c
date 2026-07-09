@@ -27,10 +27,10 @@ typedef struct {
     void             *active;        /* set_active hint (fast path == plan_target) */
     SfRestorePlan     out;           /* returned by pointer */
 
-    /* A3/A4 debug trace (SF_DIRTY_TRACE): per-round member plus running
-     * intersection/union. FULL only (blind's member accumulates, no per-round
-     * isolation). Untouched + unallocated unless enabled -> hot path zero
-     * intrusion. */
+    /* A3/A4 debug trace (SF_DIRTY_TRACE): per steady/in-place round member plus
+     * running intersection/union. FULL only (blind's member accumulates, no
+     * per-round isolation). Untouched + unallocated unless enabled -> hot path
+     * zero intrusion. */
     bool              dbg_on;
     size_t            dbg_rounds;
     unsigned long    *dbg_common, *dbg_union, *dbg_prev;
@@ -90,10 +90,10 @@ static const SfRestorePlan *flat_plan(SfRestoreStore *s, void *target)
     return &f->out;
 }
 
-/* A3/A4: fold this round's member into the running common (AND) / union (OR)
- * and print, before FULL clears it. Meaningful over the steady (inplace) tail:
- * setup/cross restores are still present in early lines, so consumers should
- * filter by the host-side restore kind when they need pure steady state. */
+/* A3/A4: fold this steady in-place round's member into the running common
+ * (AND) / union (OR) and print, before FULL clears it. setup/build_diff/cross
+ * re-baselines have target != active and are skipped at the caller, so union is
+ * a steady-tail working-set view. */
 static void flat_dbg_note(FlatStore *f)
 {
     size_t nbits = f->blk_pgbase[f->n_blocks];
@@ -138,9 +138,9 @@ static void flat_clear_generation(FlatStore *f)
 static void flat_after_restore(SfRestoreStore *s, void *target)
 {
     FlatStore *f = (FlatStore *)s;
-    (void)target;
+    bool steady = target == f->active;
 
-    if (f->dbg_on) {
+    if (f->dbg_on && steady) {
         flat_dbg_note(f);      /* A3: fold member before clear (FULL per-round set) */
     }
     if (f->policy == SF_FLAT_BLIND) {

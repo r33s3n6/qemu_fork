@@ -78,6 +78,8 @@ struct SfRestoreStore { const SfRestoreStoreOps *ops; };
  * subsumes the old GHashTable src memo + dirty bitmap + HOT set.
  *  - BLIND (ALL_HOT): after_restore keeps pages writable (no reset); plan grows
  *    to the active layer's footprint, drain goes ~empty in steady state.
+ *    SF_RESET_EVERY_N=N (BLIND only): every N in-place restores, reset_ring+clear
+ *    (n=1 ≡ FULL; n=0/unset = pure blind). Bounds long-run W drift.
  *  - FULL: after_restore resets + clears; next round ∝ this round's dirty.
  */
 typedef enum { SF_FLAT_FULL, SF_FLAT_BLIND } SfFlatPolicy;

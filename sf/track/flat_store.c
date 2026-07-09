@@ -1,10 +1,10 @@
 /*
- * sf/track/flat_store — first restore-store backend (plan 2026-07-08-03 §4).
- * A persistent {dst,src} plan + a page-index membership bitmap for O(1) dedup.
- * src is filled lazily on plan() and cached across rounds (only touched pages),
- * so this one structure replaces the old GHashTable src memo + dirty bitmap +
- * HOT set. Pure state + resolve callback; the KVM reset happens only in the
- * boundary hooks. Clean-room: no Nyx code.
+ * sf/track/flat_store — first restore-store backend (plan 2026-07-08-03 §4 +
+ * 2026-07-09-01 C1). A persistent {dst,src} plan + page-index membership
+ * bitmap for O(1) dedup. src filled lazily on plan() and cached across rounds.
+ * Policies: FULL = after_restore reset_ring+clear every round; BLIND = keep
+ * writable (SF_BLIND=1); BLIND+SF_RESET_EVERY_N=N = reprotect+clear every N
+ * in-place restores (n=1 ≡ FULL; n=0/unset = pure blind). Clean-room: no Nyx.
  */
 #include "qemu/osdep.h"
 #include "qemu/bitmap.h"
@@ -19,6 +19,10 @@ typedef struct {
     SfResolveFn       resolve;
     void             *user;
     SfFlatPolicy      policy;
+    /* BLIND only: 0 = pure blind (never reset in-place); N = reset_ring+clear
+     * every N in-place restores (n=1 ≡ FULL). Read once from SF_RESET_EVERY_N. */
+    size_t            reset_every_n;
+    size_t            inplace_since_reset; /* in-place after_restore count since clear */
 
     unsigned long    *member;        /* page-idx bitmap: in this generation's set */
     SfPlanPage       *plan;          /* insertion-ordered {dst,src} */
@@ -136,6 +140,7 @@ static void flat_clear_generation(FlatStore *f)
     f->n = 0;
     f->resolved_upto = 0;
     f->pos = 0;               /* fresh generation: nothing carried, all net increment */
+    f->inplace_since_reset = 0;
 }
 
 static void flat_after_restore(SfRestoreStore *s, void *target)
@@ -149,12 +154,20 @@ static void flat_after_restore(SfRestoreStore *s, void *target)
     }
     /* In-place restore of the active baseline (steady loop). */
     if (f->dbg_on) {
-        flat_dbg_note(f);      /* A3: fold this round's member before FULL clears it */
+        flat_dbg_note(f);      /* A3: fold this round's member before FULL/periodic clear */
     }
     if (f->policy == SF_FLAT_BLIND) {
-        /* Keep writable + keep plan (periodic clear = reset_every_n knob). This
-         * round's whole set is now "carried across a restore" → unsure next time;
-         * notes after this point are the next generation's net increment. */
+        f->inplace_since_reset++;
+        /* C1 reset_every_n: every N in-place rounds reprotect + clear (n=1 ≡ FULL).
+         * n=0 (default) = pure blind — keep writable, plan accumulates. */
+        if (f->reset_every_n > 0 &&
+            f->inplace_since_reset >= f->reset_every_n) {
+            sf_kvm_reset_ring();
+            flat_clear_generation(f);
+            return;
+        }
+        /* Keep writable + keep plan. Whole set is now carried → unsure next
+         * time; notes after this are the next generation's net increment. */
         f->pos = f->n;
         return;
     }
@@ -234,6 +247,18 @@ SfRestoreStore *sf_flat_store_new(const SfBlockReg *blocks, size_t n_blocks,
     f->resolve = resolve;
     f->user = user;
     f->policy = policy;
+    /* SF_RESET_EVERY_N only meaningful under BLIND (FULL already resets every 1).
+     * 0 / unset = pure blind; N≥1 = periodic reprotect+clear every N in-place. */
+    {
+        const char *ren = getenv("SF_RESET_EVERY_N");
+        if (ren && *ren && policy == SF_FLAT_BLIND) {
+            char *end = NULL;
+            unsigned long v = strtoul(ren, &end, 10);
+            if (end != ren && *end == '\0') {
+                f->reset_every_n = (size_t)v;
+            }
+        }
+    }
 
     /* blk_pgbase has n_blocks+1 entries: [b] = first idx of block b, [n_blocks]
      * = total page count (used to size the bitmap + clear it). */

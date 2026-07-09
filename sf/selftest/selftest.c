@@ -205,10 +205,31 @@ static void sf_selftest_track(Monitor *mon, bool *all_ok)
         bool full0 = (o->plan(st, tgt)->n == 0);
         full = full1 && full0;
         o->free(st);
+
+        /* C1 reset_every_n tooth: SF_RESET_EVERY_N=2 under BLIND keeps once then
+         * clears on the 2nd in-place after_restore (≡ periodic FULL). */
+        {
+            struct sf_tst_rctx c5 = { region, shadow, 0 };
+            g_setenv("SF_RESET_EVERY_N", "2", 1);
+            st = sf_flat_store_new(&blk, 1, sf_tst_resolve, &c5, SF_FLAT_BLIND);
+            g_unsetenv("SF_RESET_EVERY_N");
+            o = st->ops;
+            o->set_active(st, tgt);
+            o->note_batch(st, b1, 3);
+            o->after_restore(st, tgt);   /* 1st: keep, n still 2 */
+            bool keep1 = (o->plan(st, tgt)->n == 2);
+            o->after_restore(st, tgt);   /* 2nd: reset+clear, n→0 */
+            bool cleared = (o->plan(st, tgt)->n == 0);
+            /* after clear, new notes form a fresh gen */
+            o->note_batch(st, b1, 3);
+            bool fresh2 = (o->plan(st, tgt)->n == 2);
+            full = full && keep1 && cleared && fresh2;
+            o->free(st);
+        }
     }
 
     snprintf(buf, sizeof(buf), "dedup+incremental (resolves=%d) blind-keep%s",
-             c.calls, kvm_enabled() ? "" : " + full-clear + rebase-switch + pos-split");
+             c.calls, kvm_enabled() ? "" : " + full-clear + rebase-switch + pos-split + reset_every_n");
     report(mon, all_ok, "R3 flat-store logic", ok && full && rebase && possplit, buf);
     g_free(region);
     g_free(shadow);

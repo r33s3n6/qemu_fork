@@ -1005,6 +1005,31 @@ static void dirty_gfn_set_collected(struct kvm_dirty_gfn *gfn)
 }
 
 static bool sf_kvm_dirty_ring_owned;
+static uint64_t sf_kvm_guest_active_total_ns;
+
+static bool sf_kvm_time_enabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0) {
+        const char *s = getenv("SF_TIME");
+        enabled = s && *s;
+    }
+    return enabled;
+}
+
+static uint64_t sf_kvm_now_ns(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+uint64_t sf_kvm_guest_active_ns(void)
+{
+    return qatomic_read(&sf_kvm_guest_active_total_ns);
+}
 
 static bool kvm_dirty_ring_host_page(KVMState *s, struct kvm_dirty_gfn *gfn,
                                      size_t psize, void **hostp)
@@ -3851,6 +3876,7 @@ int kvm_cpu_exec(CPUState *cpu)
 {
     struct kvm_run *run = cpu->kvm_run;
     int ret, run_ret;
+    bool sf_time = sf_kvm_time_enabled();
 
     trace_kvm_cpu_exec();
 
@@ -3884,7 +3910,12 @@ int kvm_cpu_exec(CPUState *cpu)
             kvm_cpu_kick_self();
         }
 
+        uint64_t sf_guest_t0 = sf_time ? sf_kvm_now_ns() : 0;
         run_ret = kvm_vcpu_ioctl(cpu, KVM_RUN, 0);
+        if (sf_time) {
+            qatomic_fetch_add(&sf_kvm_guest_active_total_ns,
+                              sf_kvm_now_ns() - sf_guest_t0);
+        }
 
         /*
          * After writing cpu->exit_request, cpu_exit() sends a signal that writes
@@ -5057,6 +5088,62 @@ static void query_stats(StatsResultList **result, StatsTarget target,
     default:
         g_assert_not_reached();
     }
+}
+
+uint64_t sf_kvm_vcpu_stat_sum(const char *name)
+{
+    CPUState *cpu;
+    uint64_t total = 0;
+
+    CPU_FOREACH(cpu) {
+        struct kvm_stats_desc *kvm_stats_desc;
+        struct kvm_stats_header *kvm_stats_header;
+        StatsDescriptors *descriptors;
+        struct kvm_stats_desc *pdesc;
+        g_autofree uint64_t *stats_data = NULL;
+        Error *err = NULL;
+        size_t size_desc, size_data = 0;
+        ssize_t ret;
+        int i;
+
+        if (cpu->kvm_vcpu_stats_fd == -1) {
+            continue;
+        }
+        descriptors = find_stats_descriptors(STATS_TARGET_VCPU,
+                                             cpu->kvm_vcpu_stats_fd, &err);
+        if (!descriptors) {
+            error_free(err);
+            continue;
+        }
+
+        kvm_stats_header = &descriptors->kvm_stats_header;
+        kvm_stats_desc = descriptors->kvm_stats_desc;
+        size_desc = sizeof(*kvm_stats_desc) + kvm_stats_header->name_size;
+
+        for (i = 0; i < kvm_stats_header->num_desc; i++) {
+            pdesc = (void *)kvm_stats_desc + i * size_desc;
+            size_data += pdesc->size * sizeof(*stats_data);
+        }
+        stats_data = g_malloc0(size_data);
+        ret = pread(cpu->kvm_vcpu_stats_fd, stats_data, size_data,
+                    kvm_stats_header->data_offset);
+        if (ret != size_data) {
+            continue;
+        }
+
+        for (i = 0; i < kvm_stats_header->num_desc; i++) {
+            pdesc = (void *)kvm_stats_desc + i * size_desc;
+            if (!strcmp(pdesc->name, name)) {
+                uint64_t *stats = (void *)((uint8_t *)stats_data + pdesc->offset);
+
+                for (int j = 0; j < pdesc->size; j++) {
+                    total += stats[j];
+                }
+                break;
+            }
+        }
+    }
+    return total;
 }
 
 static void query_stats_schema(StatsSchemaList **result, StatsTarget target,

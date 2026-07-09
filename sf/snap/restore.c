@@ -51,6 +51,9 @@ static uint64_t sf_now_ns(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
+static bool sf_restore_exec_base_valid;
+static uint64_t sf_restore_last_guest_active_ns;
+static uint64_t sf_restore_last_pf_taken;
 
 /* ---- test knobs (teeth for the phase1.5 gates) ---- */
 bool sf_skip_tsc(void)   /* exposed for the terminal snapshot path's refreeze */
@@ -673,10 +676,23 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
     size_t n;
     bool timing = sf_timing();
     uint64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0;
+    uint64_t guest_active_us = 0, pf_taken = 0;
 
     if (timing) { t0 = sf_now_ns(); }
 
     /* Step 1: drain the ring + get the persistent plan, resolved to dst. */
+    if (timing) {
+        uint64_t guest_now = sf_kvm_guest_active_ns();
+        uint64_t pf_now = sf_kvm_vcpu_stat_sum("pf_taken");
+
+        if (sf_restore_exec_base_valid) {
+            guest_active_us = (guest_now - sf_restore_last_guest_active_ns) / 1000;
+            pf_taken = pf_now - sf_restore_last_pf_taken;
+        }
+        sf_restore_last_guest_active_ns = guest_now;
+        sf_restore_last_pf_taken = pf_now;
+        sf_restore_exec_base_valid = true;
+    }
     sf_track_drain();
     plan = sf_track_plan(dst);
     if (timing) { t1 = sf_now_ns(); }
@@ -715,9 +731,11 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
         t4 = sf_now_ns();
         fprintf(stderr,
                 "sf-time: restore plan=%.1fus device=%.1fus ram=%.1fus "
-                "cpusync+reset=%.1fus total=%.1fus (W=%zu)\n",
+                "cpusync+reset=%.1fus total=%.1fus (W=%zu) "
+                "guest_active=%" PRIu64 "us pf_taken=%" PRIu64 "\n",
                 (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (t3 - t2) / 1000.0,
-                (t4 - t3) / 1000.0, (t4 - t0) / 1000.0, n);
+                (t4 - t3) / 1000.0, (t4 - t0) / 1000.0, n,
+                guest_active_us, pf_taken);
     }
     monitor_printf(NULL, "sf: restore ok: dst=%u device=%s ram W=%zu\n",
                    dst->id, dst->dev.have ? "replayed" : "SKIPPED", n);

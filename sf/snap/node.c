@@ -7,6 +7,7 @@
  */
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/error-report.h"
 #include "qemu/queue.h"
 #include "qemu/crc32c.h"
 #include "exec/cpu-common.h"
@@ -89,6 +90,15 @@ SfSnapNode *sf_node_new(SfSnapNode *parent, SfSnapKind kind)
     if (parent == NULL) {
         n->id = SF_ROOT_ID;             /* shared main-tree root, reserved 0 */
     } else {
+        /* local_id is 24 bits (SF_ID_MAX_LOCAL). Without this, mask wrap in
+         * SF_ID() would reuse early ids and corrupt the tree (roadmap I.2
+         * defer). Fail loud before wrap. */
+        if (g_next_local > SF_ID_MAX_LOCAL) {
+            error_report("sf: local_id overflow worker=%u next=%u max=%u "
+                         "(>16M nodes/worker; refuse wrap)",
+                         g_worker_id, g_next_local, SF_ID_MAX_LOCAL);
+            abort();
+        }
         n->id = SF_ID(g_worker_id, g_next_local++);
     }
     n->parent = parent;

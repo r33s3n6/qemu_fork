@@ -751,8 +751,8 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
     size_t n;
     size_t reprotect_pages = 0;
     bool timing = sf_timing();
-    uint64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
-    uint64_t t_cpusync = 0, t_tsc = 0, t_reprotect = 0;
+    uint64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0;
+    uint64_t t_cpusync = 0, t_tsc = 0, t_reprotect = 0;  /* cpusync/tsc = accum durations */
     uint64_t guest_active_wall_us = 0, guest_active_cpu_us = 0, pf_taken = 0;
 
     if (timing) { t0 = sf_now_ns(); }
@@ -793,26 +793,26 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
     n = sf_restore_apply_ram(dst, src, plan);
     if (timing) { t3 = sf_now_ns(); }
 
-    /* Step 4a: push the replayed CPUState into the KVM vCPU.
-     * CPU_FOREACH future-proofs for multi-vCPU (DP-A). */
+    /* Step 4: push the replayed CPUState into the KVM vCPU, then force the TSC
+     * rewind — per-cpu order preserved (post_init writes the TSC up, refreeze
+     * pulls it back). cpusync/tsc split by per-cpu accumulation so multi-vCPU
+     * interleaving is unchanged vs a single loop. CPU_FOREACH (DP-A). */
     {
         CPUState *cpu;
         CPU_FOREACH(cpu) {
+            uint64_t ca = timing ? sf_now_ns() : 0;
             cpu_synchronize_post_init(cpu);
-        }
-    }
-    if (timing) { t_cpusync = sf_now_ns(); }
-
-    /* Step 4b: force the TSC rewind (separately timed — known KVM sync-up cost). */
-    {
-        CPUState *cpu;
-        CPU_FOREACH(cpu) {
+            uint64_t cb = timing ? sf_now_ns() : 0;
             if (kvm_enabled() && !sf_skip_tsc()) {
                 sf_kvm_refreeze_tsc(cpu);
             }
+            if (timing) {
+                t_cpusync += cb - ca;
+                t_tsc += sf_now_ns() - cb;
+            }
         }
     }
-    if (timing) { t_tsc = sf_now_ns(); }
+    if (timing) { t4 = sf_now_ns(); }
 
     /* Step 5: re-baseline for the next generation (FULL: reset ring + clear;
      * BLIND: keep pages writable). */
@@ -828,8 +828,8 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
                 "pf_taken=%" PRIu64 "\n",
                 dst->id, src == dst ? "inplace" : "cross",
                 (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (t3 - t2) / 1000.0,
-                (t_cpusync - t3) / 1000.0, (t_tsc - t_cpusync) / 1000.0,
-                (t_reprotect - t_tsc) / 1000.0,
+                t_cpusync / 1000.0, t_tsc / 1000.0,
+                (t_reprotect - t4) / 1000.0,
                 (t_reprotect - t0) / 1000.0, n, reprotect_pages,
                 guest_active_wall_us, guest_active_cpu_us, pf_taken);
     }

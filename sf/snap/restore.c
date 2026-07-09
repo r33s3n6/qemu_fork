@@ -372,6 +372,7 @@ SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, bool activat
                                Error **errp)
 {
     size_t psize = qemu_real_host_page_size();
+    bool memcmp_all = getenv("SF_DIFF_MEMCMP_ALL") != NULL;
     SfSnapNode *node;
     const SfRestorePlan *plan;
     SfPageKey *keys;
@@ -395,6 +396,7 @@ SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, bool activat
      * (= written, not value-changed) carries write-same pages into the net increment
      * — i.e. is "net increment == guaranteed different" true for this workload. */
     if (getenv("SF_DIFF_STAT")) {
+        uint64_t t0 = sf_now_ns();
         size_t un_t = 0, un_s = 0, ni_t = 0, ni_s = 0;
         for (size_t i = 0; i < plan->n; i++) {
             const uint8_t *s = plan->pages[i].src;
@@ -402,9 +404,12 @@ SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, bool activat
             if (i < plan->unsure_n) { un_t++; un_s += same; }
             else                    { ni_t++; ni_s += same; }
         }
+        /* memcmp_all_us = cost of memcmp-ing the WHOLE set (what SF_DIFF_MEMCMP_ALL
+         * would add to a save); dropped_same = pages it would remove from the diff. */
         fprintf(stderr, "sf-diff-stat: parent=%u n=%zu unsure_n=%zu "
-                "unsure_same=%zu/%zu net_inc_same=%zu/%zu\n",
-                parent->id, plan->n, plan->unsure_n, un_s, un_t, ni_s, ni_t);
+                "unsure_same=%zu/%zu net_inc_same=%zu/%zu memcmp_all_us=%.1f\n",
+                parent->id, plan->n, plan->unsure_n, un_s, un_t, ni_s, ni_t,
+                (sf_now_ns() - t0) / 1000.0);
     }
 
     /* Keys to save (drop NO_RESTORE), sorted for bsearch. The plan is already
@@ -417,14 +422,18 @@ SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, bool activat
         if (sf_excluded(host)) {
             continue;   /* NO_RESTORE: not diffed */
         }
-        /* Unsure-page confirm (plan 09-01 §4 D): only the carried/unsure prefix
-         * [0,unsure_n) might already equal the parent (dirtied in an earlier round,
-         * restored back, never re-touched — common under BLIND keep). memcmp-confirm
-         * just those and drop the ones that match: restore resolves through to the
-         * parent for them anyway, so keeping them only bloats this diff. The suffix
-         * [unsure_n,n) came straight from this drain's ring (guaranteed written this
-         * generation) — no memcmp. */
-        if (i < plan->unsure_n && src && memcmp(host, src, psize) == 0) {
+        /* Unsure-page confirm (plan 09-01 §4 D): by default memcmp only the carried/
+         * unsure prefix [0,unsure_n) — pages dirtied in an earlier round, restored
+         * back, never re-touched (common under BLIND keep) → likely == parent. Drop
+         * the matches: restore resolves through to the parent for them anyway. The
+         * suffix [unsure_n,n) came straight from this drain's ring — "written", not
+         * necessarily "changed", so it still holds write-same pages (~8-22% measured),
+         * but they're the minority so we skip the memcmp there by default.
+         * SF_DIFF_MEMCMP_ALL extends the confirm to the whole set to also drop those
+         * — trades save-side memcmp (see SF_DIFF_STAT memcmp_all_us) for a smaller
+         * diff. Correctness identical either way (dropped pages equal the parent). */
+        if ((memcmp_all || i < plan->unsure_n) && src &&
+            memcmp(host, src, psize) == 0) {
             continue;
         }
         if (sf_host_to_key_safe(host, &k)) {

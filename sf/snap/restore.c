@@ -390,6 +390,23 @@ SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, bool activat
     sf_track_drain();
     plan = sf_track_plan(parent);
 
+    /* SF_DIFF_STAT (debug, opt-in): how many tracked pages already equal the parent,
+     * split unsure-prefix vs net-increment suffix. Measures whether KVM's dirty ring
+     * (= written, not value-changed) carries write-same pages into the net increment
+     * — i.e. is "net increment == guaranteed different" true for this workload. */
+    if (getenv("SF_DIFF_STAT")) {
+        size_t un_t = 0, un_s = 0, ni_t = 0, ni_s = 0;
+        for (size_t i = 0; i < plan->n; i++) {
+            const uint8_t *s = plan->pages[i].src;
+            bool same = s && memcmp(plan->pages[i].dst, s, psize) == 0;
+            if (i < plan->unsure_n) { un_t++; un_s += same; }
+            else                    { ni_t++; ni_s += same; }
+        }
+        fprintf(stderr, "sf-diff-stat: parent=%u n=%zu unsure_n=%zu "
+                "unsure_same=%zu/%zu net_inc_same=%zu/%zu\n",
+                parent->id, plan->n, plan->unsure_n, un_s, un_t, ni_s, ni_t);
+    }
+
     /* Keys to save (drop NO_RESTORE), sorted for bsearch. The plan is already
      * deduped (membership bitmap), so a plain sort suffices — no uniq pass. */
     keys = g_new(SfPageKey, plan->n ? plan->n : 1);

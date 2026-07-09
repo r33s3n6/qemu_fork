@@ -51,6 +51,15 @@ static uint64_t sf_now_ns(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
+/* Thread CPU clock: advances only while this thread is on-CPU. Concurrent
+ * oversubscription: wall includes preemption; thread-cputime is the cost
+ * attribution mirror of guest_active_cpu (see arch/perf-metrics.md §1). */
+static uint64_t sf_now_thread_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
 static bool sf_restore_exec_base_valid;
 static uint64_t sf_restore_last_guest_active_wall_ns;
 static uint64_t sf_restore_last_guest_active_cpu_ns;
@@ -751,11 +760,19 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
     size_t n;
     size_t reprotect_pages = 0;
     bool timing = sf_timing();
+    /* Wall buckets (throughput). Thread-CPU siblings for plan/ram/reprotect/total
+     * (cost attribution under preemption — plan 09-03 A1). device/cpusync/tsc
+     * stay wall-only: short ioctl paths, not the bandwidth/contention story. */
     uint64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0;
+    uint64_t c0 = 0, c1 = 0, c2 = 0, c3 = 0, c4 = 0;
     uint64_t t_cpusync = 0, t_tsc = 0, t_reprotect = 0;  /* cpusync/tsc = accum durations */
+    uint64_t c_reprotect = 0;
     uint64_t guest_active_wall_us = 0, guest_active_cpu_us = 0, pf_taken = 0;
 
-    if (timing) { t0 = sf_now_ns(); }
+    if (timing) {
+        t0 = sf_now_ns();
+        c0 = sf_now_thread_ns();
+    }
 
     /* Step 1: drain the ring + get the persistent plan, resolved to dst. */
     if (timing) {
@@ -777,7 +794,10 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
     }
     sf_track_drain();
     plan = sf_track_plan(dst);
-    if (timing) { t1 = sf_now_ns(); }
+    if (timing) {
+        t1 = sf_now_ns();
+        c1 = sf_now_thread_ns();
+    }
 
     /* Step 2: device replay (registers; restores env->tsc etc. for step 4). */
     if (dst->dev.have) {
@@ -787,11 +807,17 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
             sf_replay(&dst->dev.tables);
         }
     }
-    if (timing) { t2 = sf_now_ns(); }
+    if (timing) {
+        t2 = sf_now_ns();
+        c2 = sf_now_thread_ns();  /* anchors ram_cpu start (device wall-only) */
+    }
 
     /* Step 3: RAM delta-restore — plan (+ cross-node path pages) → live guest. */
     n = sf_restore_apply_ram(dst, src, plan);
-    if (timing) { t3 = sf_now_ns(); }
+    if (timing) {
+        t3 = sf_now_ns();
+        c3 = sf_now_thread_ns();
+    }
 
     /* Step 4: push the replayed CPUState into the KVM vCPU, then force the TSC
      * rewind — per-cpu order preserved (post_init writes the TSC up, refreeze
@@ -812,7 +838,10 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
             }
         }
     }
-    if (timing) { t4 = sf_now_ns(); }
+    if (timing) {
+        t4 = sf_now_ns();
+        c4 = sf_now_thread_ns();
+    }
 
     /* Step 5: re-baseline for the next generation (FULL: reset ring + clear;
      * BLIND: keep pages writable). */
@@ -820,17 +849,23 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
 
     if (timing) {
         t_reprotect = sf_now_ns();
+        c_reprotect = sf_now_thread_ns();
         fprintf(stderr,
-                "sf-time: restore dst=%u kind=%s plan=%.1fus device=%.1fus ram=%.1fus "
-                "cpusync=%.1fus tsc_refreeze=%.1fus reprotect=%.1fus "
-                "total=%.1fus (W=%zu) reprotect_pages=%zu "
+                "sf-time: restore dst=%u kind=%s plan=%.1fus plan_cpu=%.1fus "
+                "device=%.1fus ram=%.1fus ram_cpu=%.1fus "
+                "cpusync=%.1fus tsc_refreeze=%.1fus "
+                "reprotect=%.1fus reprotect_cpu=%.1fus "
+                "total=%.1fus total_cpu=%.1fus (W=%zu) reprotect_pages=%zu "
                 "guest_active_wall=%" PRIu64 "us guest_active_cpu=%" PRIu64 "us "
                 "pf_taken=%" PRIu64 "\n",
                 dst->id, src == dst ? "inplace" : "cross",
-                (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (t3 - t2) / 1000.0,
+                (t1 - t0) / 1000.0, (c1 - c0) / 1000.0,
+                (t2 - t1) / 1000.0,
+                (t3 - t2) / 1000.0, (c3 - c2) / 1000.0,
                 t_cpusync / 1000.0, t_tsc / 1000.0,
-                (t_reprotect - t4) / 1000.0,
-                (t_reprotect - t0) / 1000.0, n, reprotect_pages,
+                (t_reprotect - t4) / 1000.0, (c_reprotect - c4) / 1000.0,
+                (t_reprotect - t0) / 1000.0, (c_reprotect - c0) / 1000.0,
+                n, reprotect_pages,
                 guest_active_wall_us, guest_active_cpu_us, pf_taken);
     }
     monitor_printf(NULL, "sf: restore ok: dst=%u device=%s ram W=%zu\n",

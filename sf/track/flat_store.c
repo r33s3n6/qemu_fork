@@ -27,12 +27,13 @@ typedef struct {
     void             *active;        /* set_active hint (fast path == plan_target) */
     SfRestorePlan     out;           /* returned by pointer */
 
-    /* A3 debug trace (SF_DIRTY_TRACE): running intersection/union of per-round
-     * member = 共享脏页 common set. FULL only (blind's member accumulates, no
-     * per-round isolation). Untouched + unallocated unless enabled → hot path 零侵入. */
+    /* A3/A4 debug trace (SF_DIRTY_TRACE): per-round member plus running
+     * intersection/union. FULL only (blind's member accumulates, no per-round
+     * isolation). Untouched + unallocated unless enabled -> hot path zero
+     * intrusion. */
     bool              dbg_on;
     size_t            dbg_rounds;
-    unsigned long    *dbg_common, *dbg_union;
+    unsigned long    *dbg_common, *dbg_union, *dbg_prev;
 } FlatStore;
 
 /* host → dense page-index. ponytail: linear over the few RAMBlocks; if this
@@ -89,20 +90,24 @@ static const SfRestorePlan *flat_plan(SfRestoreStore *s, void *target)
     return &f->out;
 }
 
-/* A3: fold this round's member into the running common (AND) / union (OR) and
- * print, before FULL clears it. Meaningful over the steady (inplace) tail —
- * the first few notes are setup/build_diff diffs and only tighten the AND. */
+/* A3/A4: fold this round's member into the running common (AND) / union (OR)
+ * and print, before FULL clears it. Meaningful over the steady (inplace) tail:
+ * setup/cross restores are still present in early lines, so consumers should
+ * filter by the host-side restore kind when they need pure steady state. */
 static void flat_dbg_note(FlatStore *f)
 {
     size_t nbits = f->blk_pgbase[f->n_blocks];
     size_t nwords = BITS_TO_LONGS(nbits);
     size_t pc_this = 0, pc_common = 0, pc_union = 0;
+    size_t pc_overlap_prev = 0, pc_overlap_union = 0;
 
     if (f->dbg_rounds == 0) {
         memcpy(f->dbg_common, f->member, nwords * sizeof(long));
         memcpy(f->dbg_union, f->member, nwords * sizeof(long));
     } else {
         for (size_t i = 0; i < nwords; i++) {
+            pc_overlap_prev += __builtin_popcountl(f->member[i] & f->dbg_prev[i]);
+            pc_overlap_union += __builtin_popcountl(f->member[i] & f->dbg_union[i]);
             f->dbg_common[i] &= f->member[i];
             f->dbg_union[i] |= f->member[i];
         }
@@ -113,8 +118,14 @@ static void flat_dbg_note(FlatStore *f)
         pc_common += __builtin_popcountl(f->dbg_common[i]);
         pc_union += __builtin_popcountl(f->dbg_union[i]);
     }
-    fprintf(stderr, "sf-dirty-trace: round=%zu this=%zu common=%zu union=%zu\n",
-            f->dbg_rounds, pc_this, pc_common, pc_union);
+    double union_ratio = pc_this ? (double)pc_union / (double)pc_this : 0.0;
+
+    fprintf(stderr,
+            "sf-dirty-trace: round=%zu this=%zu common=%zu union=%zu "
+            "overlap_prev=%zu overlap_union=%zu union_per_round=%.3f\n",
+            f->dbg_rounds, pc_this, pc_common, pc_union,
+            pc_overlap_prev, pc_overlap_union, union_ratio);
+    memcpy(f->dbg_prev, f->member, nwords * sizeof(long));
 }
 
 static void flat_clear_generation(FlatStore *f)
@@ -169,6 +180,7 @@ static void flat_free(SfRestoreStore *s)
     g_free(f->blk_pgbase);
     g_free(f->dbg_common);
     g_free(f->dbg_union);
+    g_free(f->dbg_prev);
     g_free(f);
 }
 
@@ -212,6 +224,7 @@ SfRestoreStore *sf_flat_store_new(const SfBlockReg *blocks, size_t n_blocks,
     if (f->dbg_on) {
         f->dbg_common = bitmap_new(base ? base : 1);
         f->dbg_union = bitmap_new(base ? base : 1);
+        f->dbg_prev = bitmap_new(base ? base : 1);
     }
     return &f->base;
 }

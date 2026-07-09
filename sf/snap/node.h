@@ -232,8 +232,9 @@ void  sf_snap_tracker_disarm(void);
  * Exposed so the RAM diff/delta mechanics are testable under pc KVM (where the
  * microvm hot-profile guard refuses the full preparse). */
 SfSnapNode *sf_snap_ram_root(Error **errp);   /* root backing + blocks + root node, sets sf_active */
-SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind,
-                               Error **errp);  /* collect ∪ HOT → non-root diff node (RAM only) */
+SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, bool activate,
+                               Error **errp);  /* collect ∪ HOT → non-root diff node (RAM only);
+                                                * activate=re-baseline tracker to the new node */
 int   sf_snap_delta_restore(uint32_t dst_id, Error **errp);  /* RAM delta-restore (no device/clock) */
 
 /* ---- selftest fault injection (test-only; production never calls these) ----

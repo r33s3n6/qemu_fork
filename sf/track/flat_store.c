@@ -138,15 +138,20 @@ static void flat_clear_generation(FlatStore *f)
 static void flat_after_restore(SfRestoreStore *s, void *target)
 {
     FlatStore *f = (FlatStore *)s;
-    bool steady = target == f->active;
 
-    if (f->dbg_on && steady) {
-        flat_dbg_note(f);      /* A3: fold member before clear (FULL per-round set) */
+    if (target != f->active) {
+        /* Cross restore: the active baseline is about to switch; set_active()
+         * re-baselines (reprotect + clear). Nothing to do here — one reset only. */
+        return;
+    }
+    /* In-place restore of the active baseline (steady loop). */
+    if (f->dbg_on) {
+        flat_dbg_note(f);      /* A3: fold this round's member before FULL clears it */
     }
     if (f->policy == SF_FLAT_BLIND) {
-        return;   /* keep writable + keep plan; no reset (periodic clear = knob) */
+        return;   /* keep writable + keep plan (periodic clear = reset_every_n knob) */
     }
-    sf_kvm_reset_ring();       /* FULL: reprotect all harvested */
+    sf_kvm_reset_ring();       /* FULL: reprotect this round's dirty */
     flat_clear_generation(f);  /* next round ∝ this round's dirty */
 }
 
@@ -160,7 +165,20 @@ static void flat_after_drain(SfRestoreStore *s)
 
 static void flat_set_active(SfRestoreStore *s, void *node)
 {
-    ((FlatStore *)s)->active = node;   /* hint; plan() already fast-paths ==plan_target */
+    FlatStore *f = (FlatStore *)s;
+
+    if (node == f->active) {
+        return;   /* same baseline, nothing to re-base */
+    }
+    /* Baseline switch (snapshot created, or cross restore): the tracked dirty set is
+     * relative to the OLD baseline. Re-base to @node — on stock KVM that means
+     * reprotect everything harvested (reset_ring) + drop the vec. FULL already
+     * reprotects each in-place after_restore, so this matters most for BLIND, whose
+     * only re-baseline point is the switch: without it the old baseline's dirt (and
+     * one-time setup pages) leak into @node's generation and its saved diff. */
+    sf_kvm_reset_ring();
+    flat_clear_generation(f);
+    f->active = node;
 }
 
 static void flat_invalidate(SfRestoreStore *s, void *target)

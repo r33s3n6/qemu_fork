@@ -136,8 +136,9 @@ static void sf_selftest_track(Monitor *mon, bool *all_ok)
     struct sf_tst_rctx c = { region, shadow, 0 };
     SfBlockReg blk = { region, N * psize };
     void *tgt = (void *)0x1;
+    void *tgt2 = (void *)0x2;
     char buf[160];
-    bool ok, full = true;
+    bool ok, full = true, rebase = true;
 
     SfRestoreStore *st = sf_flat_store_new(&blk, 1, sf_tst_resolve, &c, SF_FLAT_BLIND);
     const SfRestoreStoreOps *o = st->ops;
@@ -160,21 +161,38 @@ static void sf_selftest_track(Monitor *mon, bool *all_ok)
     ok = ok && (p->n == 3) && (c.calls == 3);
     o->free(st);
 
-    if (!kvm_enabled()) {           /* FULL after_restore calls sf_kvm_reset_ring */
+    if (!kvm_enabled()) {           /* set_active/after_restore reach sf_kvm_reset_ring */
+        /* Re-baseline tooth: switching the active baseline reprotects + clears the
+         * vec — BLIND's only re-base point, so the old baseline's dirt can't leak
+         * into the new generation. Without a switch, BLIND keeps (tested above). */
+        struct sf_tst_rctx c3 = { region, shadow, 0 };
+        st = sf_flat_store_new(&blk, 1, sf_tst_resolve, &c3, SF_FLAT_BLIND);
+        o = st->ops;
+        o->set_active(st, tgt);
+        o->note_batch(st, b1, 3);
+        bool base2 = (o->plan(st, tgt)->n == 2);
+        o->set_active(st, tgt2);    /* switch baseline → reset + clear */
+        bool base0 = (o->plan(st, tgt)->n == 0);
+        rebase = base2 && base0;
+        o->free(st);
+
+        /* FULL in-place after_restore clears; active must be set so it counts as
+         * in-place (a cross target is a no-op, deferred to set_active). */
         struct sf_tst_rctx c2 = { region, shadow, 0 };
         st = sf_flat_store_new(&blk, 1, sf_tst_resolve, &c2, SF_FLAT_FULL);
         o = st->ops;
+        o->set_active(st, tgt);
         o->note_batch(st, b1, 3);
         bool full1 = (o->plan(st, tgt)->n == 2);
-        o->after_restore(st, tgt);  /* FULL: reset + clear */
+        o->after_restore(st, tgt);  /* FULL in-place: reset + clear */
         bool full0 = (o->plan(st, tgt)->n == 0);
         full = full1 && full0;
         o->free(st);
     }
 
     snprintf(buf, sizeof(buf), "dedup+incremental (resolves=%d) blind-keep%s",
-             c.calls, kvm_enabled() ? "" : " + full-clear");
-    report(mon, all_ok, "R3 flat-store logic", ok && full, buf);
+             c.calls, kvm_enabled() ? "" : " + full-clear + rebase-switch");
+    report(mon, all_ok, "R3 flat-store logic", ok && full && rebase, buf);
     g_free(region);
     g_free(shadow);
 }
@@ -661,7 +679,7 @@ static void sf_selftest_tsc(Monitor *mon, bool *all_ok)
 static SfSnapNode *sf_make_layer(Monitor *mon, bool *all_ok)
 {
     Error *err = NULL;
-    SfSnapNode *n = sf_snap_build_diff(sf_active, SF_SNAP_RUN, &err);
+    SfSnapNode *n = sf_snap_build_diff(sf_active, SF_SNAP_RUN, true, &err);
     if (!n) {
         monitor_printf(mon, "sf: selftest[snap] build_diff FAILED: %s\n",
                        error_get_pretty(err));

@@ -360,12 +360,16 @@ SfSnapNode *sf_snap_ram_root(Error **errp)
 /*
  * RAM-only non-root diff: the dirtied set since the parent (the tracker's
  * persistent plan) becomes this node's diff. Copy the live pages into a fresh
- * diff store, keyed + sorted for bsearch. after_restore re-baselines the
- * generation to this new node (FULL: reset ring + clear; BLIND: keep). Does NOT
- * set sf_active (the caller decides — production save does, after device
- * capture; selftest controls it).
+ * diff store, keyed + sorted for bsearch.
+ *
+ * @activate (default true for the snapshot op): re-baseline the tracker to this
+ * new node via set_active — reprotect + clear, so the next generation tracks dirt
+ * relative to @node, not the parent. Pass false to build a diff WITHOUT switching
+ * the tracked baseline (host-controlled). Does NOT set the global sf_active (the
+ * caller decides — production save does, after device capture; selftest controls it).
  */
-SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, Error **errp)
+SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, bool activate,
+                               Error **errp)
 {
     size_t psize = qemu_real_host_page_size();
     SfSnapNode *node;
@@ -392,8 +396,18 @@ SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, Error **errp
     for (size_t i = 0; i < plan->n; i++) {
         SfPageKey k;
         void *host = plan->pages[i].dst;
+        const uint8_t *src = plan->pages[i].src;
         if (sf_excluded(host)) {
             continue;   /* NO_RESTORE: not diffed */
+        }
+        /* Unsure-page confirm (plan 09-01 D): a tracked page can already equal the
+         * parent (dirtied, restored back, never re-touched — common under BLIND
+         * keep). Drop it: restore resolves through to the parent for it anyway, so
+         * keeping it only bloats this diff and the steady restore set.
+         * ponytail: memcmps every tracked page vs its parent copy; restrict to the
+         * carried/unsure segment (pos-split, plan D1) if the save path turns hot. */
+        if (src && memcmp(host, src, psize) == 0) {
+            continue;
         }
         if (sf_host_to_key_safe(host, &k)) {
             keys[nk++] = k;
@@ -417,8 +431,12 @@ SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, Error **errp
     }
     g_free(keys);
 
-    /* Re-baseline: next generation is relative to this new node. */
-    sf_track_after_restore(node);
+    /* Re-baseline the tracker to this new node (reprotect + clear) so the next
+     * generation tracks dirt relative to @node. set_active (not after_restore) so
+     * BLIND re-bases too. @activate=false leaves the tracked baseline on the parent. */
+    if (activate) {
+        sf_track_set_active(node);
+    }
     return node;
 }
 
@@ -637,7 +655,7 @@ int sf_snap_save(SfSnapKind kind, Error **errp)
     uint64_t t0_tsc = (kvm_enabled() && current_cpu) ? sf_kvm_read_tsc(current_cpu) : 0;
 
     if (timing) { ta = sf_now_ns(); }
-    node = sf_snap_build_diff(sf_active, kind, &err);
+    node = sf_snap_build_diff(sf_active, kind, true, &err);
     if (!node) {
         error_propagate(errp, err);
         return -EIO;

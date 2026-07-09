@@ -36,6 +36,11 @@ typedef struct {
 typedef struct {
     const SfPlanPage *pages;
     size_t            n;
+    /* pages[0,unsure_n) = carried across a prior restore ("unsure": may already
+     * equal the snapshot); pages[unsure_n,n) = this generation's net increment,
+     * straight from the ring (guaranteed written). build_diff memcmp-confirms only
+     * the unsure prefix (plan 2026-07-08-03/09-01 §4 D). 0 ⇒ all net increment. */
+    size_t            unsure_n;
 } SfRestorePlan;
 
 /*

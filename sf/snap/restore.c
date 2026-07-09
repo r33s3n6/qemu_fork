@@ -400,13 +400,14 @@ SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, bool activat
         if (sf_excluded(host)) {
             continue;   /* NO_RESTORE: not diffed */
         }
-        /* Unsure-page confirm (plan 09-01 D): a tracked page can already equal the
-         * parent (dirtied, restored back, never re-touched — common under BLIND
-         * keep). Drop it: restore resolves through to the parent for it anyway, so
-         * keeping it only bloats this diff and the steady restore set.
-         * ponytail: memcmps every tracked page vs its parent copy; restrict to the
-         * carried/unsure segment (pos-split, plan D1) if the save path turns hot. */
-        if (src && memcmp(host, src, psize) == 0) {
+        /* Unsure-page confirm (plan 09-01 §4 D): only the carried/unsure prefix
+         * [0,unsure_n) might already equal the parent (dirtied in an earlier round,
+         * restored back, never re-touched — common under BLIND keep). memcmp-confirm
+         * just those and drop the ones that match: restore resolves through to the
+         * parent for them anyway, so keeping them only bloats this diff. The suffix
+         * [unsure_n,n) came straight from this drain's ring (guaranteed written this
+         * generation) — no memcmp. */
+        if (i < plan->unsure_n && src && memcmp(host, src, psize) == 0) {
             continue;
         }
         if (sf_host_to_key_safe(host, &k)) {

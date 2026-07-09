@@ -138,7 +138,7 @@ static void sf_selftest_track(Monitor *mon, bool *all_ok)
     void *tgt = (void *)0x1;
     void *tgt2 = (void *)0x2;
     char buf[160];
-    bool ok, full = true, rebase = true;
+    bool ok, full = true, rebase = true, possplit = true;
 
     SfRestoreStore *st = sf_flat_store_new(&blk, 1, sf_tst_resolve, &c, SF_FLAT_BLIND);
     const SfRestoreStoreOps *o = st->ops;
@@ -176,6 +176,23 @@ static void sf_selftest_track(Monitor *mon, bool *all_ok)
         rebase = base2 && base0;
         o->free(st);
 
+        /* pos-split tooth: a fresh generation is all net increment (unsure_n==0);
+         * after an in-place restore the kept set is carried (unsure prefix), the
+         * next drain's pages are net increment. build_diff memcmps only [0,unsure_n). */
+        struct sf_tst_rctx c4 = { region, shadow, 0 };
+        st = sf_flat_store_new(&blk, 1, sf_tst_resolve, &c4, SF_FLAT_BLIND);
+        o = st->ops;
+        o->set_active(st, tgt);
+        o->note_batch(st, b1, 3);                       /* 2 distinct, fresh gen */
+        const SfRestorePlan *pp = o->plan(st, tgt);
+        bool fresh = (pp->n == 2) && (pp->unsure_n == 0);
+        o->after_restore(st, tgt);                      /* in-place BLIND keep → pos=2 */
+        o->note_batch(st, b2, 2);                       /* p2 new (p1 dup) */
+        pp = o->plan(st, tgt);
+        bool carried = (pp->n == 3) && (pp->unsure_n == 2);
+        possplit = fresh && carried;
+        o->free(st);
+
         /* FULL in-place after_restore clears; active must be set so it counts as
          * in-place (a cross target is a no-op, deferred to set_active). */
         struct sf_tst_rctx c2 = { region, shadow, 0 };
@@ -191,8 +208,8 @@ static void sf_selftest_track(Monitor *mon, bool *all_ok)
     }
 
     snprintf(buf, sizeof(buf), "dedup+incremental (resolves=%d) blind-keep%s",
-             c.calls, kvm_enabled() ? "" : " + full-clear + rebase-switch");
-    report(mon, all_ok, "R3 flat-store logic", ok && full && rebase, buf);
+             c.calls, kvm_enabled() ? "" : " + full-clear + rebase-switch + pos-split");
+    report(mon, all_ok, "R3 flat-store logic", ok && full && rebase && possplit, buf);
     g_free(region);
     g_free(shadow);
 }

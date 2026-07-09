@@ -23,6 +23,7 @@ typedef struct {
     unsigned long    *member;        /* page-idx bitmap: in this generation's set */
     SfPlanPage       *plan;          /* insertion-ordered {dst,src} */
     size_t            n, cap, resolved_upto;
+    size_t            pos;           /* n as of the last restore = unsure/net-increment split */
     void             *plan_target;   /* target the src[0..resolved_upto) resolve to */
     void             *active;        /* set_active hint (fast path == plan_target) */
     SfRestorePlan     out;           /* returned by pointer */
@@ -87,6 +88,7 @@ static const SfRestorePlan *flat_plan(SfRestoreStore *s, void *target)
     f->resolved_upto = f->n;
     f->out.pages = f->plan;
     f->out.n = f->n;
+    f->out.unsure_n = f->pos;   /* [0,pos) carried across a restore; [pos,n) net increment */
     return &f->out;
 }
 
@@ -133,6 +135,7 @@ static void flat_clear_generation(FlatStore *f)
     bitmap_zero(f->member, f->blk_pgbase[f->n_blocks]);   /* [n_blocks] = total pages */
     f->n = 0;
     f->resolved_upto = 0;
+    f->pos = 0;               /* fresh generation: nothing carried, all net increment */
 }
 
 static void flat_after_restore(SfRestoreStore *s, void *target)
@@ -149,7 +152,11 @@ static void flat_after_restore(SfRestoreStore *s, void *target)
         flat_dbg_note(f);      /* A3: fold this round's member before FULL clears it */
     }
     if (f->policy == SF_FLAT_BLIND) {
-        return;   /* keep writable + keep plan (periodic clear = reset_every_n knob) */
+        /* Keep writable + keep plan (periodic clear = reset_every_n knob). This
+         * round's whole set is now "carried across a restore" → unsure next time;
+         * notes after this point are the next generation's net increment. */
+        f->pos = f->n;
+        return;
     }
     sf_kvm_reset_ring();       /* FULL: reprotect this round's dirty */
     flat_clear_generation(f);  /* next round ∝ this round's dirty */

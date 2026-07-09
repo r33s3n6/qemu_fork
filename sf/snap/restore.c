@@ -529,6 +529,63 @@ static size_t sf_push_path_pages(SfSnapNode *target, const SfRamStore *s,
     return k;
 }
 
+/*
+ * A2 (plan 09-03): classify each restore page's owner layer by pointer range
+ * into the node chain. Buckets:
+ *   root     — root store (shared base ceiling under root-sharing)
+ *   shared   — SCHEMA/PREFIX (sharing target under prefix-sharing)
+ *   private  — CLEAN/RUN/other worker-private layers
+ * Debug-gate only (caller gates on SF_TIME); not on the memcpy hot path.
+ */
+typedef struct {
+    size_t root;
+    size_t shared;
+    size_t private;
+    size_t null_src;
+} SfRestoreSrcStat;
+
+static void sf_src_stat_one(SfSnapNode *dst, const uint8_t *src,
+                            SfRestoreSrcStat *st)
+{
+    size_t psize = qemu_real_host_page_size();
+
+    if (!src) {
+        st->null_src++;
+        return;
+    }
+    for (SfSnapNode *n = dst; n; n = n->parent) {
+        if (!n->parent) {
+            /* root: flat rootstore; span = map_len */
+            if (n->ram.data && n->ram.map_len &&
+                src >= n->ram.data &&
+                (size_t)(src - n->ram.data) < n->ram.map_len) {
+                st->root++;
+                return;
+            }
+        } else if (n->ram.data && n->ram.n_pages) {
+            size_t span = (size_t)n->ram.n_pages * psize;
+            if (src >= n->ram.data && (size_t)(src - n->ram.data) < span) {
+                if (n->kind == SF_SNAP_SCHEMA || n->kind == SF_SNAP_PREFIX) {
+                    st->shared++;
+                } else {
+                    st->private++;
+                }
+                return;
+            }
+        }
+    }
+    /* unmatched pointer: treat as private (unknown owner) so totals still sum */
+    st->private++;
+}
+
+static void sf_src_stat_pages(SfSnapNode *dst, const SfPlanPage *pages, size_t n,
+                              SfRestoreSrcStat *st)
+{
+    for (size_t i = 0; i < n; i++) {
+        sf_src_stat_one(dst, pages[i].src, st);
+    }
+}
+
 /* Apply the plan (+ cross-node path pages) rolling live RAM back to dst; returns
  * the number of pages applied. */
 static size_t sf_restore_apply_ram(SfSnapNode *dst, SfSnapNode *src,
@@ -560,6 +617,45 @@ static size_t sf_restore_apply_ram(SfSnapNode *dst, SfSnapNode *src,
     sf_track_apply(scratch, ns);
     g_free(scratch);
     return ns;
+}
+
+/*
+ * A2 source split for the page set apply just used. Outside the ram timing
+ * window (call after t3). In-place = plan only; cross = rebuild plan∪path
+ * (setup path, rare vs steady inplace).
+ */
+static void sf_src_stat_for_restore(SfSnapNode *dst, SfSnapNode *src,
+                                    const SfRestorePlan *plan,
+                                    SfRestoreSrcStat *st)
+{
+    memset(st, 0, sizeof(*st));
+    if (src == dst) {
+        sf_src_stat_pages(dst, plan->pages, plan->n, st);
+        return;
+    }
+    {
+        SfSnapNode *L = sf_node_lca(src, dst);
+        size_t cap = plan->n, ns;
+        SfPlanPage *scratch;
+
+        for (SfSnapNode *n = src; n != L; n = n->parent) {
+            cap += n->ram.n_pages;
+        }
+        for (SfSnapNode *n = dst; n != L; n = n->parent) {
+            cap += n->ram.n_pages;
+        }
+        scratch = g_new(SfPlanPage, cap ? cap : 1);
+        memcpy(scratch, plan->pages, plan->n * sizeof(SfPlanPage));
+        ns = plan->n;
+        for (SfSnapNode *n = src; n != L; n = n->parent) {
+            ns += sf_push_path_pages(dst, &n->ram, scratch + ns);
+        }
+        for (SfSnapNode *n = dst; n != L; n = n->parent) {
+            ns += sf_push_path_pages(dst, &n->ram, scratch + ns);
+        }
+        sf_src_stat_pages(dst, scratch, ns, st);
+        g_free(scratch);
+    }
 }
 
 /*
@@ -768,6 +864,7 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
     uint64_t t_cpusync = 0, t_tsc = 0, t_reprotect = 0;  /* cpusync/tsc = accum durations */
     uint64_t c_reprotect = 0;
     uint64_t guest_active_wall_us = 0, guest_active_cpu_us = 0, pf_taken = 0;
+    SfRestoreSrcStat src_stat = {0};
 
     if (timing) {
         t0 = sf_now_ns();
@@ -817,6 +914,8 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
     if (timing) {
         t3 = sf_now_ns();
         c3 = sf_now_thread_ns();
+        /* A2: outside ram bucket — does not pollute ram/ram_cpu. */
+        sf_src_stat_for_restore(dst, src, plan, &src_stat);
     }
 
     /* Step 4: push the replayed CPUState into the KVM vCPU, then force the TSC
@@ -856,6 +955,7 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
                 "cpusync=%.1fus tsc_refreeze=%.1fus "
                 "reprotect=%.1fus reprotect_cpu=%.1fus "
                 "total=%.1fus total_cpu=%.1fus (W=%zu) reprotect_pages=%zu "
+                "src_root=%zu src_shared=%zu src_private=%zu src_null=%zu "
                 "guest_active_wall=%" PRIu64 "us guest_active_cpu=%" PRIu64 "us "
                 "pf_taken=%" PRIu64 "\n",
                 dst->id, src == dst ? "inplace" : "cross",
@@ -866,6 +966,7 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
                 (t_reprotect - t4) / 1000.0, (c_reprotect - c4) / 1000.0,
                 (t_reprotect - t0) / 1000.0, (c_reprotect - c0) / 1000.0,
                 n, reprotect_pages,
+                src_stat.root, src_stat.shared, src_stat.private, src_stat.null_src,
                 guest_active_wall_us, guest_active_cpu_us, pf_taken);
     }
     monitor_printf(NULL, "sf: restore ok: dst=%u device=%s ram W=%zu\n",

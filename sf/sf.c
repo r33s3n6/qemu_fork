@@ -222,6 +222,12 @@ void hmp_sf_cold_start(Monitor *mon, const QDict *qdict)
         monitor_printf(mon, "sf: cold-start failed: %s\n", error_get_pretty(err));
         error_free(err);
     } else {
+        /* Guest resumes at the snapshot site. Do NOT put_rax(dst_id): the
+         * single-site outl reuses %eax as the command word; node id 2 has
+         * low byte == SF_CP_RESTORE and would re-enter as restore(0).
+         * cold-race guest path takes a fresh private snapshot after landing
+         * (plan 09-03 B3; NR page is root-time after remap). */
+        sf_cp_generation_inc();
         monitor_printf(mon, "sf: cold-start ok: dir=%s id=%" PRId64 "\n", dir, id);
     }
     if (was_running) {

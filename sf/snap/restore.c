@@ -565,7 +565,11 @@ static void sf_src_stat_one(SfSnapNode *dst, const uint8_t *src,
         } else if (n->ram.data && n->ram.n_pages) {
             size_t span = (size_t)n->ram.n_pages * psize;
             if (src >= n->ram.data && (size_t)(src - n->ram.data) < span) {
-                if (n->kind == SF_SNAP_SCHEMA || n->kind == SF_SNAP_PREFIX) {
+                /* shared = SCHEMA/PREFIX kinds (intended labels) OR any
+                 * FILE-backed layer (cold-start MAP_SHARED page-cache share;
+                 * terminal path currently tags all non-root as RUN). */
+                if (n->kind == SF_SNAP_SCHEMA || n->kind == SF_SNAP_PREFIX ||
+                    n->ram.backing == SF_BACKING_FILE) {
                     st->shared++;
                 } else {
                     st->private++;

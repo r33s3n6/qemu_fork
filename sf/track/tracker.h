@@ -56,8 +56,9 @@ typedef struct {
     void (*note_batch)(SfRestoreStore *, void *const *host, size_t n);
     /* The {dst,src}[] to roll back for @target (src resolved, cached as it sees fit). */
     const SfRestorePlan *(*plan)(SfRestoreStore *, void *target);
-    /* After a restore's memcpy: reset/protect + generation bookkeeping per policy. */
-    void (*after_restore)(SfRestoreStore *, void *target);
+    /* After a restore's memcpy: reset/protect + generation bookkeeping per policy.
+     * Returns #pages reprotected this call (0 for pure-blind / cross-defer). */
+    size_t (*after_restore)(SfRestoreStore *, void *target);
     /* After a forced/background drain (ring-full): reclaim ring slots. */
     void (*after_drain)(SfRestoreStore *);
     /* Hint: the expected restore target (target==active ⇒ fast path). */
@@ -102,7 +103,7 @@ void sf_track_end(void);
 void sf_track_drain(void);                        /* ring → store->note_batch */
 const SfRestorePlan *sf_track_plan(void *target); /* store->plan (live-dirty set) */
 void sf_track_apply(const SfPlanPage *pages, size_t n);  /* 2-thread memcpy */
-void sf_track_after_restore(void *target);        /* store->after_restore */
+size_t sf_track_after_restore(void *target);      /* store->after_restore; #reprotect */
 void sf_track_after_drain(void);                  /* store->after_drain (ring-full) */
 uint8_t *sf_track_resolve(void *target, void *host); /* for the snap layer's path pages */
 void sf_track_set_active(void *node);

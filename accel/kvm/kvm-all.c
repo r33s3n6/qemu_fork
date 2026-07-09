@@ -1005,7 +1005,8 @@ static void dirty_gfn_set_collected(struct kvm_dirty_gfn *gfn)
 }
 
 static bool sf_kvm_dirty_ring_owned;
-static uint64_t sf_kvm_guest_active_total_ns;
+static uint64_t sf_kvm_guest_active_wall_ns_total;
+static uint64_t sf_kvm_guest_active_cpu_ns_total;
 
 static bool sf_kvm_time_enabled(void)
 {
@@ -1026,9 +1027,24 @@ static uint64_t sf_kvm_now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
-uint64_t sf_kvm_guest_active_ns(void)
+/* Thread CPU clock: advances only while this vCPU thread is on-CPU (guest
+ * non-root + KVM exit handling). Host preemption of the thread does not count. */
+static uint64_t sf_kvm_now_thread_ns(void)
 {
-    return qatomic_read(&sf_kvm_guest_active_total_ns);
+    struct timespec ts;
+
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+uint64_t sf_kvm_guest_active_wall_ns(void)
+{
+    return qatomic_read(&sf_kvm_guest_active_wall_ns_total);
+}
+
+uint64_t sf_kvm_guest_active_cpu_ns(void)
+{
+    return qatomic_read(&sf_kvm_guest_active_cpu_ns_total);
 }
 
 static bool kvm_dirty_ring_host_page(KVMState *s, struct kvm_dirty_gfn *gfn,
@@ -1550,17 +1566,20 @@ size_t sf_kvm_ring_capacity(void)
 
 /* Reclaim the ring slots we've drained but not yet reset: mark [reset_index,
  * fetch_index) collected and KVM_RESET_DIRTY_RINGS. Stock KVM welds reclaim +
- * reprotect (reprotects exactly those pages). */
-void sf_kvm_reset_ring(void)
+ * reprotect (reprotects exactly those pages). Returns the number of pages
+ * reprotected (harvested GFN count). */
+size_t sf_kvm_reset_ring(void)
 {
     KVMState *s = kvm_state;
+    size_t n = 0;
 
     if (!s) {
-        return;
+        return 0;
     }
     kvm_slots_lock();
-    sf_kvm_reset_harvested(s);
+    n = (size_t)sf_kvm_reset_harvested(s);
     kvm_slots_unlock();
+    return n;
 }
 
 /* I.3 (kvm-keep-writable) seam: reprotect exactly @host[0..n), keeping every
@@ -3910,11 +3929,17 @@ int kvm_cpu_exec(CPUState *cpu)
             kvm_cpu_kick_self();
         }
 
-        uint64_t sf_guest_t0 = sf_time ? sf_kvm_now_ns() : 0;
+        uint64_t sf_wall_t0 = 0, sf_cpu_t0 = 0;
+        if (sf_time) {
+            sf_wall_t0 = sf_kvm_now_ns();
+            sf_cpu_t0 = sf_kvm_now_thread_ns();
+        }
         run_ret = kvm_vcpu_ioctl(cpu, KVM_RUN, 0);
         if (sf_time) {
-            qatomic_fetch_add(&sf_kvm_guest_active_total_ns,
-                              sf_kvm_now_ns() - sf_guest_t0);
+            qatomic_fetch_add(&sf_kvm_guest_active_wall_ns_total,
+                              sf_kvm_now_ns() - sf_wall_t0);
+            qatomic_fetch_add(&sf_kvm_guest_active_cpu_ns_total,
+                              sf_kvm_now_thread_ns() - sf_cpu_t0);
         }
 
         /*

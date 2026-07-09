@@ -143,14 +143,15 @@ static void flat_clear_generation(FlatStore *f)
     f->inplace_since_reset = 0;
 }
 
-static void flat_after_restore(SfRestoreStore *s, void *target)
+static size_t flat_after_restore(SfRestoreStore *s, void *target)
 {
     FlatStore *f = (FlatStore *)s;
+    size_t n_reprotect;
 
     if (target != f->active) {
         /* Cross restore: the active baseline is about to switch; set_active()
          * re-baselines (reprotect + clear). Nothing to do here — one reset only. */
-        return;
+        return 0;
     }
     /* In-place restore of the active baseline (steady loop). */
     if (f->dbg_on) {
@@ -162,17 +163,18 @@ static void flat_after_restore(SfRestoreStore *s, void *target)
          * n=0 (default) = pure blind — keep writable, plan accumulates. */
         if (f->reset_every_n > 0 &&
             f->inplace_since_reset >= f->reset_every_n) {
-            sf_kvm_reset_ring();
+            n_reprotect = sf_kvm_reset_ring();
             flat_clear_generation(f);
-            return;
+            return n_reprotect;
         }
         /* Keep writable + keep plan. Whole set is now carried → unsure next
          * time; notes after this are the next generation's net increment. */
         f->pos = f->n;
-        return;
+        return 0;
     }
-    sf_kvm_reset_ring();       /* FULL: reprotect this round's dirty */
-    flat_clear_generation(f);  /* next round ∝ this round's dirty */
+    n_reprotect = sf_kvm_reset_ring();  /* FULL: reprotect this round's dirty */
+    flat_clear_generation(f);           /* next round ∝ this round's dirty */
+    return n_reprotect;
 }
 
 static void flat_after_drain(SfRestoreStore *s)
@@ -180,7 +182,7 @@ static void flat_after_drain(SfRestoreStore *s)
     (void)s;
     /* Forced (ring-full): reclaim slots; keep membership (pages still in the set,
      * they will re-fault and re-note after reprotect — correctness-safe). */
-    sf_kvm_reset_ring();
+    (void)sf_kvm_reset_ring();
 }
 
 static void flat_set_active(SfRestoreStore *s, void *node)
@@ -196,7 +198,7 @@ static void flat_set_active(SfRestoreStore *s, void *node)
      * reprotects each in-place after_restore, so this matters most for BLIND, whose
      * only re-baseline point is the switch: without it the old baseline's dirt (and
      * one-time setup pages) leak into @node's generation and its saved diff. */
-    sf_kvm_reset_ring();
+    (void)sf_kvm_reset_ring();
     flat_clear_generation(f);
     f->active = node;
 }

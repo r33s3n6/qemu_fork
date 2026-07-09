@@ -717,7 +717,7 @@ static void sf_selftest_tsc(Monitor *mon, bool *all_ok)
 static SfSnapNode *sf_make_layer(Monitor *mon, bool *all_ok)
 {
     Error *err = NULL;
-    SfSnapNode *n = sf_snap_build_diff(sf_active, SF_SNAP_RUN, true, &err);
+    SfSnapNode *n = sf_snap_build_diff(sf_active, SF_SNAP_RUN, true, NULL, &err);
     if (!n) {
         monitor_printf(mon, "sf: selftest[snap] build_diff FAILED: %s\n",
                        error_get_pretty(err));

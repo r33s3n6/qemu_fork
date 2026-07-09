@@ -97,11 +97,12 @@ const SfRestorePlan *sf_track_plan(void *target)
     return g_store ? g_store->ops->plan(g_store, target) : NULL;
 }
 
-void sf_track_after_restore(void *target)
+size_t sf_track_after_restore(void *target)
 {
     if (g_store) {
-        g_store->ops->after_restore(g_store, target);
+        return g_store->ops->after_restore(g_store, target);
     }
+    return 0;
 }
 
 void sf_track_after_drain(void)

@@ -662,10 +662,13 @@ void sf_kvm_set_skip_flush(bool on);
  */
 size_t sf_kvm_drain_ring(void **host_out, size_t max);
 size_t sf_kvm_ring_capacity(void);
-void sf_kvm_reset_ring(void);
+size_t sf_kvm_reset_ring(void);   /* reclaim + reprotect; returns #pages reprotected */
 bool sf_kvm_can_protect_set(void);
 void sf_kvm_protect(void *const *host, size_t n);
-uint64_t sf_kvm_guest_active_ns(void);
+/* Dual clocks around KVM_RUN (arch/perf-metrics.md §1): wall = throughput
+ * denominator; thread CPU = cost attribution (excludes host preemption). */
+uint64_t sf_kvm_guest_active_wall_ns(void);
+uint64_t sf_kvm_guest_active_cpu_ns(void);
 uint64_t sf_kvm_vcpu_stat_sum(const char *name);
 
 #endif

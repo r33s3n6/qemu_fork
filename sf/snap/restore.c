@@ -52,7 +52,8 @@ static uint64_t sf_now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 static bool sf_restore_exec_base_valid;
-static uint64_t sf_restore_last_guest_active_ns;
+static uint64_t sf_restore_last_guest_active_wall_ns;
+static uint64_t sf_restore_last_guest_active_cpu_ns;
 static uint64_t sf_restore_last_pf_taken;
 
 /* ---- test knobs (teeth for the phase1.5 gates) ---- */
@@ -369,7 +370,7 @@ SfSnapNode *sf_snap_ram_root(Error **errp)
  * caller decides — production save does, after device capture; selftest controls it).
  */
 SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, bool activate,
-                               Error **errp)
+                               SfSnapDiffTiming *timing_out, Error **errp)
 {
     size_t psize = qemu_real_host_page_size();
     /* Default: confirm the WHOLE tracked set against the parent (memcmp ≈0.2-0.3us/
@@ -377,11 +378,18 @@ SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, bool activat
      * SF_DIFF_UNSURE_ONLY restricts the confirm to the carried/unsure prefix
      * [0,unsure_n) — the pos-split fast path for save-latency-sensitive workloads. */
     bool memcmp_all = getenv("SF_DIFF_UNSURE_ONLY") == NULL;
+    bool timing = timing_out != NULL;
     SfSnapNode *node;
     const SfRestorePlan *plan;
     SfPageKey *keys;
     size_t nk = 0;
+    /* Buckets: plan | memcmp | save | rebase (DIFF_STAT is outside all four). */
+    uint64_t t_plan0 = 0, t_plan1 = 0, t_mc0 = 0, t_mc1 = 0;
+    uint64_t t_save1 = 0, t_rebase1 = 0;
 
+    if (timing_out) {
+        memset(timing_out, 0, sizeof(*timing_out));
+    }
     if (!parent) {
         error_setg(errp, "sf_snap_build_diff: parent required");
         return NULL;
@@ -391,16 +399,15 @@ SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, bool activat
         return NULL;
     }
 
-    /* The dirty set vs the parent = the tracker's persistent plan. */
+    /* plan = drain + plan (dirty set vs parent). */
+    if (timing) { t_plan0 = sf_now_ns(); }
     sf_track_drain();
     plan = sf_track_plan(parent);
+    if (timing) { t_plan1 = sf_now_ns(); }
 
-    /* SF_DIFF_STAT (debug, opt-in): how many tracked pages already equal the parent,
-     * split unsure-prefix vs net-increment suffix. Measures whether KVM's dirty ring
-     * (= written, not value-changed) carries write-same pages into the net increment
-     * — i.e. is "net increment == guaranteed different" true for this workload. */
+    /* SF_DIFF_STAT (debug, opt-in): outside the four save buckets. */
     if (getenv("SF_DIFF_STAT")) {
-        uint64_t t0 = sf_now_ns();
+        uint64_t ts = sf_now_ns();
         size_t un_t = 0, un_s = 0, ni_t = 0, ni_s = 0;
         for (size_t i = 0; i < plan->n; i++) {
             const uint8_t *s = plan->pages[i].src;
@@ -413,11 +420,12 @@ SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, bool activat
         fprintf(stderr, "sf-diff-stat: parent=%u n=%zu unsure_n=%zu "
                 "unsure_same=%zu/%zu net_inc_same=%zu/%zu memcmp_all_us=%.1f\n",
                 parent->id, plan->n, plan->unsure_n, un_s, un_t, ni_s, ni_t,
-                (sf_now_ns() - t0) / 1000.0);
+                (sf_now_ns() - ts) / 1000.0);
     }
 
-    /* Keys to save (drop NO_RESTORE), sorted for bsearch. The plan is already
-     * deduped (membership bitmap), so a plain sort suffices — no uniq pass. */
+    /* memcmp = key select (drop write-same) + qsort. The plan is already deduped
+     * (membership bitmap), so a plain sort suffices — no uniq pass. */
+    if (timing) { t_mc0 = sf_now_ns(); }
     keys = g_new(SfPageKey, plan->n ? plan->n : 1);
     for (size_t i = 0; i < plan->n; i++) {
         SfPageKey k;
@@ -442,7 +450,9 @@ SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, bool activat
         }
     }
     qsort(keys, nk, sizeof(SfPageKey), sf_key_cmp);
+    if (timing) { t_mc1 = sf_now_ns(); }
 
+    /* save = ramstore create + page copies. */
     node = sf_node_new(parent, kind);
     if (sf_ramstore_create_anon(&node->ram, (uint32_t)nk) < 0) {
         error_setg(errp, "sf_snap_build_diff: ramstore oom");
@@ -458,12 +468,20 @@ SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, bool activat
         }
     }
     g_free(keys);
+    if (timing) { t_save1 = sf_now_ns(); }
 
     /* Re-baseline the tracker to this new node (reprotect + clear) so the next
      * generation tracks dirt relative to @node. set_active (not after_restore) so
      * BLIND re-bases too. @activate=false leaves the tracked baseline on the parent. */
     if (activate) {
         sf_track_set_active(node);
+    }
+    if (timing) {
+        t_rebase1 = sf_now_ns();
+        timing_out->plan_ns = t_plan1 - t_plan0;
+        timing_out->memcmp_ns = t_mc1 - t_mc0;
+        timing_out->save_ns = t_save1 - t_mc1;
+        timing_out->rebase_ns = t_rebase1 - t_save1;
     }
     return node;
 }
@@ -682,8 +700,8 @@ int sf_snap_save(SfSnapKind kind, Error **errp)
      * T4's per-node refreeze. */
     uint64_t t0_tsc = (kvm_enabled() && current_cpu) ? sf_kvm_read_tsc(current_cpu) : 0;
 
-    if (timing) { ta = sf_now_ns(); }
-    node = sf_snap_build_diff(sf_active, kind, true, &err);
+    SfSnapDiffTiming diff_t = {0};
+    node = sf_snap_build_diff(sf_active, kind, true, timing ? &diff_t : NULL, &err);
     if (!node) {
         error_propagate(errp, err);
         return -EIO;
@@ -701,9 +719,12 @@ int sf_snap_save(SfSnapKind kind, Error **errp)
     if (timing) {
         tc = sf_now_ns();
         fprintf(stderr,
-                "sf-time: snapshot diff ram=%.1fus device=%.1fus "
+                "sf-time: snapshot diff plan=%.1fus memcmp=%.1fus save=%.1fus "
+                "rebase=%.1fus device=%.1fus "
                 "(diff=%u pages, device mblocks=%zu gets=%zu posts=%zu)\n",
-                (tb - ta) / 1000.0, (tc - tb) / 1000.0,
+                diff_t.plan_ns / 1000.0, diff_t.memcmp_ns / 1000.0,
+                diff_t.save_ns / 1000.0, diff_t.rebase_ns / 1000.0,
+                (tc - tb) / 1000.0,
                 node->ram.n_pages, node->dev.tables.n_mblocks,
                 node->dev.tables.n_gets, node->dev.tables.n_posts);
     }
@@ -728,22 +749,29 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
     SfSnapNode *src = sf_active;
     const SfRestorePlan *plan;
     size_t n;
+    size_t reprotect_pages = 0;
     bool timing = sf_timing();
-    uint64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0;
-    uint64_t guest_active_us = 0, pf_taken = 0;
+    uint64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
+    uint64_t t_cpusync = 0, t_tsc = 0, t_reprotect = 0;
+    uint64_t guest_active_wall_us = 0, guest_active_cpu_us = 0, pf_taken = 0;
 
     if (timing) { t0 = sf_now_ns(); }
 
     /* Step 1: drain the ring + get the persistent plan, resolved to dst. */
     if (timing) {
-        uint64_t guest_now = sf_kvm_guest_active_ns();
+        uint64_t wall_now = sf_kvm_guest_active_wall_ns();
+        uint64_t cpu_now = sf_kvm_guest_active_cpu_ns();
         uint64_t pf_now = sf_kvm_vcpu_stat_sum("pf_taken");
 
         if (sf_restore_exec_base_valid) {
-            guest_active_us = (guest_now - sf_restore_last_guest_active_ns) / 1000;
+            guest_active_wall_us =
+                (wall_now - sf_restore_last_guest_active_wall_ns) / 1000;
+            guest_active_cpu_us =
+                (cpu_now - sf_restore_last_guest_active_cpu_ns) / 1000;
             pf_taken = pf_now - sf_restore_last_pf_taken;
         }
-        sf_restore_last_guest_active_ns = guest_now;
+        sf_restore_last_guest_active_wall_ns = wall_now;
+        sf_restore_last_guest_active_cpu_ns = cpu_now;
         sf_restore_last_pf_taken = pf_now;
         sf_restore_exec_base_valid = true;
     }
@@ -765,32 +793,45 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
     n = sf_restore_apply_ram(dst, src, plan);
     if (timing) { t3 = sf_now_ns(); }
 
-    /* Step 4: push the replayed CPUState into the KVM vCPU + force the TSC
-     * rewind. CPU_FOREACH future-proofs for multi-vCPU (DP-A). */
+    /* Step 4a: push the replayed CPUState into the KVM vCPU.
+     * CPU_FOREACH future-proofs for multi-vCPU (DP-A). */
     {
         CPUState *cpu;
         CPU_FOREACH(cpu) {
             cpu_synchronize_post_init(cpu);
+        }
+    }
+    if (timing) { t_cpusync = sf_now_ns(); }
+
+    /* Step 4b: force the TSC rewind (separately timed — known KVM sync-up cost). */
+    {
+        CPUState *cpu;
+        CPU_FOREACH(cpu) {
             if (kvm_enabled() && !sf_skip_tsc()) {
                 sf_kvm_refreeze_tsc(cpu);
             }
         }
     }
+    if (timing) { t_tsc = sf_now_ns(); }
 
     /* Step 5: re-baseline for the next generation (FULL: reset ring + clear;
      * BLIND: keep pages writable). */
-    sf_track_after_restore(dst);
+    reprotect_pages = sf_track_after_restore(dst);
 
     if (timing) {
-        t4 = sf_now_ns();
+        t_reprotect = sf_now_ns();
         fprintf(stderr,
                 "sf-time: restore dst=%u kind=%s plan=%.1fus device=%.1fus ram=%.1fus "
-                "cpusync+reset=%.1fus total=%.1fus (W=%zu) "
-                "guest_active=%" PRIu64 "us pf_taken=%" PRIu64 "\n",
+                "cpusync=%.1fus tsc_refreeze=%.1fus reprotect=%.1fus "
+                "total=%.1fus (W=%zu) reprotect_pages=%zu "
+                "guest_active_wall=%" PRIu64 "us guest_active_cpu=%" PRIu64 "us "
+                "pf_taken=%" PRIu64 "\n",
                 dst->id, src == dst ? "inplace" : "cross",
                 (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (t3 - t2) / 1000.0,
-                (t4 - t3) / 1000.0, (t4 - t0) / 1000.0, n,
-                guest_active_us, pf_taken);
+                (t_cpusync - t3) / 1000.0, (t_tsc - t_cpusync) / 1000.0,
+                (t_reprotect - t_tsc) / 1000.0,
+                (t_reprotect - t0) / 1000.0, n, reprotect_pages,
+                guest_active_wall_us, guest_active_cpu_us, pf_taken);
     }
     monitor_printf(NULL, "sf: restore ok: dst=%u device=%s ram W=%zu\n",
                    dst->id, dst->dev.have ? "replayed" : "SKIPPED", n);

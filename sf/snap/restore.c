@@ -414,11 +414,18 @@ SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, Error **errp
 /* ---- restore apply (RAM) -------------------------------------------------- *
  * The tracker's plan(dst) gives the live-dirty set already resolved to dst. For
  * a cross-node restore (src != dst) the src/dst-side path layers must also roll
- * to dst — append those pages (resolved to dst) into a scratch array. Path pages
- * that also sit in the plan are copied twice, but idempotently (same src for the
- * same dst), so no dedup is needed on this slow rebuild path.
- * ponytail: cross-node is the non-hot rebuild path; add path-page dedup only if
- * it ever shows up hot. */
+ * to dst — append those pages (resolved to dst) into a scratch array.
+ *
+ * KNOWN COST (roadmap I.4, deferred — do NOT read this as "fine"): this appends
+ * every path layer's whole index WITHOUT dedup, so a page appearing in several
+ * layers (or in both plan and path) is resolved + copied once per occurrence.
+ * Work is ∝ Σ(path-layer index sizes) × chain depth, NOT ∝ distinct divergent
+ * pages — this drops the old sort_uniq dedup and thereby violates Agamotto
+ * Delta-Restore (∝ divergent pages, depth-independent). Copies stay correct
+ * (idempotent: same src for the same dst). Left unoptimized only because
+ * cross-node is the non-hot rebuild path; its speed is UNMEASURED. Redesign per
+ * roadmap I.4 (reference Agamotto) when it turns hot or R5 shows it drags
+ * races/s — not with a bolt-on dedup. */
 static size_t sf_push_path_pages(SfSnapNode *target, const SfRamStore *s,
                                  SfPlanPage *out)
 {

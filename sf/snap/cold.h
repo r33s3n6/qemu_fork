@@ -8,6 +8,6 @@
 #include "qapi/error.h"
 
 int sf_cold_start(const char *dir, uint32_t dst_id, bool restore_exclude,
-                  Error **errp);
+                  bool skip_checkpoint_outl, Error **errp);
 
 #endif /* SF_SNAP_COLD_H */

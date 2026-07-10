@@ -275,7 +275,7 @@ bool sf_gate_boundary_cmd(const SfCtlCmd *cmd)
         }
         Error *err = NULL;
         bql_lock();
-        int r = sf_cold_start(cmd->dir, cmd->id, false, &err);
+        int r = sf_cold_start(cmd->dir, cmd->id, false, true, &err);
         bql_unlock();
         if (r < 0) {
             fprintf(stderr, "sf-gate: cold-start %s/%u failed: %s\n",
@@ -355,7 +355,7 @@ static bool sf_gate_stopped_resume(const SfCtlCmd *cmd)
         }
         Error *err = NULL;
         if (take_bql) { bql_lock(); }
-        int r = sf_cold_start(cmd->dir, cmd->id, false, &err);
+        int r = sf_cold_start(cmd->dir, cmd->id, false, true, &err);
         if (r < 0) {
             if (take_bql) { bql_unlock(); }
             fprintf(stderr, "sf-gate: stopped cold-start %s/%u failed: %s\n",

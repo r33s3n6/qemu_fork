@@ -219,7 +219,7 @@ void hmp_sf_cold_start(Monitor *mon, const QDict *qdict)
     if (was_running) {
         vm_stop(RUN_STATE_RESTORE_VM);
     }
-    if (sf_cold_start(dir, (uint32_t)id, restore_nr, &err) < 0) {
+    if (sf_cold_start(dir, (uint32_t)id, restore_nr, true, &err) < 0) {
         monitor_printf(mon, "sf: cold-start failed: %s\n", error_get_pretty(err));
         error_free(err);
     } else {

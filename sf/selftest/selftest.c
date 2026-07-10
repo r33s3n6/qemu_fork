@@ -1512,12 +1512,12 @@ static void sf_selftest_persist(Monitor *mon, bool *all_ok)
                 if (sf_snap_promote(fC, fdir, &err) < 0) {
                     prom_ok = false; error_free(err); err = NULL; break;
                 }
-                if (sf_cold_start(fdir, b_id, false, &err) < 0) {
+                if (sf_cold_start(fdir, b_id, false, false, &err) < 0) {
                     error_free(err); err = NULL; break;
                 }
                 cold_b = (sf_rd32(SF_ST_BASE) == vB);
                 if (!cold_b) { break; }
-                if (sf_cold_start(fdir, c_id, false, &err) < 0) {
+                if (sf_cold_start(fdir, c_id, false, false, &err) < 0) {
                     error_free(err); err = NULL; break;
                 }
                 cold_c = (sf_rd32(SF_ST_BASE) == vC);
@@ -1674,7 +1674,7 @@ static void sf_selftest_cold_start(Monitor *mon, bool *all_ok)
         }
     }
 
-    if (sf_cold_start(dir, L1->id, true, &err) < 0) {
+    if (sf_cold_start(dir, L1->id, true, false, &err) < 0) {
         report(mon, all_ok, "8 cold-start", false, error_get_pretty(err));
         error_free(err);
         goto out;
@@ -1700,7 +1700,7 @@ static void sf_selftest_cold_start(Monitor *mon, bool *all_ok)
     }
 
     {
-        bool rejected = (sf_cold_start(dir, 0x7ffffffeU, false, &err) < 0);
+        bool rejected = (sf_cold_start(dir, 0x7ffffffeU, false, false, &err) < 0);
         snprintf(buf, sizeof(buf), "invalid-id rejected=%d", rejected);
         report(mon, all_ok, "8-neg cold-start bad-id teeth", rejected, buf);
         error_free(err);

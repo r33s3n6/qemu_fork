@@ -5,10 +5,12 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "system/runstate.h"
+#include "system/kvm.h"
 #include "sf/snap/cold.h"
 #include "sf/snap/node.h"
 #include "sf/snap/persist.h"
 #include "sf/snap/tripwire.h"
+#include "sf/kvm_tsc.h"
 
 static int sf_cold_remap_live_ram(int fd, Error **errp)
 {
@@ -36,7 +38,7 @@ static int sf_cold_remap_live_ram(int fd, Error **errp)
 }
 
 int sf_cold_start(const char *dir, uint32_t dst_id, bool restore_exclude,
-                  Error **errp)
+                  bool skip_checkpoint_outl, Error **errp)
 {
     SfSnapNode *loaded = NULL;
     SfSnapNode *target;
@@ -101,6 +103,11 @@ int sf_cold_start(const char *dir, uint32_t dst_id, bool restore_exclude,
         goto out;
     }
     if (sf_snap_restore(dst_id, NULL, errp) < 0) {
+        goto out;
+    }
+    if (skip_checkpoint_outl && kvm_enabled() &&
+        sf_kvm_skip_checkpoint_outl(first_cpu) < 0) {
+        error_setg(errp, "sf_cold_start: restored checkpoint RIP is invalid");
         goto out;
     }
     sf_tripwire_arm(true);

@@ -3940,7 +3940,8 @@ void sf_kvm_refreeze_tsc(CPUState *cs)
  * snapshot/restore reply in %eax on the SAME outl that carried the command —
  * so the guest reads it back via a `+a` output constraint on the outl, no inl
  * (the Nyx NO_PT_NYX model). RIP and all other regs come back from KVM_GET_REGS
- * unchanged (for restore, that's the snapshot's RIP = outl-after). */
+ * unchanged. Hot restore returns through the I/O handler; cold-start explicitly
+ * skips a verified checkpoint outl before resuming the guest. */
 void sf_kvm_put_rax(CPUState *cs, uint64_t value)
 {
     struct kvm_regs regs;
@@ -3960,6 +3961,29 @@ uint64_t sf_kvm_get_rbx(CPUState *cs)
 {
     cpu_synchronize_state(cs);
     return X86_CPU(cs)->env.regs[R_EBX];
+}
+
+int sf_kvm_skip_checkpoint_outl(CPUState *cs)
+{
+    struct kvm_regs regs;
+    uint8_t opcode = 0;
+
+    if (!cs || kvm_vcpu_ioctl(cs, KVM_GET_REGS, &regs) < 0) {
+        return -1;
+    }
+    if (cpu_memory_rw_debug(cs, regs.rip, &opcode, 1, false) < 0 ||
+        opcode != 0xef) {
+        error_report("sf: cold-start RIP 0x%" PRIx64
+                     " is not checkpoint outl (opcode=0x%02x)",
+                     (uint64_t)regs.rip, opcode);
+        return -1;
+    }
+    regs.rip++;
+    if (kvm_vcpu_ioctl(cs, KVM_SET_REGS, &regs) < 0) {
+        return -1;
+    }
+    X86_CPU(cs)->env.eip = regs.rip;
+    return 0;
 }
 
 void kvm_put_apicbase(X86CPU *cpu, uint64_t value)

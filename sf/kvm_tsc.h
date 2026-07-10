@@ -49,4 +49,9 @@ void sf_kvm_put_rax(CPUState *cs, uint64_t value);
  * since one outl only carries 32 bits and a >4GB guest can have the page >4GB. */
 uint64_t sf_kvm_get_rbx(CPUState *cs);
 
+/* Cold-start has already completed the checkpoint I/O in the host. Verify that
+ * the restored RIP points at `outl %eax,%dx` (opcode 0xEF), then advance past
+ * it so resume does not issue a second SNAPSHOT. */
+int sf_kvm_skip_checkpoint_outl(CPUState *cs);
+
 #endif /* SF_KVM_TSC_H */

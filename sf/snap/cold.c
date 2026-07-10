@@ -12,6 +12,95 @@
 #include "sf/snap/tripwire.h"
 #include "sf/kvm_tsc.h"
 
+/*
+ * Prefault host pages for root.ram (MAP_SHARED restore source), ancestor
+ * diff stores, and live MAP_PRIVATE RAM after cold remap+restore.
+ * Hypothesis (plan 07-10-01 维 A): first-window high pf_taken is host-side
+ * cold EPT/first-touch after cold-start; warming these mappings may crush r1 pf.
+ * Opt-in: SF_PREFAULT=1 (or "on"/"yes"). Touches only; no semantic change.
+ */
+static void sf_prefault_span(void *p, size_t len)
+{
+    size_t psz = qemu_real_host_page_size();
+    volatile uint8_t acc = 0;
+    uint8_t *base = p;
+
+    if (!base || len == 0) {
+        return;
+    }
+    for (size_t off = 0; off < len; off += psz) {
+        acc += base[off];
+    }
+    /* Prevent the compiler from deleting the walk. */
+    if (acc == 0xff && len == 1) {
+        asm volatile("" ::: "memory");
+    }
+}
+
+static void sf_prefault_ramstore(const SfRamStore *s)
+{
+    if (!s) {
+        return;
+    }
+    if (s->map_base && s->map_len) {
+        sf_prefault_span(s->map_base, s->map_len);
+        return;
+    }
+    /* ANON / partial: touch data payload if present. */
+    if (s->data && s->n_pages) {
+        sf_prefault_span(s->data,
+                         (size_t)s->n_pages * qemu_real_host_page_size());
+    }
+}
+
+static void sf_prefault_after_cold_start(SfSnapNode *target)
+{
+    const char *e = getenv("SF_PREFAULT");
+    size_t n_store = 0;
+    int n_nodes = 0;
+
+    if (!e || !*e || !strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "no")) {
+        return;
+    }
+
+    /*
+     * Prefault restore *sources*. Modes (SF_PREFAULT=):
+     *   diff | 1 | on | yes  — ancestor **diff** stores only (default; skip root.ram)
+     *   store | all-store    — root.ram + diffs (smoke: full root thrash, r1 worse)
+     *   live | all           — + live MAP_PRIVATE (known harmful in smoke)
+     * Rationale: 6GiB root touch washes host cache → r1 wall/pf explode; diffs are
+     * small (schema/prefix tens of MB) and are the MAP_SHARED COW parents of interest.
+     */
+    bool do_root = !strcmp(e, "store") || !strcmp(e, "all-store")
+                   || !strcmp(e, "live") || !strcmp(e, "all");
+    bool do_live = !strcmp(e, "live") || !strcmp(e, "all");
+
+    for (SfSnapNode *n = target; n; n = n->parent) {
+        bool is_root = (n->parent == NULL);
+        if (is_root && !do_root) {
+            continue;
+        }
+        sf_prefault_ramstore(&n->ram);
+        n_nodes++;
+        if (n->ram.map_len) {
+            n_store += n->ram.map_len;
+        } else if (n->ram.n_pages) {
+            n_store += (size_t)n->ram.n_pages * qemu_real_host_page_size();
+        }
+    }
+
+    size_t n_live = 0;
+    if (do_live) {
+        for (size_t i = 0; i < sf_n_blocks; i++) {
+            sf_prefault_span(sf_blocks[i].host, (size_t)sf_blocks[i].len);
+            n_live += (size_t)sf_blocks[i].len;
+        }
+    }
+    fprintf(stderr,
+            "sf-prefault: store=%zuMiB nodes=%d live=%zuMiB mode=%s\n",
+            n_store / (1024 * 1024), n_nodes, n_live / (1024 * 1024), e);
+}
+
 static int sf_cold_remap_live_ram(int fd, Error **errp)
 {
     for (size_t i = 0; i < sf_n_blocks; i++) {
@@ -110,6 +199,8 @@ int sf_cold_start(const char *dir, uint32_t dst_id, bool restore_exclude,
         error_setg(errp, "sf_cold_start: restored checkpoint RIP is invalid");
         goto out;
     }
+    /* Dim-A: warm host pages before first guest race window (opt-in). */
+    sf_prefault_after_cold_start(target);
     sf_tripwire_arm(true);
     ret = 0;
 

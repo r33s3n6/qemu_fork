@@ -212,21 +212,20 @@ void hmp_sf_cold_start(Monitor *mon, const QDict *qdict)
 {
     const char *dir = qdict_get_str(qdict, "dir");
     int64_t id = qdict_get_try_int(qdict, "id", 0);
+    bool restore_nr = qdict_get_try_bool(qdict, "restore-nr", false);
     Error *err = NULL;
     bool was_running = runstate_is_running();
 
     if (was_running) {
         vm_stop(RUN_STATE_RESTORE_VM);
     }
-    if (sf_cold_start(dir, (uint32_t)id, &err) < 0) {
+    if (sf_cold_start(dir, (uint32_t)id, restore_nr, &err) < 0) {
         monitor_printf(mon, "sf: cold-start failed: %s\n", error_get_pretty(err));
         error_free(err);
     } else {
-        /* Guest resumes at the snapshot site. Do NOT put_rax(dst_id): the
-         * single-site outl reuses %eax as the command word; node id 2 has
-         * low byte == SF_CP_RESTORE and would re-enter as restore(0).
-         * cold-race guest path takes a fresh private snapshot after landing
-         * (plan 09-03 B3; NR page is root-time after remap). */
+        /* Guest resumes at the original snapshot site. The restored CPU state
+         * already contains that outl's reply; only advance host generation.
+         * Requested NO_RESTORE content was copied back while the VM was stopped. */
         sf_cp_generation_inc();
         monitor_printf(mon, "sf: cold-start ok: dir=%s id=%" PRId64 "\n", dir, id);
     }
@@ -238,6 +237,7 @@ void hmp_sf_cold_start(Monitor *mon, const QDict *qdict)
 void hmp_sf_persist(Monitor *mon, const QDict *qdict)
 {
     const char *dir = qdict_get_str(qdict, "dir");
+    bool save_nr = qdict_get_try_bool(qdict, "save-nr", false);
     SfSnapNode *root = sf_active;
     Error *err = NULL;
 
@@ -248,7 +248,7 @@ void hmp_sf_persist(Monitor *mon, const QDict *qdict)
     while (root->parent) {
         root = root->parent;
     }
-    if (sf_snap_persist(root, dir, &err) < 0) {
+    if (sf_snap_persist(root, dir, save_nr, &err) < 0) {
         monitor_printf(mon, "sf: persist failed: %s\n", error_get_pretty(err));
         error_free(err);
         return;

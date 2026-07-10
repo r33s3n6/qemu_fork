@@ -7,6 +7,7 @@
 
 #include "qapi/error.h"
 
-int sf_cold_start(const char *dir, uint32_t dst_id, Error **errp);
+int sf_cold_start(const char *dir, uint32_t dst_id, bool restore_exclude,
+                  Error **errp);
 
 #endif /* SF_SNAP_COLD_H */

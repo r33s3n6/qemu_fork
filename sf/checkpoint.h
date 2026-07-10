@@ -18,12 +18,9 @@
 #define SF_NR_PORT       0x530
 #define SF_NR_PORT_SIZE  4
 
-/* Commands written to SF_CP_PORT (outl). The low 8 bits of eax are the cmd; the
- * high 24 bits carry a node id for RESTORE (id-based multi-layer restore, plan
- * 2026-07-08 T1 §2.1). The single-site outl address is unchanged (RIP alignment
- * remains the terminal-restore foundation). */
-#define SF_CP_CMD_MASK   0xffu
-#define SF_CP_ID_SHIFT   8
+/* Commands written to SF_CP_PORT (outl): eax carries the command and ebx the
+ * full 32-bit composite node id. Keeping them separate preserves worker_id.
+ * The single-site outl address remains the terminal-restore foundation. */
 #define SF_CP_NOP        0    /* boundary only (channel mode); no save/restore */
 #define SF_CP_SNAPSHOT   1
 #define SF_CP_RESTORE    2

@@ -50,14 +50,25 @@ static void sf_id_init_once(void)
     g_id_inited = true;
     const char *e = getenv("SF_WORKER_ID");
     if (e && *e) {
-        g_worker_id = (uint32_t)strtoul(e, NULL, 0) & SF_ID_MAX_WORKER;
+        char *end = NULL;
+        errno = 0;
+        unsigned long wid = strtoul(e, &end, 0);
+        if (errno || !end || *end || wid >= SF_ID_MAX_WORKER) {
+            error_report("sf: SF_WORKER_ID must be in 0..254, got '%s'", e);
+            abort();
+        }
+        g_worker_id = (uint32_t)wid;
     }
     sf_id_reset_local();
 }
 
 void sf_node_set_worker_id(uint32_t wid)
 {
-    g_worker_id = wid & SF_ID_MAX_WORKER;
+    if (wid >= SF_ID_MAX_WORKER) {
+        error_report("sf: worker id must be in 0..254, got %u", wid);
+        abort();
+    }
+    g_worker_id = wid;
     g_id_inited = true;      /* an explicit setter wins over the env default */
     sf_id_reset_local();
 }

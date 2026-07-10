@@ -125,13 +125,13 @@ static void sf_cp_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
      * host word, no lock needed. */
     bool take_bql = !bql_locked();
 
-    /* Standalone ABI (plan 2026-07-08 T1 §2.1): eax = (id<<8) | cmd. cmd is the
-     * low 8 bits; id (high 24) targets a node for RESTORE, ignored for SNAPSHOT/
-     * NOP. The reply is returned in %eax on the SAME outl (Nyx-style; pushed to
+    /* Standalone ABI: eax = command, ebx = the full 32-bit composite node id.
+     * The reply is returned in %eax on the SAME outl (Nyx-style; pushed to
      * KVM below): SNAPSHOT → new node id, RESTORE → generation (0xFFFFFFFF on
      * bad id), NOP → generation. No inl needed. */
-    uint32_t cmd = val & SF_CP_CMD_MASK;
-    uint32_t id  = val >> SF_CP_ID_SHIFT;
+    uint32_t cmd = val;
+    uint32_t id = (current_cpu && kvm_enabled()) ?
+                  (uint32_t)sf_kvm_get_rbx(current_cpu) : 0;
 
     switch (cmd) {
     case SF_CP_SNAPSHOT:

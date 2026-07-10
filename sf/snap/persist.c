@@ -238,13 +238,14 @@ out:
 
 /* NO_RESTORE table → manifest as block-relative offsets (defined below; forward
  * declared so the header writer can call it). */
-static void sf_manifest_put_exclude(QDict *man);
+static int sf_manifest_put_exclude(QDict *man, const char *dir,
+                                   bool save_content, Error **errp);
 
 /* manifest.json header (NO nodes — those are in nodes.log). Written atomically
  * (tmp+rename via g_file_set_contents). Used by sf_snap_persist and by promote
  * on the root (the first promote of a workdir, which establishes the header). */
 static int sf_manifest_write_header(const char *dir, uint64_t root_ram_len,
-                                    Error **errp)
+                                    bool save_exclude, Error **errp)
 {
     QDict *man = qdict_new();
     GString *json;
@@ -255,7 +256,10 @@ static int sf_manifest_write_header(const char *dir, uint64_t root_ram_len,
     qdict_put_int(man, "page_size", qemu_real_host_page_size());
     qdict_put_int(man, "root_ram_len", (int64_t)root_ram_len);
     sf_manifest_put_blocks(man);
-    sf_manifest_put_exclude(man);
+    if (sf_manifest_put_exclude(man, dir, save_exclude, errp) < 0) {
+        qobject_unref(man);
+        return -1;
+    }
 
     json = qobject_to_json_pretty(QOBJECT(man), true);
     mpath = g_build_filename(dir, "manifest.json", NULL);
@@ -270,9 +274,11 @@ static int sf_manifest_write_header(const char *dir, uint64_t root_ram_len,
  * process, so a cold-started worker rebuilds host addresses from (block,off).
  * §4.2-3: without this a worker resuming from snapshot X has an empty exclude
  * table and restore rolls back its task buffer. */
-static void sf_manifest_put_exclude(QDict *man)
+static int sf_manifest_put_exclude(QDict *man, const char *dir,
+                                   bool save_content, Error **errp)
 {
     QList *ex = qlist_new();
+    GByteArray *content = save_content ? g_byte_array_new() : NULL;
     size_t psize = qemu_real_host_page_size();
     size_t n = sf_exclude_count();
 
@@ -286,14 +292,41 @@ static void sf_manifest_put_exclude(QDict *man)
             !sf_host_to_key_safe((void *)(uintptr_t)host_start, &key)) {
             continue;
         }
+        if (content &&
+            (size > G_MAXUINT || content->len > G_MAXUINT - (guint)size)) {
+            error_setg(errp, "sf_persist: NO_RESTORE content exceeds 4GiB");
+            qobject_unref(ex);
+            g_byte_array_unref(content);
+            return -1;
+        }
         e = qdict_new();
         qdict_put_int(e, "block", SF_KEY_BLOCK(key));
         qdict_put_int(e, "off", (int64_t)(SF_KEY_PFN(key) * psize));
         qdict_put_int(e, "size", (int64_t)size);
         qdict_put_int(e, "buf_id", buf_id);
+        if (content) {
+            qdict_put_int(e, "data_off", (int64_t)content->len);
+            g_byte_array_append(content, (const uint8_t *)(uintptr_t)host_start,
+                                size);
+        }
         qlist_append_obj(ex, QOBJECT(e));
     }
     qdict_put(man, "exclude", ex);
+    if (content) {
+        char *path = g_build_filename(dir, "exclude.ram", NULL);
+        int ret = sf_write_file(path, content->data, content->len, errp);
+        g_free(path);
+        g_byte_array_unref(content);
+        if (ret < 0) {
+            return -1;
+        }
+        qdict_put_bool(man, "exclude_content", true);
+    } else {
+        char *path = g_build_filename(dir, "exclude.ram", NULL);
+        unlink(path);
+        g_free(path);
+    }
+    return 0;
 }
 
 /* Walk @n's subtree pre-order: write each non-root diff store + device stream,
@@ -339,7 +372,8 @@ static void sf_persist_walk(SfSnapNode *n, int log_fd, const char *dir,
     }
 }
 
-int sf_snap_persist(SfSnapNode *root, const char *dir, Error **errp)
+int sf_snap_persist(SfSnapNode *root, const char *dir, bool save_exclude,
+                    Error **errp)
 {
     uint64_t root_len = 0;
     char *ndir, *lpath;
@@ -365,7 +399,7 @@ int sf_snap_persist(SfSnapNode *root, const char *dir, Error **errp)
         return -1;
     }
     /* Header (no nodes) first; nodes go to a fresh nodes.log below. */
-    if (sf_manifest_write_header(dir, root_len, errp) < 0) {
+    if (sf_manifest_write_header(dir, root_len, save_exclude, errp) < 0) {
         return -1;
     }
 
@@ -537,7 +571,7 @@ int sf_snap_promote(SfSnapNode *node, const char *dir, Error **errp)
         /* Root promote establishes the workdir: write the header (manifest.json)
          * once. Non-root promotes inherit it — the header is tree-level and
          * stable, so they only append their node record. */
-        if (sf_manifest_write_header(dir, sf_blocks_root_len(), errp) < 0) {
+        if (sf_manifest_write_header(dir, sf_blocks_root_len(), false, errp) < 0) {
             return -1;
         }
         snprintf(dname, sizeof(dname), "root.dev");
@@ -981,7 +1015,7 @@ void sf_snap_free_loaded(SfSnapNode *root)
     g_free(root);
 }
 
-int sf_exclude_reload(const char *dir, Error **errp)
+int sf_exclude_reload(const char *dir, bool restore_content, Error **errp)
 {
     char *mpath = g_build_filename(dir, "manifest.json", NULL);
     gchar *jstr = NULL;
@@ -991,6 +1025,8 @@ int sf_exclude_reload(const char *dir, Error **errp)
     QDict *man;
     QList *ex;
     const QListEntry *e;
+    gchar *content = NULL;
+    gsize content_len = 0;
     int ret = -1;
 
     if (!g_file_get_contents(mpath, &jstr, &jlen, &gerr)) {
@@ -1010,6 +1046,22 @@ int sf_exclude_reload(const char *dir, Error **errp)
     if (!man) {
         error_setg(errp, "sf_exclude_reload: manifest is not a JSON object");
         goto out;
+    }
+    if (restore_content) {
+        char *path;
+        if (!qdict_get_try_bool(man, "exclude_content", false)) {
+            error_setg(errp, "sf_exclude_reload: content was not persisted");
+            goto out;
+        }
+        path = g_build_filename(dir, "exclude.ram", NULL);
+        if (!g_file_get_contents(path, &content, &content_len, &gerr)) {
+            error_setg(errp, "sf_exclude_reload: read %s: %s", path,
+                       gerr->message);
+            g_error_free(gerr);
+            g_free(path);
+            goto out;
+        }
+        g_free(path);
     }
 
     /* Rebuild from a clean slate: block-relative (block,off) → live host base. */
@@ -1034,10 +1086,20 @@ int sf_exclude_reload(const char *dir, Error **errp)
             }
             sf_exclude_add((uint64_t)(uintptr_t)((uint8_t *)sf_blocks[bid].host + off),
                            size, (uint32_t)qdict_get_try_int(ed, "buf_id", 0));
+            if (restore_content) {
+                uint64_t data_off = (uint64_t)qdict_get_try_int(ed, "data_off", -1);
+                if (data_off > content_len || size > content_len - data_off) {
+                    error_setg(errp, "sf_exclude_reload: content range out of bounds");
+                    goto out;
+                }
+                memcpy((uint8_t *)sf_blocks[bid].host + off,
+                       content + data_off, size);
+            }
         }
     }
     ret = 0;
 out:
+    g_free(content);
     qobject_unref(o);
     return ret;
 }

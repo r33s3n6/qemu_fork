@@ -1366,7 +1366,7 @@ static void sf_selftest_persist(Monitor *mon, bool *all_ok)
     root = sf_active;
     while (root->parent) { root = root->parent; }
 
-    if (sf_snap_persist(root, dir, &err) < 0) {
+    if (sf_snap_persist(root, dir, false, &err) < 0) {
         report(mon, all_ok, "G persist", false, error_get_pretty(err));
         error_free(err); goto out;
     }
@@ -1512,12 +1512,12 @@ static void sf_selftest_persist(Monitor *mon, bool *all_ok)
                 if (sf_snap_promote(fC, fdir, &err) < 0) {
                     prom_ok = false; error_free(err); err = NULL; break;
                 }
-                if (sf_cold_start(fdir, b_id, &err) < 0) {
+                if (sf_cold_start(fdir, b_id, false, &err) < 0) {
                     error_free(err); err = NULL; break;
                 }
                 cold_b = (sf_rd32(SF_ST_BASE) == vB);
                 if (!cold_b) { break; }
-                if (sf_cold_start(fdir, c_id, &err) < 0) {
+                if (sf_cold_start(fdir, c_id, false, &err) < 0) {
                     error_free(err); err = NULL; break;
                 }
                 cold_c = (sf_rd32(SF_ST_BASE) == vC);
@@ -1652,9 +1652,10 @@ static void sf_selftest_cold_start(Monitor *mon, bool *all_ok)
         void *hx = sf_gpa_to_host(SF_ST_BASE + SF_ST_PAGE);
         if (hx) {
             sf_exclude_add((uint64_t)(uintptr_t)hx, SF_ST_PAGE, 7);
+            *(uint32_t *)hx = 0x4e525346U;
         }
     }
-    if (sf_snap_persist(root, dir, &err) < 0) {
+    if (sf_snap_persist(root, dir, true, &err) < 0) {
         report(mon, all_ok, "8 cold-start", false, error_get_pretty(err));
         error_free(err);
         goto out;
@@ -1666,8 +1667,14 @@ static void sf_selftest_cold_start(Monitor *mon, bool *all_ok)
         goto out;
     }
     hot = sf_rd32(SF_ST_BASE);
+    {
+        void *hx = sf_gpa_to_host(SF_ST_BASE + SF_ST_PAGE);
+        if (hx) {
+            *(uint32_t *)hx = 0xdeadbeefU;
+        }
+    }
 
-    if (sf_cold_start(dir, L1->id, &err) < 0) {
+    if (sf_cold_start(dir, L1->id, true, &err) < 0) {
         report(mon, all_ok, "8 cold-start", false, error_get_pretty(err));
         error_free(err);
         goto out;
@@ -1686,10 +1693,14 @@ static void sf_selftest_cold_start(Monitor *mon, bool *all_ok)
         snprintf(buf, sizeof(buf), "count=%zu hit=%d",
                  sf_exclude_count(), (hx && sf_excluded(hx)));
         report(mon, all_ok, "8 exclude-zone rebuilt from manifest", excl_ok, buf);
+        bool content_ok = hx && *(uint32_t *)hx == 0x4e525346U;
+        snprintf(buf, sizeof(buf), "value=0x%08x",
+                 hx ? *(uint32_t *)hx : 0);
+        report(mon, all_ok, "8 exclude content optional restore", content_ok, buf);
     }
 
     {
-        bool rejected = (sf_cold_start(dir, 0x7ffffffeU, &err) < 0);
+        bool rejected = (sf_cold_start(dir, 0x7ffffffeU, false, &err) < 0);
         snprintf(buf, sizeof(buf), "invalid-id rejected=%d", rejected);
         report(mon, all_ok, "8-neg cold-start bad-id teeth", rejected, buf);
         error_free(err);

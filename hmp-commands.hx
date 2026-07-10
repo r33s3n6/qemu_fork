@@ -396,17 +396,17 @@ ERST
 
     {
         .name       = "sf_cold_start",
-        .args_type  = "dir:F,id:i?",
-        .params     = "dir [id]",
-        .help       = "sf (M3): cold-start a persisted snapshot tree and restore to id",
+        .args_type  = "dir:F,id:i?,restore-nr:b?",
+        .params     = "dir [id] [restore-nr]",
+        .help       = "sf (M3): cold-start tree; optionally restore NO_RESTORE content",
         .cmd        = hmp_sf_cold_start,
     },
 
     {
         .name       = "sf_persist",
-        .args_type  = "dir:F",
-        .params     = "dir",
-        .help       = "sf (M3): persist the current snapshot tree to dir",
+        .args_type  = "dir:F,save-nr:b?",
+        .params     = "dir [save-nr]",
+        .help       = "sf (M3): persist tree; optionally save NO_RESTORE content",
         .cmd        = hmp_sf_persist,
     },
 

@@ -35,7 +35,8 @@ static int sf_cold_remap_live_ram(int fd, Error **errp)
     return 0;
 }
 
-int sf_cold_start(const char *dir, uint32_t dst_id, Error **errp)
+int sf_cold_start(const char *dir, uint32_t dst_id, bool restore_exclude,
+                  Error **errp)
 {
     SfSnapNode *loaded = NULL;
     SfSnapNode *target;
@@ -81,7 +82,7 @@ int sf_cold_start(const char *dir, uint32_t dst_id, Error **errp)
     /* Rebuild the NO_RESTORE table from the manifest before restore, else a
      * worker resuming from a snapshot (guest not re-running REGISTER_BUF) has an
      * empty exclude table and restore rolls back its task buffer (§4.2-3). */
-    if (sf_exclude_reload(dir, errp) < 0) {
+    if (sf_exclude_reload(dir, restore_exclude, errp) < 0) {
         goto out;
     }
     if (sf_rootstore_open_file(&loaded->ram, root_path, errp) < 0) {

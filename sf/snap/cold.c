@@ -3,6 +3,7 @@
  * Clean-room: no QEMU-Nyx code.
  */
 #include "qemu/osdep.h"
+#include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "system/runstate.h"
 #include "system/kvm.h"
@@ -196,8 +197,15 @@ int sf_cold_start(const char *dir, uint32_t dst_id, bool restore_exclude,
     }
     if (skip_checkpoint_outl && kvm_enabled() &&
         sf_kvm_skip_checkpoint_outl(first_cpu) < 0) {
-        error_setg(errp, "sf_cold_start: restored checkpoint RIP is invalid");
-        goto out;
+        /* Production guests are snapshotted at 0x520 checkpoint outl. Experimental
+         * smoke (e.g. tsc-scale after cold-start) may snapshot mid-userspace;
+         * SF_COLD_ALLOW_ANY_RIP=1 skips the RIP check (resume at snapshotted PC). */
+        if (getenv("SF_COLD_ALLOW_ANY_RIP")) {
+            warn_report("SF_COLD_ALLOW_ANY_RIP: resume at non-checkpoint RIP");
+        } else {
+            error_setg(errp, "sf_cold_start: restored checkpoint RIP is invalid");
+            goto out;
+        }
     }
     /* Dim-A: warm host pages before first guest race window (opt-in). */
     sf_prefault_after_cold_start(target);

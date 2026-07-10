@@ -319,9 +319,23 @@ static int cpu_post_load(void *opaque, int version_id)
 
     if (env->tsc_khz && env->user_tsc_khz &&
         env->tsc_khz != env->user_tsc_khz) {
-        error_report("Mismatch between user-specified TSC frequency and "
-                     "migrated TSC frequency");
-        return -EINVAL;
+        /*
+         * Stock sanity check: migrated tsc_khz must match -cpu tsc-frequency.
+         * SF_TSC_FREQ_ALLOW_MISMATCH=1 (sf / cold-start scale matrix): keep the
+         * *user* frequency so a shared snapshot can be resumed under a different
+         * SCALE. user_tsc_khz is documented "for sanity check only"; overwrite
+         * env->tsc_khz so KVM_SET_TSC_KHZ / CPUID use the cmdline rate.
+         */
+        if (getenv("SF_TSC_FREQ_ALLOW_MISMATCH")) {
+            warn_report("SF_TSC_FREQ_ALLOW_MISMATCH: tsc_khz migrated=%" PRId64
+                        " user=%" PRId64 " → use user",
+                        env->tsc_khz, env->user_tsc_khz);
+            env->tsc_khz = env->user_tsc_khz;
+        } else {
+            error_report("Mismatch between user-specified TSC frequency and "
+                         "migrated TSC frequency");
+            return -EINVAL;
+        }
     }
 
     if (env->fpregs_format_vmstate) {

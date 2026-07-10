@@ -80,7 +80,10 @@ struct SfRestoreStore { const SfRestoreStoreOps *ops; };
  *  - BLIND (ALL_HOT): after_restore keeps pages writable (no reset); plan grows
  *    to the active layer's footprint, drain goes ~empty in steady state.
  *    SF_RESET_EVERY_N=N (BLIND only): every N in-place restores, reset_ring+clear
- *    (n=1 ≡ FULL; n=0/unset = pure blind). Bounds long-run W drift.
+ *    (n=1 ≡ FULL; n=0/unset = pure blind). Bounds long-run W drift (random spikes).
+ *    SF_WARMUP_RESET=K (BLIND only): one-shot reset_ring+clear after K in-place
+ *    rounds (shed cold-start first-window tax); then policy continues. Orthogonal
+ *    to reset_every_n (warmup once @K, then every N). Aggregate steady from K+1.
  *  - FULL: after_restore resets + clears; next round ∝ this round's dirty.
  */
 typedef enum { SF_FLAT_FULL, SF_FLAT_BLIND } SfFlatPolicy;
@@ -102,7 +105,7 @@ void sf_track_end(void);
 
 void sf_track_drain(void);                        /* ring → store->note_batch */
 const SfRestorePlan *sf_track_plan(void *target); /* store->plan (live-dirty set) */
-void sf_track_apply(const SfPlanPage *pages, size_t n);  /* 2-thread memcpy */
+void sf_track_apply(const SfPlanPage *pages, size_t n);  /* memcpy; SF_APPLY_THREADS=1|2 */
 size_t sf_track_after_restore(void *target);      /* store->after_restore; #reprotect */
 void sf_track_after_drain(void);                  /* store->after_drain (ring-full) */
 uint8_t *sf_track_resolve(void *target, void *host); /* for the snap layer's path pages */

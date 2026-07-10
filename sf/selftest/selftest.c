@@ -226,10 +226,32 @@ static void sf_selftest_track(Monitor *mon, bool *all_ok)
             full = full && keep1 && cleared && fresh2;
             o->free(st);
         }
+
+        /* SF_WARMUP_RESET=2: keep once, one-shot clear on 2nd, then pure-blind
+         * (3rd keep; no further reset without reset_every_n). */
+        {
+            struct sf_tst_rctx c6 = { region, shadow, 0 };
+            g_unsetenv("SF_RESET_EVERY_N");
+            g_setenv("SF_WARMUP_RESET", "2", 1);
+            st = sf_flat_store_new(&blk, 1, sf_tst_resolve, &c6, SF_FLAT_BLIND);
+            g_unsetenv("SF_WARMUP_RESET");
+            o = st->ops;
+            o->set_active(st, tgt);
+            o->note_batch(st, b1, 3);
+            o->after_restore(st, tgt);   /* 1st: keep */
+            bool wkeep1 = (o->plan(st, tgt)->n == 2);
+            o->after_restore(st, tgt);   /* 2nd: one-shot reset+clear */
+            bool wcleared = (o->plan(st, tgt)->n == 0);
+            o->note_batch(st, b1, 3);
+            o->after_restore(st, tgt);   /* 3rd: pure blind, keep */
+            bool wkeep3 = (o->plan(st, tgt)->n == 2);
+            full = full && wkeep1 && wcleared && wkeep3;
+            o->free(st);
+        }
     }
 
     snprintf(buf, sizeof(buf), "dedup+incremental (resolves=%d) blind-keep%s",
-             c.calls, kvm_enabled() ? "" : " + full-clear + rebase-switch + pos-split + reset_every_n");
+             c.calls, kvm_enabled() ? "" : " + full-clear + rebase-switch + pos-split + reset_every_n + warmup_reset");
     report(mon, all_ok, "R3 flat-store logic", ok && full && rebase && possplit, buf);
     g_free(region);
     g_free(shadow);

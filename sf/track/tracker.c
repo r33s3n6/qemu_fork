@@ -131,10 +131,10 @@ void sf_track_invalidate(void *target)
     }
 }
 
-/* ---- 2-thread apply worker (moved from snap/restore.c) --------------------- *
- * main thread + one persistent background thread = the measured ~×2 sweet spot
- * (archive 2026-06-21-08); more threads saturate memory bandwidth. Two-pass
- * (resolve-all in the store's plan, then memcpy-all here) beats interleaving.
+/* ---- apply memcpy: default 2-thread, SF_APPLY_THREADS=1 forces single-thread *
+ * main + one persistent background worker = measured ~×2 sweet spot
+ * (archive 2026-06-21-08). SF_APPLY_THREADS=1 = no background thread (all
+ * memcpy on the caller). Two-pass (resolve-all in plan, then memcpy-all).
  */
 static void sf_copy_slice(const SfPlanPage *pages, size_t start, size_t end)
 {
@@ -144,6 +144,24 @@ static void sf_copy_slice(const SfPlanPage *pages, size_t start, size_t end)
             memcpy(pages[i].dst, pages[i].src, psize);
         }
     }
+}
+
+/* 1 = single-thread (no bg worker); 2 = default dual-thread. Read once. */
+static int sf_apply_nthreads(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("SF_APPLY_THREADS");
+        cached = 2;
+        if (e && *e) {
+            char *end = NULL;
+            long v = strtol(e, &end, 10);
+            if (end != e && *end == '\0' && (v == 1 || v == 2)) {
+                cached = (int)v;
+            }
+        }
+    }
+    return cached;
 }
 
 typedef struct {
@@ -190,7 +208,8 @@ void sf_track_apply(const SfPlanPage *pages, size_t n)
     if (!n) {
         return;
     }
-    if (n < SF_APPLY_PARALLEL_MIN) {
+    /* SF_APPLY_THREADS=1: no background thread; always single-thread memcpy. */
+    if (sf_apply_nthreads() == 1 || n < SF_APPLY_PARALLEL_MIN) {
         sf_copy_slice(pages, 0, n);
         return;
     }

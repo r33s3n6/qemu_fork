@@ -1,10 +1,14 @@
 /*
  * sf/track/flat_store — first restore-store backend (plan 2026-07-08-03 §4 +
- * 2026-07-09-01 C1). A persistent {dst,src} plan + page-index membership
- * bitmap for O(1) dedup. src filled lazily on plan() and cached across rounds.
+ * 2026-07-09-01 C1 + 2026-07-10-02 warmup-reset). A persistent {dst,src} plan
+ * + page-index membership bitmap for O(1) dedup. src filled lazily on plan()
+ * and cached across rounds.
  * Policies: FULL = after_restore reset_ring+clear every round; BLIND = keep
  * writable (SF_BLIND=1); BLIND+SF_RESET_EVERY_N=N = reprotect+clear every N
- * in-place restores (n=1 ≡ FULL; n=0/unset = pure blind). Clean-room: no Nyx.
+ * in-place restores (n=1 ≡ FULL; n=0/unset = pure blind);
+ * BLIND+SF_WARMUP_RESET=K = one-shot full-reset after K in-place rounds
+ * (shed cold-start first-window tax capitalised into blind union; orthogonal
+ * to reset_every_n: warmup once, then periodic). Clean-room: no Nyx.
  */
 #include "qemu/osdep.h"
 #include "qemu/bitmap.h"
@@ -23,6 +27,11 @@ typedef struct {
      * every N in-place restores (n=1 ≡ FULL). Read once from SF_RESET_EVERY_N. */
     size_t            reset_every_n;
     size_t            inplace_since_reset; /* in-place after_restore count since clear */
+    /* BLIND only: one-shot reset_ring+clear after K in-place rounds
+     * (SF_WARMUP_RESET). 0/unset = off. Pending warmup suppresses reset_every_n
+     * so both levers compose as "once @K, then every N". */
+    size_t            warmup_reset_k;
+    bool              warmup_reset_done;
 
     unsigned long    *member;        /* page-idx bitmap: in this generation's set */
     SfPlanPage       *plan;          /* insertion-ordered {dst,src} */
@@ -159,6 +168,20 @@ static size_t flat_after_restore(SfRestoreStore *s, void *target)
     }
     if (f->policy == SF_FLAT_BLIND) {
         f->inplace_since_reset++;
+        /* Warmup-reset @K (plan 2026-07-10-02): one-shot full-reset after K
+         * in-place rounds. Rebuilds blind baseline so cold-start first-window
+         * tax is not permanently capitalised into member. While pending, skip
+         * reset_every_n (compose = once @K then every N). */
+        if (f->warmup_reset_k > 0 && !f->warmup_reset_done) {
+            if (f->inplace_since_reset >= f->warmup_reset_k) {
+                n_reprotect = sf_kvm_reset_ring();
+                flat_clear_generation(f);
+                f->warmup_reset_done = true;
+                return n_reprotect;
+            }
+            f->pos = f->n;
+            return 0;
+        }
         /* C1 reset_every_n: every N in-place rounds reprotect + clear (n=1 ≡ FULL).
          * n=0 (default) = pure blind — keep writable, plan accumulates. */
         if (f->reset_every_n > 0 &&
@@ -249,15 +272,23 @@ SfRestoreStore *sf_flat_store_new(const SfBlockReg *blocks, size_t n_blocks,
     f->resolve = resolve;
     f->user = user;
     f->policy = policy;
-    /* SF_RESET_EVERY_N only meaningful under BLIND (FULL already resets every 1).
-     * 0 / unset = pure blind; N≥1 = periodic reprotect+clear every N in-place. */
-    {
+    /* SF_RESET_EVERY_N / SF_WARMUP_RESET only meaningful under BLIND
+     * (FULL already resets every 1). 0 / unset = off. */
+    if (policy == SF_FLAT_BLIND) {
         const char *ren = getenv("SF_RESET_EVERY_N");
-        if (ren && *ren && policy == SF_FLAT_BLIND) {
+        if (ren && *ren) {
             char *end = NULL;
             unsigned long v = strtoul(ren, &end, 10);
             if (end != ren && *end == '\0') {
                 f->reset_every_n = (size_t)v;
+            }
+        }
+        const char *wrk = getenv("SF_WARMUP_RESET");
+        if (wrk && *wrk) {
+            char *end = NULL;
+            unsigned long v = strtoul(wrk, &end, 10);
+            if (end != wrk && *end == '\0') {
+                f->warmup_reset_k = (size_t)v;
             }
         }
     }

@@ -270,11 +270,11 @@ static MemoryRegion sf_nr_io;
  * (vm_stop while restoring, generation bump, vm_start). */
 static void sf_boot_cold_start_bh(void *opaque)
 {
-    const char *dir = sf_config_boot_dir();
+    const SfConfig *c = sf_config();
     Error *err = NULL;
     bool was_running = runstate_is_running();
 
-    if (dir[0] == '\0') {
+    if (c->common_dir[0] == '\0' && c->private_dir[0] == '\0') {
         error_report("sf-config: cold_start_on_boot set but no "
                      "SF_COMMON_DIR/SF_PRIVATE_DIR");
         exit(1);
@@ -282,14 +282,16 @@ static void sf_boot_cold_start_bh(void *opaque)
     if (was_running) {
         vm_stop(RUN_STATE_RESTORE_VM);
     }
-    if (sf_cold_start(dir, sf_config()->initial_node, true, true, &err) < 0) {
+    if (sf_cold_start(c->common_dir, c->private_dir, c->initial_node,
+                      true, true, &err) < 0) {
         error_report("sf-config: boot cold-start failed: %s",
                      error_get_pretty(err));
         exit(1);
     }
     sf_cp_generation_inc();
-    fprintf(stderr, "sf-config: boot cold-start ok dir=%s node=%u\n",
-            dir, sf_config()->initial_node);
+    fprintf(stderr, "sf-config: boot cold-start ok common=%s private=%s node=%u\n",
+            c->common_dir[0] ? c->common_dir : "(none)",
+            c->private_dir[0] ? c->private_dir : "(none)", c->initial_node);
     if (was_running) {
         vm_start();
     }

@@ -226,7 +226,12 @@ bool sf_gate_boundary_enter(uint64_t val)
 
 static void sf_gate_do_persist(void)
 {
-    const char *dir = sf_config()->private_dir;
+    const SfConfig *c = sf_config();
+    const char *dir = c->private_dir;
+    /* Two-dir when a distinct read-only common base is configured: persist only
+     * this worker's private nodes, back-referencing common (plan 04 §2.4). */
+    const char *common_ref = (c->common_dir[0] && strcmp(c->common_dir, dir))
+                             ? c->common_dir : NULL;
     SfSnapNode *root;
     Error *err = NULL;
 
@@ -241,7 +246,7 @@ static void sf_gate_do_persist(void)
     for (root = sf_active; root->parent; root = root->parent) {
         /* walk to root */
     }
-    if (sf_snap_persist(root, dir, false, &err) < 0) {
+    if (sf_snap_persist(root, dir, false, common_ref, &err) < 0) {
         fprintf(stderr, "sf-gate: persist %s failed: %s\n",
                 dir, error_get_pretty(err));
         error_free(err);
@@ -253,7 +258,10 @@ static void sf_gate_do_persist(void)
 
 static void sf_gate_do_promote(const SfCtlCmd *cmd)
 {
-    const char *dir = sf_config()->private_dir;
+    const SfConfig *c = sf_config();
+    const char *dir = c->private_dir;
+    const char *common_ref = (c->common_dir[0] && strcmp(c->common_dir, dir))
+                             ? c->common_dir : NULL;
     SfSnapNode *node = cmd->has_id ? sf_node_find(cmd->id) : sf_active;
     Error *err = NULL;
 
@@ -261,7 +269,7 @@ static void sf_gate_do_promote(const SfCtlCmd *cmd)
         sf_control_reply(SF_ST_ERROR, SF_ERR_PROMOTE_FAILED);
         return;
     }
-    if (sf_snap_promote(node, dir, &err) < 0) {
+    if (sf_snap_promote(node, dir, common_ref, &err) < 0) {
         fprintf(stderr, "sf-gate: promote %s failed: %s\n",
                 dir, error_get_pretty(err));
         error_free(err);

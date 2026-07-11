@@ -40,10 +40,6 @@ void sf_config_load(void);
 /* The live config (never NULL after sf_config_load; zero-valued before). */
 const SfConfig *sf_config(void);
 
-/* Dir to cold-start from at boot: common_dir if set, else private_dir. Empty
- * string if neither is set (caller treats as "no boot cold-start possible"). */
-const char *sf_config_boot_dir(void);
-
 /* Runtime setter for the debug HMP `sf_config <key> <val>`. Returns 0 on success,
  * -1 on unknown key / bad value (errp set). Keys match the env suffix lowercased:
  * common_dir/private_dir/resume_timeout_ms/gate/cold_start_on_boot/initial_node. */

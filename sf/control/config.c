@@ -69,14 +69,6 @@ const SfConfig *sf_config(void)
     return &sf_cfg;
 }
 
-const char *sf_config_boot_dir(void)
-{
-    if (sf_cfg.common_dir[0]) {
-        return sf_cfg.common_dir;
-    }
-    return sf_cfg.private_dir;   /* "" if neither set */
-}
-
 int sf_config_set(const char *key, const char *val, Error **errp)
 {
     if (!strcmp(key, "common_dir")) {

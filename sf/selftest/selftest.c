@@ -1388,7 +1388,7 @@ static void sf_selftest_persist(Monitor *mon, bool *all_ok)
     root = sf_active;
     while (root->parent) { root = root->parent; }
 
-    if (sf_snap_persist(root, dir, false, &err) < 0) {
+    if (sf_snap_persist(root, dir, false, NULL, &err) < 0) {
         report(mon, all_ok, "G persist", false, error_get_pretty(err));
         error_free(err); goto out;
     }
@@ -1423,20 +1423,20 @@ static void sf_selftest_persist(Monitor *mon, bool *all_ok)
         if (!pdir || !orphan_dir) {
             report(mon, all_ok, "G promote", false, "g_dir_make_tmp failed");
         } else {
-            rejected = (sf_snap_promote(L2, pdir, &err) < 0);
+            rejected = (sf_snap_promote(L2, pdir, NULL, &err) < 0);
             error_free(err);
             err = NULL;
-            root_ok = (sf_snap_promote(root, pdir, &err) == 0);
+            root_ok = (sf_snap_promote(root, pdir, NULL, &err) == 0);
             error_free(err);
             err = NULL;
-            orphan_rejected = (sf_snap_promote(L1, orphan_dir, &err) < 0);
+            orphan_rejected = (sf_snap_promote(L1, orphan_dir, NULL, &err) < 0);
             error_free(err);
             err = NULL;
             promote_ok = rejected &&
                  root_ok &&
                  orphan_rejected &&
-                 sf_snap_promote(L1, pdir, &err) == 0 &&
-                 sf_snap_promote(L2, pdir, &err) == 0 &&
+                 sf_snap_promote(L1, pdir, NULL, &err) == 0 &&
+                 sf_snap_promote(L2, pdir, NULL, &err) == 0 &&
                  sf_snap_load(pdir, &pload, &err) == 0;
             if (promote_ok) {
                 SfSnapNode *pL1 = QLIST_FIRST(&pload->children);
@@ -1522,24 +1522,24 @@ static void sf_selftest_persist(Monitor *mon, bool *all_ok)
                 if (!fC) { fok = false; break; }
                 b_id = fB->id; c_id = fC->id;
 
-                if (sf_snap_promote(froot, fdir, &err) < 0) {
+                if (sf_snap_promote(froot, fdir, NULL, &err) < 0) {
                     prom_ok = false; error_free(err); err = NULL; break;
                 }
-                if (sf_snap_promote(fA, fdir, &err) < 0) {
+                if (sf_snap_promote(fA, fdir, NULL, &err) < 0) {
                     prom_ok = false; error_free(err); err = NULL; break;
                 }
-                if (sf_snap_promote(fB, fdir, &err) < 0) {
+                if (sf_snap_promote(fB, fdir, NULL, &err) < 0) {
                     prom_ok = false; error_free(err); err = NULL; break;
                 }
-                if (sf_snap_promote(fC, fdir, &err) < 0) {
+                if (sf_snap_promote(fC, fdir, NULL, &err) < 0) {
                     prom_ok = false; error_free(err); err = NULL; break;
                 }
-                if (sf_cold_start(fdir, b_id, false, false, &err) < 0) {
+                if (sf_cold_start(fdir, NULL, b_id, false, false, &err) < 0) {
                     error_free(err); err = NULL; break;
                 }
                 cold_b = (sf_rd32(SF_ST_BASE) == vB);
                 if (!cold_b) { break; }
-                if (sf_cold_start(fdir, c_id, false, false, &err) < 0) {
+                if (sf_cold_start(fdir, NULL, c_id, false, false, &err) < 0) {
                     error_free(err); err = NULL; break;
                 }
                 cold_c = (sf_rd32(SF_ST_BASE) == vC);
@@ -1577,13 +1577,13 @@ static void sf_selftest_persist(Monitor *mon, bool *all_ok)
                 if (!cL2) { cok = false; break; }
                 croot = sf_active;
                 while (croot->parent) { croot = croot->parent; }
-                if (sf_snap_promote(croot, cdir, &err) < 0) {
+                if (sf_snap_promote(croot, cdir, NULL, &err) < 0) {
                     cok = false; error_free(err); err = NULL; break;
                 }
-                if (sf_snap_promote(cL1, cdir, &err) < 0) {
+                if (sf_snap_promote(cL1, cdir, NULL, &err) < 0) {
                     cok = false; error_free(err); err = NULL; break;
                 }
-                if (sf_snap_promote(cL2, cdir, &err) < 0) {
+                if (sf_snap_promote(cL2, cdir, NULL, &err) < 0) {
                     cok = false; error_free(err); err = NULL; break;
                 }
                 /* Append a half line (no newline) — a crash mid-append. */
@@ -1677,7 +1677,7 @@ static void sf_selftest_cold_start(Monitor *mon, bool *all_ok)
             *(uint32_t *)hx = 0x4e525346U;
         }
     }
-    if (sf_snap_persist(root, dir, true, &err) < 0) {
+    if (sf_snap_persist(root, dir, true, NULL, &err) < 0) {
         report(mon, all_ok, "8 cold-start", false, error_get_pretty(err));
         error_free(err);
         goto out;
@@ -1696,7 +1696,7 @@ static void sf_selftest_cold_start(Monitor *mon, bool *all_ok)
         }
     }
 
-    if (sf_cold_start(dir, L1->id, true, false, &err) < 0) {
+    if (sf_cold_start(dir, NULL, L1->id, true, false, &err) < 0) {
         report(mon, all_ok, "8 cold-start", false, error_get_pretty(err));
         error_free(err);
         goto out;
@@ -1722,7 +1722,7 @@ static void sf_selftest_cold_start(Monitor *mon, bool *all_ok)
     }
 
     {
-        bool rejected = (sf_cold_start(dir, 0x7ffffffeU, false, false, &err) < 0);
+        bool rejected = (sf_cold_start(dir, NULL, 0x7ffffffeU, false, false, &err) < 0);
         snprintf(buf, sizeof(buf), "invalid-id rejected=%d", rejected);
         report(mon, all_ok, "8-neg cold-start bad-id teeth", rejected, buf);
         error_free(err);
@@ -1733,6 +1733,135 @@ out:
     sf_exclude_clear();
     sf_rmrf_persist_dir(dir);
     g_free(dir);
+}
+
+/* ---- two-dir common/private cold-start (S3 闸①, plan 2026-07-11-04 §2.2) -----
+ * Build a worker-0 common base (root + C1), persist it to common_dir; then, as a
+ * non-zero worker, branch a PRIVATE layer P1 off C1 and persist it two-dir to
+ * private_dir (common_ref = common_dir). A cold-start given BOTH dirs must graft
+ * P1 onto the loaded common tree and restore P1's exact RAM.
+ * Teeth: (a) private_dir must NOT hold the common prefix (no root.ram, no C1.ram)
+ * — proves the skip; (b) a private id that was never persisted is rejected.
+ */
+static void sf_selftest_cold_start_twodir(Monitor *mon, bool *all_ok)
+{
+    char buf[192];
+    Error *err = NULL;
+    SfSnapNode *C1, *P1, *root;
+    char *cdir = NULL, *pdir = NULL, *p_root = NULL, *p_cnode = NULL;
+    uint32_t v_p1, hot, cold, c1_id, p1_id;
+
+    if (!kvm_enabled() || !sf_kvm_dirty_ring_enabled()) {
+        monitor_printf(mon, "sf: selftest[cold-start-2dir]: SKIPPED "
+                       "(needs KVM + dirty ring)\n");
+        return;
+    }
+
+    cdir = g_dir_make_tmp("sf-common-XXXXXX", NULL);
+    pdir = g_dir_make_tmp("sf-private-XXXXXX", NULL);
+    if (!cdir || !pdir) {
+        report(mon, all_ok, "2dir cold-start", false, "g_dir_make_tmp failed");
+        goto out;
+    }
+
+    setenv("SF_ROOT_DIR", cdir, 1);
+    if (!sf_snap_root(mon)) {
+        unsetenv("SF_ROOT_DIR");
+        *all_ok = false;
+        goto out;
+    }
+    unsetenv("SF_ROOT_DIR");
+
+    /* Common base: worker 0 (default). root + one common diff layer C1. */
+    sf_run_guest_ms(20);
+    C1 = sf_make_layer(mon, all_ok);
+    if (!C1) {
+        goto out;
+    }
+    c1_id = C1->id;
+    root = sf_active;
+    while (root->parent) {
+        root = root->parent;
+    }
+    if (sf_snap_persist(root, cdir, false, NULL, &err) < 0) {
+        report(mon, all_ok, "2dir common persist", false, error_get_pretty(err));
+        error_free(err);
+        goto out;
+    }
+
+    /* Private layer P1: a non-zero worker slot branches off the common C1. */
+    sf_node_set_worker_id(1);
+    sf_run_guest_ms(20);
+    P1 = sf_make_layer(mon, all_ok);
+    if (!P1) {
+        goto out;
+    }
+    p1_id = P1->id;
+    v_p1 = sf_rd32(SF_ST_BASE);
+    if (SF_ID_WORKER(p1_id) != 1) {
+        report(mon, all_ok, "2dir private is worker!=0", false, "worker==0");
+        goto out;
+    }
+    /* Two-dir persist: skip_common → only P1 written to private_dir. */
+    if (sf_snap_persist(root, pdir, false, cdir, &err) < 0) {
+        report(mon, all_ok, "2dir private persist", false, error_get_pretty(err));
+        error_free(err);
+        goto out;
+    }
+
+    /* Teeth (a): the common prefix must not have been copied into private_dir. */
+    {
+        char cname[32];
+        p_root = g_build_filename(pdir, "root.ram", NULL);
+        snprintf(cname, sizeof(cname), "nodes/%u.ram", c1_id);
+        p_cnode = g_build_filename(pdir, cname, NULL);
+        bool no_root = !g_file_test(p_root, G_FILE_TEST_EXISTS);
+        bool no_cnode = !g_file_test(p_cnode, G_FILE_TEST_EXISTS);
+        snprintf(buf, sizeof(buf), "no_root.ram=%d no_common_node=%d",
+                 no_root, no_cnode);
+        report(mon, all_ok, "2dir private skips common prefix",
+               no_root && no_cnode, buf);
+    }
+
+    /* Hot baseline, then move RAM away so cold-start must reconstruct P1. */
+    hot = v_p1;
+    if (sf_snap_delta_restore(c1_id, &err) < 0) {
+        report(mon, all_ok, "2dir hot baseline", false, error_get_pretty(err));
+        error_free(err);
+        goto out;
+    }
+
+    if (sf_cold_start(cdir, pdir, p1_id, false, false, &err) < 0) {
+        report(mon, all_ok, "2dir cold-start", false, error_get_pretty(err));
+        error_free(err);
+        goto out;
+    }
+    cold = sf_rd32(SF_ST_BASE);
+    snprintf(buf, sizeof(buf), "hot=%u cold=%u P1=%u C1=%u", hot, cold, p1_id, c1_id);
+    report(mon, all_ok, "2dir cold-start equivalence", cold == hot, buf);
+
+    /* Teeth (b): a private id never persisted must be rejected. */
+    {
+        bool rejected = (sf_cold_start(cdir, pdir, SF_ID(1, 99), false, false,
+                                       &err) < 0);
+        snprintf(buf, sizeof(buf), "missing-private rejected=%d", rejected);
+        report(mon, all_ok, "2dir missing-private teeth", rejected, buf);
+        error_free(err);
+        err = NULL;
+    }
+
+out:
+    sf_node_set_worker_id(0);   /* restore default slot for later tests */
+    g_free(p_root);
+    g_free(p_cnode);
+    if (cdir) {
+        sf_rmrf_persist_dir(cdir);
+        g_free(cdir);
+    }
+    if (pdir) {
+        sf_rmrf_persist_dir(pdir);
+        g_free(pdir);
+    }
 }
 
 /* ---- device stream persist/reparse round-trip (T6 方案 B, plan 07 §1) --------
@@ -1983,6 +2112,7 @@ bool sf_selftest_all(Monitor *mon, Error **errp)
     sf_selftest_ramstore_file(mon, &all_ok);   /* host-only; runs under TCG + KVM */
     sf_selftest_persist(mon, &all_ok);          /* needs KVM + dirty ring */
     sf_selftest_cold_start(mon, &all_ok);       /* needs KVM + dirty ring; destructive */
+    sf_selftest_cold_start_twodir(mon, &all_ok); /* S3 闸① common/private; destructive */
     sf_selftest_dev_stream(mon, &all_ok);       /* TCG only (reparse re-load) */
 
     monitor_printf(mon, "sf: selftest overall: %s\n",

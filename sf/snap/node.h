@@ -53,6 +53,15 @@ typedef uint64_t SfPageKey;
 #define SF_ID_LOCAL(id)   ((uint32_t)(id) & SF_ID_MAX_LOCAL)
 #define SF_ROOT_ID        0u
 
+/*
+ * Per-node origin (plan 2026-07-11-04 §2.2) is DERIVED from the id, not stored:
+ * common nodes (root + the shared read-only base tree, built by the worker-0
+ * base builder) carry worker_id 0; a worker W's private nodes carry worker_id W.
+ * So common ⟺ worker_id == 0. The persist skip (don't re-copy the common prefix
+ * into a worker's private_dir) and the two-dir cold-start load both key off this.
+ */
+#define SF_NODE_IS_COMMON(n)  (SF_ID_WORKER((n)->id) == 0u)
+
 typedef enum {
     SF_SNAP_ROOT = 0,
     SF_SNAP_CLEAN,

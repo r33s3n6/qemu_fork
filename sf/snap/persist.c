@@ -243,9 +243,13 @@ static int sf_manifest_put_exclude(QDict *man, const char *dir,
 
 /* manifest.json header (NO nodes — those are in nodes.log). Written atomically
  * (tmp+rename via g_file_set_contents). Used by sf_snap_persist and by promote
- * on the root (the first promote of a workdir, which establishes the header). */
+ * on the root (the first promote of a workdir, which establishes the header).
+ * @common_ref != NULL marks a two-dir private manifest (plan 04 §2.2): it records
+ * the read-only common base dir instead of a self-contained root.ram, so a
+ * cold-start given only this private_dir can still find its common base. */
 static int sf_manifest_write_header(const char *dir, uint64_t root_ram_len,
-                                    bool save_exclude, Error **errp)
+                                    bool save_exclude, const char *common_ref,
+                                    Error **errp)
 {
     QDict *man = qdict_new();
     GString *json;
@@ -254,7 +258,11 @@ static int sf_manifest_write_header(const char *dir, uint64_t root_ram_len,
 
     qdict_put_int(man, "version", SF_MANIFEST_VERSION);
     qdict_put_int(man, "page_size", qemu_real_host_page_size());
-    qdict_put_int(man, "root_ram_len", (int64_t)root_ram_len);
+    if (common_ref) {
+        qdict_put_str(man, "common", common_ref);
+    } else {
+        qdict_put_int(man, "root_ram_len", (int64_t)root_ram_len);
+    }
     sf_manifest_put_blocks(man);
     if (sf_manifest_put_exclude(man, dir, save_exclude, errp) < 0) {
         qobject_unref(man);
@@ -334,7 +342,7 @@ static int sf_manifest_put_exclude(QDict *man, const char *dir,
  * before its children, so the log is loadable in file order. Sets *ret on first
  * failure. */
 static void sf_persist_walk(SfSnapNode *n, int log_fd, const char *dir,
-                            Error **errp, int *ret)
+                            bool skip_common, Error **errp, int *ret)
 {
     SfSnapNode *child;
     char line[192];
@@ -342,6 +350,17 @@ static void sf_persist_walk(SfSnapNode *n, int log_fd, const char *dir,
     char dname[32];
 
     if (*ret) {
+        return;
+    }
+    /* Two-dir private persist: the common prefix (worker-0 nodes) already lives
+     * read-only in common_dir — don't re-copy it. Skip writing this node but
+     * still recurse so private descendants hanging off it are written; their
+     * records reference the common parent id, resolved via the loaded common
+     * tree at cold-start (plan 04 §2.2/§2.4). */
+    if (skip_common && SF_NODE_IS_COMMON(n)) {
+        QLIST_FOREACH(child, &n->children, sibling) {
+            sf_persist_walk(child, log_fd, dir, skip_common, errp, ret);
+        }
         return;
     }
     if (n->parent && sf_persist_node_ram(dir, n, errp) < 0) {
@@ -368,13 +387,14 @@ static void sf_persist_walk(SfSnapNode *n, int log_fd, const char *dir,
     }
 
     QLIST_FOREACH(child, &n->children, sibling) {
-        sf_persist_walk(child, log_fd, dir, errp, ret);
+        sf_persist_walk(child, log_fd, dir, skip_common, errp, ret);
     }
 }
 
 int sf_snap_persist(SfSnapNode *root, const char *dir, bool save_exclude,
-                    Error **errp)
+                    const char *common_ref, Error **errp)
 {
+    bool skip_common = (common_ref != NULL);
     uint64_t root_len = 0;
     char *ndir, *lpath;
     int log_fd = -1;
@@ -395,11 +415,14 @@ int sf_snap_persist(SfSnapNode *root, const char *dir, bool save_exclude,
         error_setg_errno(errp, errno, "sf_snap_persist: mkdir nodes/");
         return -1;
     }
-    if (sf_persist_root_ram(root, dir, &root_len, errp) < 0) {
+    /* Two-dir private persist skips the common root.ram (it stays read-only in
+     * common_dir); the header records @common_ref instead. */
+    if (!skip_common && sf_persist_root_ram(root, dir, &root_len, errp) < 0) {
         return -1;
     }
     /* Header (no nodes) first; nodes go to a fresh nodes.log below. */
-    if (sf_manifest_write_header(dir, root_len, save_exclude, errp) < 0) {
+    if (sf_manifest_write_header(dir, root_len, save_exclude, common_ref,
+                                 errp) < 0) {
         return -1;
     }
 
@@ -412,7 +435,7 @@ int sf_snap_persist(SfSnapNode *root, const char *dir, bool save_exclude,
     }
 
     ret = 0;
-    sf_persist_walk(root, log_fd, dir, errp, &ret);
+    sf_persist_walk(root, log_fd, dir, skip_common, errp, &ret);
     if (ret == 0 && (fsync(log_fd) < 0)) {
         error_setg_errno(errp, errno, "sf_snap_persist: fsync nodes.log");
         ret = -1;
@@ -523,13 +546,22 @@ static int sf_promote_node_ram(SfSnapNode *n, const char *dir, Error **errp)
 }
 
 static int sf_promote_check_parent_prefix(SfSnapNode *parent, const char *dir,
-                                          Error **errp)
+                                          bool skip_common, Error **errp)
 {
     for (SfSnapNode *n = parent; n; n = n->parent) {
         char name[32];
         char *path;
         bool exists;
 
+        /* Two-dir promote only: a common ancestor's prefix lives read-only in
+         * common_dir, not here — stop checking once we reach it (the whole rest
+         * of the chain up to root is common; plan 04 §2.2 does not re-validate
+         * the common base). In single-dir promote (skip_common=false) every node
+         * is worker 0, so this must stay off or the disconnected-parent tooth
+         * (an absent prefix .ram) would be skipped instead of rejected. */
+        if (skip_common && SF_NODE_IS_COMMON(n)) {
+            break;
+        }
         if (!n->parent) {
             path = g_build_filename(dir, "root.ram", NULL);
         } else {
@@ -547,8 +579,10 @@ static int sf_promote_check_parent_prefix(SfSnapNode *parent, const char *dir,
     return 0;
 }
 
-int sf_snap_promote(SfSnapNode *node, const char *dir, Error **errp)
+int sf_snap_promote(SfSnapNode *node, const char *dir, const char *common_ref,
+                    Error **errp)
 {
+    bool skip_common = (common_ref != NULL);
     char dname[32];
 
     if (!node) {
@@ -571,12 +605,14 @@ int sf_snap_promote(SfSnapNode *node, const char *dir, Error **errp)
         /* Root promote establishes the workdir: write the header (manifest.json)
          * once. Non-root promotes inherit it — the header is tree-level and
          * stable, so they only append their node record. */
-        if (sf_manifest_write_header(dir, sf_blocks_root_len(), false, errp) < 0) {
+        if (sf_manifest_write_header(dir, sf_blocks_root_len(), false, NULL,
+                                     errp) < 0) {
             return -1;
         }
         snprintf(dname, sizeof(dname), "root.dev");
     } else {
-        if (sf_promote_check_parent_prefix(node->parent, dir, errp) < 0) {
+        if (sf_promote_check_parent_prefix(node->parent, dir, skip_common,
+                                           errp) < 0) {
             return -EINVAL;
         }
         if (sf_promote_node_ram(node, dir, errp) < 0) {
@@ -839,7 +875,8 @@ out:
  * For each node: link to parent, open non-root .ram, re-preparse .dev.
  */
 static int sf_node_log_load(const char *dir, GHashTable *byid,
-                            SfSnapNode **root_out, Error **errp)
+                            SfSnapNode **root_out, bool require_root,
+                            Error **errp)
 {
     char *lpath = sf_node_log_path(dir);
     gchar *buf = NULL;
@@ -917,11 +954,13 @@ static int sf_node_log_load(const char *dir, GHashTable *byid,
         /* else: incomplete tail — drop silently. */
     }
 
-    if (!root) {
+    if (require_root && !root) {
         error_setg(errp, "sf_snap_load: no root node in nodes.log");
         goto out;
     }
-    *root_out = root;
+    if (root_out) {
+        *root_out = root;
+    }
     root = NULL;
     ret = 0;
 out:
@@ -978,7 +1017,7 @@ int sf_snap_load(const char *dir, SfSnapNode **root_out, Error **errp)
 
     /* Nodes live in nodes.log now (append-only), not in manifest.json. */
     byid = g_hash_table_new(g_direct_hash, g_direct_equal);
-    if (sf_node_log_load(dir, byid, &root, errp) < 0) {
+    if (sf_node_log_load(dir, byid, &root, true, errp) < 0) {
         goto out;
     }
     *root_out = root;
@@ -993,6 +1032,71 @@ out:
     }
     qobject_unref(o);
     return ret;
+}
+
+/* Index an already-loaded tree by id (for overlay parent resolution). */
+static void sf_index_tree(SfSnapNode *n, GHashTable *byid)
+{
+    SfSnapNode *child;
+    g_hash_table_insert(byid, GUINT_TO_POINTER(n->id), n);
+    QLIST_FOREACH(child, &n->children, sibling) {
+        sf_index_tree(child, byid);
+    }
+}
+
+/* Two-dir cold-start (plan 04 §2.2): load a worker's private overlay from @dir
+ * and graft it onto the already-loaded common tree @base_root. Private nodes'
+ * parent ids resolve against the common tree (or an earlier private node), so
+ * the common tree MUST be loaded first. Only nodes.log + nodes/<id>.{ram,dev}
+ * are read here — the private manifest is not needed (its blocks match live and
+ * its 'common' ref was already consumed to pick @base_root). */
+int sf_snap_load_overlay(const char *dir, SfSnapNode *base_root, Error **errp)
+{
+    char *lpath = sf_node_log_path(dir);
+    bool has_log = g_file_test(lpath, G_FILE_TEST_IS_REGULAR);
+    GHashTable *byid;
+    int ret;
+
+    g_free(lpath);
+    /* An empty private_dir (no nodes.log) is the valid first-boot state: it is
+     * the worker's write target, not yet an overlay. No overlay to graft. */
+    if (!has_log) {
+        return 0;
+    }
+    byid = g_hash_table_new(g_direct_hash, g_direct_equal);
+    sf_index_tree(base_root, byid);
+    ret = sf_node_log_load(dir, byid, NULL, false, errp);
+    g_hash_table_destroy(byid);
+    return ret;
+}
+
+/* Peek a private manifest's 'common' base-dir reference (plan 04 §2.2). Returns
+ * a newly-allocated string, or NULL if the dir has no manifest / no 'common'
+ * field (a self-contained single-dir tree). Never errors — a missing manifest
+ * just means "no ref". */
+char *sf_snap_read_common_ref(const char *dir)
+{
+    char *mpath = g_build_filename(dir, "manifest.json", NULL);
+    gchar *jstr = NULL;
+    gsize jlen = 0;
+    QObject *o;
+    QDict *man;
+    char *ref = NULL;
+
+    if (g_file_get_contents(mpath, &jstr, &jlen, NULL)) {
+        o = qobject_from_json(jstr, NULL);
+        man = o ? qobject_to(QDict, o) : NULL;
+        if (man) {
+            const char *c = qdict_get_try_str(man, "common");
+            if (c && *c) {
+                ref = g_strdup(c);
+            }
+        }
+        qobject_unref(o);
+        g_free(jstr);
+    }
+    g_free(mpath);
+    return ref;
 }
 
 /* Post-order free of a loaded subtree; no tripwire touch (loaded trees are not

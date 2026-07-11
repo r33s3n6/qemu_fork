@@ -250,7 +250,7 @@ void hmp_sf_cold_start(Monitor *mon, const QDict *qdict)
     if (was_running) {
         vm_stop(RUN_STATE_RESTORE_VM);
     }
-    if (sf_cold_start(dir, (uint32_t)id, restore_nr, true, &err) < 0) {
+    if (sf_cold_start(dir, NULL, (uint32_t)id, restore_nr, true, &err) < 0) {
         monitor_printf(mon, "sf: cold-start failed: %s\n", error_get_pretty(err));
         error_free(err);
     } else {
@@ -279,7 +279,7 @@ void hmp_sf_persist(Monitor *mon, const QDict *qdict)
     while (root->parent) {
         root = root->parent;
     }
-    if (sf_snap_persist(root, dir, save_nr, &err) < 0) {
+    if (sf_snap_persist(root, dir, save_nr, NULL, &err) < 0) {
         monitor_printf(mon, "sf: persist failed: %s\n", error_get_pretty(err));
         error_free(err);
         return;
@@ -304,7 +304,7 @@ void hmp_sf_promote(Monitor *mon, const QDict *qdict)
                        id);
         return;
     }
-    if (sf_snap_promote(node, dir, &err) < 0) {
+    if (sf_snap_promote(node, dir, NULL, &err) < 0) {
         monitor_printf(mon, "sf: promote failed: %s\n", error_get_pretty(err));
         error_free(err);
         return;

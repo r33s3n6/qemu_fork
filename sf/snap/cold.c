@@ -127,16 +127,35 @@ static int sf_cold_remap_live_ram(int fd, Error **errp)
     return 0;
 }
 
-int sf_cold_start(const char *dir, uint32_t dst_id, bool restore_exclude,
+int sf_cold_start(const char *common_dir, const char *private_dir,
+                  uint32_t dst_id, bool restore_exclude,
                   bool skip_checkpoint_outl, Error **errp)
 {
     SfSnapNode *loaded = NULL;
     SfSnapNode *target;
     char *root_path = NULL;
+    char *ref = NULL;         /* common base derived from a private manifest */
+    const char *base_dir;     /* holds root.ram + the common tree */
+    const char *overlay_dir;  /* private overlay grafted onto base, or NULL */
     int fd = -1;
     int ret = -1;
 
-    if (!dir || !*dir) {
+    /*
+     * Resolve base (common, read-only, has root.ram) vs overlay (private,
+     * worker-writable) dirs (plan 04 §2.2). Cases:
+     *   common set        → base=common, overlay=private (if distinct)
+     *   only private set  → follow its manifest 'common' ref if present,
+     *                       else it is a self-contained single-dir tree.
+     */
+    if (common_dir && *common_dir) {
+        base_dir = common_dir;
+        overlay_dir = (private_dir && *private_dir &&
+                       strcmp(private_dir, common_dir)) ? private_dir : NULL;
+    } else if (private_dir && *private_dir) {
+        ref = sf_snap_read_common_ref(private_dir);
+        base_dir = ref ? ref : private_dir;
+        overlay_dir = ref ? private_dir : NULL;
+    } else {
         error_setg(errp, "sf_cold_start: missing snapshot dir");
         return -EINVAL;
     }
@@ -154,7 +173,7 @@ int sf_cold_start(const char *dir, uint32_t dst_id, bool restore_exclude,
         return -1;
     }
 
-    root_path = g_build_filename(dir, "root.ram", NULL);
+    root_path = g_build_filename(base_dir, "root.ram", NULL);
     fd = open(root_path, O_RDONLY);
     if (fd < 0) {
         error_setg_errno(errp, errno, "sf_cold_start: open %s", root_path);
@@ -168,13 +187,19 @@ int sf_cold_start(const char *dir, uint32_t dst_id, bool restore_exclude,
     if (sf_cold_remap_live_ram(fd, errp) < 0) {
         goto out;
     }
-    if (sf_snap_load(dir, &loaded, errp) < 0) {
+    if (sf_snap_load(base_dir, &loaded, errp) < 0) {
+        goto out;
+    }
+    /* Graft the worker's private overlay (its parents resolve into the common
+     * tree just loaded) before we look up the restore target — dst_id may be a
+     * private node (plan 04 §2.2). */
+    if (overlay_dir && sf_snap_load_overlay(overlay_dir, loaded, errp) < 0) {
         goto out;
     }
     /* Rebuild the NO_RESTORE table from the manifest before restore, else a
      * worker resuming from a snapshot (guest not re-running REGISTER_BUF) has an
      * empty exclude table and restore rolls back its task buffer (§4.2-3). */
-    if (sf_exclude_reload(dir, restore_exclude, errp) < 0) {
+    if (sf_exclude_reload(base_dir, restore_exclude, errp) < 0) {
         goto out;
     }
     if (sf_rootstore_open_file(&loaded->ram, root_path, errp) < 0) {
@@ -220,5 +245,6 @@ out:
         close(fd);
     }
     g_free(root_path);
+    g_free(ref);
     return ret;
 }

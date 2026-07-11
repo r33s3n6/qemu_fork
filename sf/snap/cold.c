@@ -11,6 +11,7 @@
 #include "sf/snap/node.h"
 #include "sf/snap/persist.h"
 #include "sf/snap/tripwire.h"
+#include "sf/snap/exclude.h"
 #include "sf/kvm_tsc.h"
 
 /*
@@ -100,6 +101,38 @@ static void sf_prefault_after_cold_start(SfSnapNode *target)
     fprintf(stderr,
             "sf-prefault: store=%zuMiB nodes=%d live=%zuMiB mode=%s\n",
             n_store / (1024 * 1024), n_nodes, n_live / (1024 * 1024), e);
+}
+
+/*
+ * Re-establish the MAP_SHARED backing of registered buffers after the block
+ * MAP_PRIVATE remap (sf_cold_remap_live_ram) clobbered them (M1 §8 order ①).
+ * Driven by the exclude table just rebuilt by sf_exclude_reload; the backing
+ * file path is the convention <dir>/bufs/<buf_id>.buf. A buf with no persisted
+ * file (e.g. a hold-mode base registers none, so the set is empty) is left as-is
+ * — the plain excluded page. Full cross-process persisted-buffer validation rides
+ * with the real-TiDB e2e (S6); here it is a no-op for the S5 gates.
+ */
+static int sf_cold_remap_bufs(const char *dir, Error **errp)
+{
+    size_t n = sf_exclude_count();
+
+    for (size_t i = 0; i < n; i++) {
+        uint64_t host, size;
+        uint32_t buf_id;
+        char *path;
+        bool have;
+
+        if (!sf_exclude_get(i, &host, &size, &buf_id)) {
+            continue;
+        }
+        path = sf_buf_path(dir, buf_id);
+        have = g_file_test(path, G_FILE_TEST_IS_REGULAR);
+        g_free(path);
+        if (have && sf_buf_remap(host, size, buf_id, dir, false, true, errp) < 0) {
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static int sf_cold_remap_live_ram(int fd, Error **errp)
@@ -200,6 +233,13 @@ int sf_cold_start(const char *common_dir, const char *private_dir,
      * worker resuming from a snapshot (guest not re-running REGISTER_BUF) has an
      * empty exclude table and restore rolls back its task buffer (§4.2-3). */
     if (sf_exclude_reload(base_dir, restore_exclude, errp) < 0) {
+        goto out;
+    }
+    /* Re-map registered buffers onto their MAP_SHARED files AFTER the block
+     * remap above blew them away (plan 04 §2.4 order ①). Buffers are the
+     * worker's private state, so their files live in the overlay (private) dir
+     * when two-dir, else the single dir. */
+    if (sf_cold_remap_bufs(overlay_dir ? overlay_dir : base_dir, errp) < 0) {
         goto out;
     }
     if (sf_rootstore_open_file(&loaded->ram, root_path, errp) < 0) {

@@ -239,6 +239,25 @@ static void sf_nr_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     }
     sf_exclude_add((uint64_t)(uintptr_t)host, req.size, buf_id);
     uint32_t cnt = (uint32_t)sf_exclude_count();
+
+    /* Remap the excluded buffer onto a named MAP_SHARED file in the workdir so a
+     * control process can write the guest's task buffer zero-copy (plan §2.4).
+     * Only when a workdir is configured — the standalone idrestore path has no
+     * private_dir and keeps the plain guest-writes-survive-restore behavior.
+     * SF_BUF_NO_REMAP is the S5 tooth: create+seed the file but skip MAP_FIXED,
+     * so a host write cannot reach the guest page (proves the remap is load-
+     * bearing, not exclusion alone). */
+    const char *workdir = sf_config()->private_dir;
+    if (workdir[0]) {
+        Error *err = NULL;
+        bool map_fixed = !getenv("SF_BUF_NO_REMAP");
+        if (sf_buf_remap((uint64_t)(uintptr_t)host, req.size, buf_id, workdir,
+                         true, map_fixed, &err) < 0) {
+            fprintf(stderr, "sf-nr: buf remap failed: %s\n",
+                    error_get_pretty(err));
+            error_free(err);
+        }
+    }
     fprintf(stderr, "sf-nr: registered gpa=0x%" PRIx64 " size=%" PRIu64
             " → host=%p buf_id=%u (count=%u)\n",
             (uint64_t)req.gpa, (uint64_t)req.size, host, buf_id, cnt);

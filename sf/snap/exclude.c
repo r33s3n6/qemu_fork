@@ -109,3 +109,91 @@ bool sf_excluded(const void *host)
     }
     return sf_excl_find((uint64_t)(uintptr_t)host) >= 0;
 }
+
+/* ---- registered-buffer shared-file backing (plan 04 §2.4 / S5) ---- */
+
+char *sf_buf_path(const char *dir, uint32_t buf_id)
+{
+    char name[32];
+    snprintf(name, sizeof(name), "bufs/%u.buf", buf_id);
+    return g_build_filename(dir, name, NULL);
+}
+
+static int sf_buf_write_all(int fd, const void *buf, size_t len)
+{
+    const uint8_t *p = buf;
+    while (len) {
+        ssize_t w = write(fd, p, len);
+        if (w < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        p += w;
+        len -= (size_t)w;
+    }
+    return 0;
+}
+
+int sf_buf_remap(uint64_t host, uint64_t size, uint32_t buf_id,
+                 const char *dir, bool create, bool map_fixed, Error **errp)
+{
+    char *path, *bdir;
+    int fd, ret = -1;
+    void *p;
+
+    if (!dir || !*dir) {
+        error_setg(errp, "sf_buf_remap: no workdir for buf %u", buf_id);
+        return -1;
+    }
+    if (create) {
+        bdir = g_build_filename(dir, "bufs", NULL);
+        ret = g_mkdir_with_parents(bdir, 0700);
+        g_free(bdir);
+        if (ret < 0) {
+            error_setg_errno(errp, errno, "sf_buf_remap: mkdir bufs/");
+            return -1;
+        }
+        ret = -1;
+    }
+    path = sf_buf_path(dir, buf_id);
+    fd = open(path, create ? (O_RDWR | O_CREAT | O_TRUNC) : O_RDWR, 0600);
+    if (fd < 0) {
+        error_setg_errno(errp, errno, "sf_buf_remap: open %s", path);
+        goto out;
+    }
+    if (create) {
+        if (ftruncate(fd, (off_t)size) < 0) {
+            error_setg_errno(errp, errno, "sf_buf_remap: ftruncate %s", path);
+            goto out;
+        }
+        /* Seed the file with the buffer's current bytes before the mapping is
+         * replaced, so anything the guest already wrote survives the remap. */
+        if (sf_buf_write_all(fd, (const void *)(uintptr_t)host, size) < 0) {
+            error_setg_errno(errp, errno, "sf_buf_remap: seed %s", path);
+            goto out;
+        }
+    }
+    if (map_fixed) {
+        p = mmap((void *)(uintptr_t)host, size, PROT_READ | PROT_WRITE,
+                 MAP_SHARED | MAP_FIXED, fd, 0);
+        if (p == MAP_FAILED) {
+            error_setg_errno(errp, errno, "sf_buf_remap: mmap %s", path);
+            goto out;
+        }
+        if (p != (void *)(uintptr_t)host) {
+            error_setg(errp, "sf_buf_remap: mmap moved %p != %p", p,
+                       (void *)(uintptr_t)host);
+            goto out;
+        }
+    }
+    ret = 0;
+out:
+    if (fd >= 0) {
+        close(fd);   /* the mapping keeps the file alive; a control process
+                      * reopens it by path for its own MAP_SHARED view. */
+    }
+    g_free(path);
+    return ret;
+}

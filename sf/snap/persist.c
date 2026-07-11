@@ -1119,6 +1119,25 @@ void sf_snap_free_loaded(SfSnapNode *root)
     g_free(root);
 }
 
+/* A file-backed registered buffer (buf_id != 0 with a bufs/<id>.buf in dir) gets
+ * its content from sf_cold_remap_bufs (mmap the shared file) right after reload,
+ * so it needs no persisted exclude.ram content. Plain NO_RESTORE state pages
+ * (buf_id 0, or no file) still require it. */
+static bool sf_exclude_entry_filebacked(const char *dir, QDict *ed)
+{
+    uint32_t buf_id = (uint32_t)qdict_get_try_int(ed, "buf_id", 0);
+    char *bp;
+    bool have;
+
+    if (buf_id == 0) {
+        return false;
+    }
+    bp = sf_buf_path(dir, buf_id);
+    have = g_file_test(bp, G_FILE_TEST_IS_REGULAR);
+    g_free(bp);
+    return have;
+}
+
 int sf_exclude_reload(const char *dir, bool restore_content, Error **errp)
 {
     char *mpath = g_build_filename(dir, "manifest.json", NULL);
@@ -1152,24 +1171,31 @@ int sf_exclude_reload(const char *dir, bool restore_content, Error **errp)
         goto out;
     }
     ex = qobject_to(QList, qdict_get(man, "exclude"));
-    /* Restoring the content of an empty exclude set is a no-op: don't demand a
-     * persisted exclude.ram when there are no ranges (a pipe `p` base saves no
-     * content, and a hold-mode base registers no NO_RESTORE buffers). */
-    if (restore_content && ex && !qlist_empty(ex)) {
-        char *path;
-        if (!qdict_get_try_bool(man, "exclude_content", false)) {
-            error_setg(errp, "sf_exclude_reload: content was not persisted");
-            goto out;
+    /* Demand persisted exclude.ram only when a *non-file-backed* NO_RESTORE page
+     * exists. File-backed buffers get content from sf_cold_remap_bufs (the shared
+     * file) after this reload, so a pipe `p` base with only registered buffers
+     * (save_exclude=false) cold-starts fine. Empty exclude → no-op. */
+    if (restore_content && ex) {
+        QLIST_FOREACH_ENTRY(ex, e) {
+            QDict *ed = qobject_to(QDict, qlist_entry_obj(e));
+            if (ed && !sf_exclude_entry_filebacked(dir, ed)) {
+                char *path;
+                if (!qdict_get_try_bool(man, "exclude_content", false)) {
+                    error_setg(errp, "sf_exclude_reload: content was not persisted");
+                    goto out;
+                }
+                path = g_build_filename(dir, "exclude.ram", NULL);
+                if (!g_file_get_contents(path, &content, &content_len, &gerr)) {
+                    error_setg(errp, "sf_exclude_reload: read %s: %s", path,
+                               gerr->message);
+                    g_error_free(gerr);
+                    g_free(path);
+                    goto out;
+                }
+                g_free(path);
+                break;
+            }
         }
-        path = g_build_filename(dir, "exclude.ram", NULL);
-        if (!g_file_get_contents(path, &content, &content_len, &gerr)) {
-            error_setg(errp, "sf_exclude_reload: read %s: %s", path,
-                       gerr->message);
-            g_error_free(gerr);
-            g_free(path);
-            goto out;
-        }
-        g_free(path);
     }
 
     /* Rebuild from a clean slate: block-relative (block,off) → live host base. */
@@ -1193,7 +1219,8 @@ int sf_exclude_reload(const char *dir, bool restore_content, Error **errp)
             }
             sf_exclude_add((uint64_t)(uintptr_t)((uint8_t *)sf_blocks[bid].host + off),
                            size, (uint32_t)qdict_get_try_int(ed, "buf_id", 0));
-            if (restore_content) {
+            /* File-backed buffers restore via sf_cold_remap_bufs, not exclude.ram. */
+            if (restore_content && content && !sf_exclude_entry_filebacked(dir, ed)) {
                 uint64_t data_off = (uint64_t)qdict_get_try_int(ed, "data_off", -1);
                 if (data_off > content_len || size > content_len - data_off) {
                     error_setg(errp, "sf_exclude_reload: content range out of bounds");

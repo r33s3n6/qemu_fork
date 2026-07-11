@@ -1151,7 +1151,11 @@ int sf_exclude_reload(const char *dir, bool restore_content, Error **errp)
         error_setg(errp, "sf_exclude_reload: manifest is not a JSON object");
         goto out;
     }
-    if (restore_content) {
+    ex = qobject_to(QList, qdict_get(man, "exclude"));
+    /* Restoring the content of an empty exclude set is a no-op: don't demand a
+     * persisted exclude.ram when there are no ranges (a pipe `p` base saves no
+     * content, and a hold-mode base registers no NO_RESTORE buffers). */
+    if (restore_content && ex && !qlist_empty(ex)) {
         char *path;
         if (!qdict_get_try_bool(man, "exclude_content", false)) {
             error_setg(errp, "sf_exclude_reload: content was not persisted");
@@ -1170,7 +1174,6 @@ int sf_exclude_reload(const char *dir, bool restore_content, Error **errp)
 
     /* Rebuild from a clean slate: block-relative (block,off) → live host base. */
     sf_exclude_clear();
-    ex = qobject_to(QList, qdict_get(man, "exclude"));
     if (ex) {
         QLIST_FOREACH_ENTRY(ex, e) {
             QDict *ed = qobject_to(QDict, qlist_entry_obj(e));

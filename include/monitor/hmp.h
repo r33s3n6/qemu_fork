@@ -193,15 +193,10 @@ void hmp_info_registers(Monitor *mon, const QDict *qdict);
 void hmp_gva2gpa(Monitor *mon, const QDict *qdict);
 void hmp_gpa2hva(Monitor *mon, const QDict *qdict);
 void hmp_gpa2hpa(Monitor *mon, const QDict *qdict);
-void hmp_sf_snapshot(Monitor *mon, const QDict *qdict);
-void hmp_sf_restore(Monitor *mon, const QDict *qdict);
 void hmp_sf_selftest(Monitor *mon, const QDict *qdict);
 void hmp_sf_tree(Monitor *mon, const QDict *qdict);
 void hmp_sf_r3_spike(Monitor *mon, const QDict *qdict);
 void hmp_sf_remap_all(Monitor *mon, const QDict *qdict);
-void hmp_sf_cold_start(Monitor *mon, const QDict *qdict);
-void hmp_sf_persist(Monitor *mon, const QDict *qdict);
-void hmp_sf_promote(Monitor *mon, const QDict *qdict);
 void hmp_sf_config(Monitor *mon, const QDict *qdict);
 
 #endif

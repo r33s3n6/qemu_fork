@@ -347,22 +347,6 @@ SRST
 ERST
 
     {
-        .name       = "sf_snapshot",
-        .args_type  = "",
-        .params     = "",
-        .help       = "sf (M0-S spike): create fast snapshot",
-        .cmd        = hmp_sf_snapshot,
-    },
-
-    {
-        .name       = "sf_restore",
-        .args_type  = "debug:s?",
-        .params     = "[skip-mblock=N|skip-get=N|skip-pre=N|skip-post=N]",
-        .help       = "sf (M0-S spike): restore to fast snapshot",
-        .cmd        = hmp_sf_restore,
-    },
-
-    {
         .name       = "sf_selftest",
         .args_type  = "",
         .params     = "",
@@ -392,30 +376,6 @@ ERST
         .params     = "",
         .help       = "sf (M3 R3-full): remap ALL guest RAM blocks MAP_PRIVATE|MAP_FIXED to a dump file, verify whole-RAM EPT rebuild (research)",
         .cmd        = hmp_sf_remap_all,
-    },
-
-    {
-        .name       = "sf_cold_start",
-        .args_type  = "dir:F,id:i?,restore-nr:b?",
-        .params     = "dir [id] [restore-nr]",
-        .help       = "sf (M3): cold-start tree; optionally restore NO_RESTORE content",
-        .cmd        = hmp_sf_cold_start,
-    },
-
-    {
-        .name       = "sf_persist",
-        .args_type  = "dir:F,save-nr:b?",
-        .params     = "dir [save-nr]",
-        .help       = "sf (M3): persist tree; optionally save NO_RESTORE content",
-        .cmd        = hmp_sf_persist,
-    },
-
-    {
-        .name       = "sf_promote",
-        .args_type  = "dir:F,id:i?",
-        .params     = "dir [id]",
-        .help       = "sf (M3): promote active/id snapshot into a connected persisted prefix",
-        .cmd        = hmp_sf_promote,
     },
 
     {

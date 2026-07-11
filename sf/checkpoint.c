@@ -266,8 +266,8 @@ static MemoryRegion sf_nr_io;
 
 /* One-shot main-loop BH (aio_bh_schedule_oneshot auto-frees it): perform the
  * configured boot cold-start once machine creation is complete (see the
- * scheduling site for why a BH, not inline). Mirrors hmp_sf_cold_start
- * (vm_stop while restoring, generation bump, vm_start). */
+ * scheduling site for why a BH, not inline). vm_stop while restoring, generation
+ * bump, vm_start. */
 static void sf_boot_cold_start_bh(void *opaque)
 {
     const SfConfig *c = sf_config();
@@ -334,8 +334,8 @@ static void sf_cp_machine_done(Notifier *n, void *unused)
      * re-preparse the .dev stream with the 'globalstate' VMSD not yet
      * registered ("no VMSD for section globalstate"). The BH runs after machine
      * creation completes (globalstate registered) and after autostart's vm_start,
-     * so it mirrors the proven hmp_sf_cold_start path (vm_stop→cold_start→
-     * vm_start). A few instructions of -kernel boot before the BH are discarded
+     * running the proven vm_stop→cold_start→vm_start sequence. A few instructions
+     * of -kernel boot before the BH are discarded
      * by cold_start's RAM remap; that's the intended "resume restored guest, not
      * the kernel". Single-dir in S1; two-dir common/private lands in S3. */
     if (sf_config()->cold_start_on_boot) {

@@ -120,75 +120,10 @@ static bool sf_parse_restore_debug(Monitor *mon, const char *arg,
     return false;
 }
 
-/* ---- HMP entries (crutch baseline: vm_stop/vm_start around the core) ---- */
-
-void hmp_sf_snapshot(Monitor *mon, const QDict *qdict)
-{
-    /*
-     * HMP crutch baseline: the vCPU is running on another thread, so quiesce
-     * the whole VM around the capture. vm_stop(SAVE_VM) also
-     * cpu_synchronize_all_states so CPUState reflects the live KVM vCPU. The
-     * terminal path (sf_checkpoint_snapshot) drops this — the vcpu boundary is
-     * quiescent — and adds the explicit TSC/kvmclock freeze.
-     */
-    Error *err = NULL;
-    bool was_running = runstate_is_running();
-    SfSnapKind kind = sf_active ? SF_SNAP_RUN : SF_SNAP_ROOT;
-
-    if (was_running) {
-        vm_stop(RUN_STATE_SAVE_VM);
-    }
-    if (sf_snap_save(kind, &err) < 0) {
-        monitor_printf(mon, "sf: snapshot failed: %s\n", error_get_pretty(err));
-        error_free(err);
-    }
-    if (was_running) {
-        vm_start();
-    }
-}
-
-void hmp_sf_restore(Monitor *mon, const QDict *qdict)
-{
-    const char *debug_arg = qdict_get_try_str(qdict, "debug");
-    SfReplayDebug debug;
-    bool have_debug = debug_arg && *debug_arg;
-    Error *err = NULL;
-
-    if (!sf_snap_have_snapshot()) {
-        monitor_printf(mon, "sf: no snapshot; run sf_snapshot first\n");
-        return;
-    }
-    /* T1: only root/active exists, so the restore target is the active node. */
-    if (have_debug && sf_active && sf_active->dev.have) {
-        if (!sf_parse_restore_debug(mon, debug_arg, &sf_active->dev.tables,
-                                    &debug)) {
-            return;
-        }
-    }
-
-    /*
-     * HMP crutch: quiesce across the rollback (mutates guest RAM + device state
-     * in place; racing a live vCPU tears RAM/regs). vm_start fires the runstate
-     * handlers (kvmclock KVM_SET_CLOCK, vapic) — the terminal path applies those
-     * explicitly via sf_snap_restore's clock tail.
-     */
-    bool was_running = runstate_is_running();
-    if (was_running) {
-        vm_stop(RUN_STATE_RESTORE_VM);
-    }
-    sf_snap_restore(sf_active ? sf_active->id : 0,
-                    have_debug ? &debug : NULL, &err);
-    if (err) {
-        monitor_printf(mon, "sf: restore failed: %s\n", error_get_pretty(err));
-        error_free(err);
-    }
-    if (was_running) {
-        vm_start();
-    }
-    if (have_debug) {
-        monitor_printf(mon, "sf: (debug=%s)\n", debug_arg);
-    }
-}
+/* ---- HMP entries (debug + low-freq config only) --------------------------
+ * Framework control (snapshot/restore/cold-start/persist/promote) left HMP for
+ * the binary pipe + startup config in control-plane v2 (plan 2026-07-11-04 §2.1,
+ * S4); only these debug/config knobs remain. */
 
 void hmp_sf_selftest(Monitor *mon, const QDict *qdict)
 {
@@ -237,79 +172,6 @@ void hmp_sf_config(Monitor *mon, const QDict *qdict)
     } else {
         monitor_printf(mon, "sf: config %s=%s\n", key, val);
     }
-}
-
-void hmp_sf_cold_start(Monitor *mon, const QDict *qdict)
-{
-    const char *dir = qdict_get_str(qdict, "dir");
-    int64_t id = qdict_get_try_int(qdict, "id", 0);
-    bool restore_nr = qdict_get_try_bool(qdict, "restore-nr", false);
-    Error *err = NULL;
-    bool was_running = runstate_is_running();
-
-    if (was_running) {
-        vm_stop(RUN_STATE_RESTORE_VM);
-    }
-    if (sf_cold_start(dir, NULL, (uint32_t)id, restore_nr, true, &err) < 0) {
-        monitor_printf(mon, "sf: cold-start failed: %s\n", error_get_pretty(err));
-        error_free(err);
-    } else {
-        /* Guest resumes at the original snapshot site. The restored CPU state
-         * already contains that outl's reply; only advance host generation.
-         * Requested NO_RESTORE content was copied back while the VM was stopped. */
-        sf_cp_generation_inc();
-        monitor_printf(mon, "sf: cold-start ok: dir=%s id=%" PRId64 "\n", dir, id);
-    }
-    if (was_running) {
-        vm_start();
-    }
-}
-
-void hmp_sf_persist(Monitor *mon, const QDict *qdict)
-{
-    const char *dir = qdict_get_str(qdict, "dir");
-    bool save_nr = qdict_get_try_bool(qdict, "save-nr", false);
-    SfSnapNode *root = sf_active;
-    Error *err = NULL;
-
-    if (!root) {
-        monitor_printf(mon, "sf: persist failed: no snapshot tree\n");
-        return;
-    }
-    while (root->parent) {
-        root = root->parent;
-    }
-    if (sf_snap_persist(root, dir, save_nr, NULL, &err) < 0) {
-        monitor_printf(mon, "sf: persist failed: %s\n", error_get_pretty(err));
-        error_free(err);
-        return;
-    }
-    monitor_printf(mon, "sf: persist ok: dir=%s\n", dir);
-}
-
-void hmp_sf_promote(Monitor *mon, const QDict *qdict)
-{
-    const char *dir = qdict_get_str(qdict, "dir");
-    int64_t id = qdict_get_try_int(qdict, "id", -1);
-    SfSnapNode *node;
-    Error *err = NULL;
-
-    if (!sf_active) {
-        monitor_printf(mon, "sf: promote failed: no snapshot tree\n");
-        return;
-    }
-    node = id >= 0 ? sf_node_find((uint32_t)id) : sf_active;
-    if (!node) {
-        monitor_printf(mon, "sf: promote failed: node id %" PRId64 " not found\n",
-                       id);
-        return;
-    }
-    if (sf_snap_promote(node, dir, NULL, &err) < 0) {
-        monitor_printf(mon, "sf: promote failed: %s\n", error_get_pretty(err));
-        error_free(err);
-        return;
-    }
-    monitor_printf(mon, "sf: promote ok: dir=%s id=%u\n", dir, node->id);
 }
 
 /* R3 spike (plan 2026-07-06-07 §3): research-only — verify EPT rebuild after a

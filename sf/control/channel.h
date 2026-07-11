@@ -18,30 +18,56 @@
 #ifndef SF_CONTROL_CHANNEL_H
 #define SF_CONTROL_CHANNEL_H
 
+/* Binary pipe (v2, §2.1): fixed 5-byte command frame [op:u8][arg:u32 LE]; the
+ * op byte reuses the ASCII verb letter for debuggability. gate mode + resume
+ * timeout are now startup config (sf/control/config.h), not pipe commands;
+ * cold-start is a boot action (§2.3), not a pipe command. */
 typedef enum {
-    SF_CTL_CONTINUE,     /* c / continue       — resume to next boundary */
-    SF_CTL_SNAPSHOT,     /* s / snapshot        — save here, stay parked */
-    SF_CTL_RESTORE,      /* r / restore [id]    — restore + resume */
-    SF_CTL_COLDSTART,    /* C / cold-start <dir> [id] — load from disk + resume */
-    SF_CTL_GATE,         /* g / gate <a|d|s>    — set guest checkpoint gate */
-    SF_CTL_TIMEOUT,       /* T / timeout <ms>    — set next resume timeout (0=inf) */
-    SF_CTL_BAD,          /* unparseable / unknown */
+    SF_CTL_CONTINUE = 'c',   /* resume to next boundary */
+    SF_CTL_SNAPSHOT = 's',   /* save here, stay parked; reply s <id> */
+    SF_CTL_RESTORE  = 'r',   /* restore [arg=id, 0xFFFFFFFF=active] + resume */
+    SF_CTL_PERSIST  = 'p',   /* persist tree to configured private_dir; stay parked */
+    SF_CTL_PROMOTE  = 'P',   /* promote [arg=id/active] to private_dir; stay parked */
+    SF_CTL_BAD      = 0,     /* unknown op */
 } SfCtlCmdKind;
 
+/* Guest-agency gate at a checkpoint boundary. Startup config (SF_GATE); no longer
+ * a pipe command. */
 typedef enum {
     SF_CTL_GATE_ALLOW,     /* default: guest may self snapshot/restore/stop */
     SF_CTL_GATE_DISABLE,    /* any guest cmd yields -> 'c' (host decides) */
     SF_CTL_GATE_STRICT,     /* non-stop guest cmd panics -> 'x' */
 } SfCtlGateMode;
 
+/* arg sentinel: "no id, use active". Node ids are small, 0xFFFFFFFF is safe. */
+#define SF_CTL_NO_ID 0xFFFFFFFFu
+
 typedef struct {
-    SfCtlCmdKind   kind;
-    bool           has_id;
-    uint32_t       id;
-    char           dir[1024];    /* cold-start dir; empty otherwise */
-    SfCtlGateMode  gmode;         /* SF_CTL_GATE */
-    int64_t        timeout_ms;    /* SF_CTL_TIMEOUT (0 = infinite) */
+    SfCtlCmdKind kind;
+    bool         has_id;
+    uint32_t     id;
 } SfCtlCmd;
+
+/* Response status byte (payload u32: node id for 's', SfCtlErr for 'e', else 0). */
+typedef enum {
+    SF_ST_CHECKPOINT = 'c',   /* parked at boundary; host decides next */
+    SF_ST_TIMEOUT    = 't',   /* mid-flight timeout stop */
+    SF_ST_CRASH      = 'x',   /* STRICT panic / crash */
+    SF_ST_SNAPSHOT   = 's',   /* snapshot done; payload = new node id */
+    SF_ST_OK         = 'o',   /* config-class ok (persist/promote) */
+    SF_ST_ERROR      = 'e',   /* payload = SfCtlErr */
+} SfCtlStatus;
+
+typedef enum {
+    SF_ERR_NONE = 0,
+    SF_ERR_INVALID_STATE,
+    SF_ERR_NO_SNAPSHOT,
+    SF_ERR_RESTORE_FAILED,
+    SF_ERR_PERSIST_FAILED,
+    SF_ERR_PROMOTE_FAILED,
+    SF_ERR_BAD_COMMAND,
+    SF_ERR_BAD_FRAME,
+} SfCtlErr;
 
 /* Look for the control chardev (id "sfctl") and attach handlers. Called once at
  * machine_init_done (from sf/checkpoint.c). No-op if the chardev is absent. */
@@ -51,8 +77,8 @@ void sf_control_init(void);
  * keeps its standalone guest-driven behavior (sf/checkpoint.c). */
 bool sf_control_active(void);
 
-/* Send a response line (must include '\n'). Called from gate.c (both dispatch
- * contexts). */
-void sf_control_reply(const char *line);
+/* Send a 5-byte response frame [status:u8][payload:u32 LE]. Called from gate.c
+ * (both dispatch contexts). */
+void sf_control_reply(uint8_t status, uint32_t payload);
 
 #endif /* SF_CONTROL_CHANNEL_H */

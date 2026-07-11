@@ -10,6 +10,7 @@
  * Clean-room: no QEMU-Nyx code.
  */
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"           /* stl_le_p / ldl_le_p */
 #include "qapi/error.h"
 #include "chardev/char.h"
 #include "chardev/char-fe.h"
@@ -18,122 +19,69 @@
 
 #define SF_CTL_CHARDEV_ID "sfctl"
 
-/* Longest legal line: a cold-start dir (SfCtlCmd.dir) + verb/id/spaces slack. A
- * line past this is rejected with 'e line-too-long' rather than silently split. */
-#define SF_CTL_LINE_MAX (sizeof(((SfCtlCmd *)0)->dir) + 128)
+#define SF_CTL_FRAME_LEN 5   /* [op:u8][arg:u32 LE] */
 
 static CharFrontend sf_ctl_fe;
 static bool         sf_ctl_inited;
 
-/* Receive line buffer — main-loop-only (chardev read callback). */
-static char   sf_ctl_rx[SF_CTL_LINE_MAX];
-static size_t sf_ctl_rxlen;
-static bool   sf_ctl_overflow;   /* current line exceeded SF_CTL_LINE_MAX; drop to next '\n' */
+/* Receive frame accumulator — main-loop-only (chardev read callback). */
+static uint8_t sf_ctl_rx[SF_CTL_FRAME_LEN];
+static size_t  sf_ctl_rxlen;
 
 bool sf_control_active(void)
 {
     return sf_ctl_inited;
 }
 
-void sf_control_reply(const char *line)
+void sf_control_reply(uint8_t status, uint32_t payload)
 {
-    qemu_chr_fe_write_all(&sf_ctl_fe, (const uint8_t *)line, (int)strlen(line));
+    uint8_t frame[SF_CTL_FRAME_LEN];
+    frame[0] = status;
+    stl_le_p(&frame[1], payload);
+    qemu_chr_fe_write_all(&sf_ctl_fe, frame, SF_CTL_FRAME_LEN);
 }
 
-/* ---- command parse (main loop) — space-separated grammar (plan §2/§45):
- * long or short verb, optional numeric id, cold-start dir (no embedded spaces),
- * gate mode letter, timeout ms. ---- */
-static void sf_ctl_parse(char *line, SfCtlCmd *c)
+/* Decode one 5-byte frame into a command (main loop). Unknown op -> SF_CTL_BAD.
+ * arg 0xFFFFFFFF means "no id" (restore/promote to active). */
+static void sf_ctl_decode(const uint8_t *frame, SfCtlCmd *c)
 {
-    char **tok;
-    guint ntok;
-    const char *verb;
-    size_t n = strlen(line);
+    uint32_t arg = ldl_le_p(&frame[1]);
 
     memset(c, 0, sizeof(*c));
-    while (n && (line[n - 1] == '\r' || line[n - 1] == ' ')) {
-        line[--n] = '\0';
-    }
-    tok = g_strsplit_set(line, " ", 0);
-    ntok = tok ? g_strv_length(tok) : 0;
-    verb = ntok ? tok[0] : "";
-
-    if (!strcmp(verb, "c") || !strcmp(verb, "continue")) {
-        c->kind = SF_CTL_CONTINUE;
-    } else if (!strcmp(verb, "s") || !strcmp(verb, "snapshot")) {
-        c->kind = SF_CTL_SNAPSHOT;
-    } else if (!strcmp(verb, "r") || !strcmp(verb, "restore")) {
-        c->kind = SF_CTL_RESTORE;
-        if (ntok >= 2 && tok[1][0]) {
+    switch (frame[0]) {
+    case SF_CTL_CONTINUE:
+    case SF_CTL_SNAPSHOT:
+    case SF_CTL_RESTORE:
+    case SF_CTL_PERSIST:
+    case SF_CTL_PROMOTE:
+        c->kind = (SfCtlCmdKind)frame[0];
+        if (arg != SF_CTL_NO_ID) {
             c->has_id = true;
-            c->id = (uint32_t)g_ascii_strtoull(tok[1], NULL, 10);
+            c->id = arg;
         }
-    } else if (!strcmp(verb, "C") || !strcmp(verb, "cold-start")) {
-        c->kind = SF_CTL_COLDSTART;
-        if (ntok >= 2 && tok[1][0]) {
-            g_strlcpy(c->dir, tok[1], sizeof(c->dir));
-        }
-        if (ntok >= 3 && tok[2][0]) {
-            c->has_id = true;
-            c->id = (uint32_t)g_ascii_strtoull(tok[2], NULL, 10);
-        }
-    } else if (!strcmp(verb, "g") || !strcmp(verb, "gate")) {
-        c->kind = SF_CTL_GATE;
-        if (ntok >= 2 && tok[1][0]) {
-            switch (tok[1][0]) {
-            case 'a': c->gmode = SF_CTL_GATE_ALLOW; break;
-            case 'd': c->gmode = SF_CTL_GATE_DISABLE; break;
-            case 's': c->gmode = SF_CTL_GATE_STRICT; break;
-            default:  c->kind = SF_CTL_BAD; break;
-            }
-        } else {
-            c->kind = SF_CTL_BAD;
-        }
-    } else if (!strcmp(verb, "T") || !strcmp(verb, "timeout")) {
-        c->kind = SF_CTL_TIMEOUT;
-        if (ntok >= 2 && tok[1][0]) {
-            c->timeout_ms = (int64_t)g_ascii_strtoull(tok[1], NULL, 10);
-        } else {
-            c->kind = SF_CTL_BAD;
-        }
-    } else {
+        break;
+    default:
         c->kind = SF_CTL_BAD;
+        break;
     }
-    g_strfreev(tok);
 }
 
 /* ---- chardev callbacks (main loop) ---- */
 
 static int sf_ctl_can_read(void *opaque)
 {
-    /* Fixed hint: sf_ctl_read bounds the line itself and keeps draining even
-     * while dropping an overlong one, so we must never return 0 mid-line. */
-    return 512;
+    return SF_CTL_FRAME_LEN;   /* one frame at a time is plenty (sync protocol) */
 }
 
 static void sf_ctl_read(void *opaque, const uint8_t *buf, int size)
 {
     for (int i = 0; i < size; i++) {
-        char ch = (char)buf[i];
-        if (ch == '\n') {
-            if (sf_ctl_overflow) {
-                sf_control_reply("e line-too-long\n");
-                sf_ctl_overflow = false;
-            } else {
-                sf_ctl_rx[sf_ctl_rxlen] = '\0';
-                SfCtlCmd c;
-                sf_ctl_parse(sf_ctl_rx, &c);
-                sf_gate_route(&c);   /* brain routes by parking state */
-            }
+        sf_ctl_rx[sf_ctl_rxlen++] = buf[i];
+        if (sf_ctl_rxlen == SF_CTL_FRAME_LEN) {
+            SfCtlCmd c;
+            sf_ctl_decode(sf_ctl_rx, &c);
             sf_ctl_rxlen = 0;
-        } else if (ch == '\r') {
-            /* strip CR */
-        } else if (sf_ctl_overflow) {
-            /* swallow the rest of the overlong line until '\n' */
-        } else if (sf_ctl_rxlen < sizeof(sf_ctl_rx) - 1) {
-            sf_ctl_rx[sf_ctl_rxlen++] = ch;
-        } else {
-            sf_ctl_overflow = true;   /* line exceeds bound → reject on '\n' */
+            sf_gate_route(&c);   /* brain routes by parking state */
         }
     }
 }

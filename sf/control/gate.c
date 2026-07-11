@@ -26,6 +26,7 @@
 #include "sf/snap/node.h"         /* sf_snap_restore / sf_active / have_snapshot */
 #include "sf/snap/cold.h"         /* sf_cold_start */
 #include "sf/control/channel.h"   /* sf_control_reply */
+#include "sf/control/config.h"    /* sf_config: default gate/timeout */
 #include "sf/control/gate.h"
 
 /* ---- sync + state (all under sf_gate_mtx) ---- */
@@ -485,8 +486,10 @@ void sf_gate_init(void)
     qemu_cond_init(&sf_gate_cond);
     sf_gate_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, sf_gate_timer_fire, NULL);
     sf_gate_state = SF_CS_RUNNING;
-    sf_gate_mode = SF_CTL_GATE_ALLOW;
-    sf_gate_timeout_ms = 0;     /* infinite until a 'T' command sets it */
+    /* Defaults now come from startup config (§2.1); a runtime cmd can still
+     * override. Pre-v2 default was ALLOW / infinite, preserved when unset. */
+    sf_gate_mode = sf_config()->gate_mode;
+    sf_gate_timeout_ms = sf_config()->resume_timeout_ms;
     sf_gate_have_cmd = false;
     sf_gate_connected = false;
     /* Flush the owed 't' once the deferred timeout vm_stop completes. */

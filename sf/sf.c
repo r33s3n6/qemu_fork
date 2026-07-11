@@ -25,6 +25,7 @@
 #include "sf/snap/node.h"
 #include "sf/snap/cold.h"
 #include "sf/snap/persist.h"
+#include "sf/control/config.h"
 #include "sf/selftest/selftest.h"
 
 /* ---- device-replay debug skip-knob parsing (HMP debug=/terminal SF_CP_SKIP) ---- */
@@ -206,6 +207,36 @@ void hmp_sf_selftest(Monitor *mon, const QDict *qdict)
 void hmp_sf_tree(Monitor *mon, const QDict *qdict)
 {
     sf_snap_tree(mon);
+}
+
+void hmp_sf_config(Monitor *mon, const QDict *qdict)
+{
+    const char *key = qdict_get_try_str(qdict, "key");
+    const char *val = qdict_get_try_str(qdict, "val");
+
+    if (!key) {
+        const SfConfig *c = sf_config();
+        static const char *gm[] = { "allow", "disable", "strict" };
+        monitor_printf(mon,
+            "sf config: common_dir=%s private_dir=%s resume_timeout_ms=%" PRId64
+            " gate=%s cold_start_on_boot=%d initial_node=%u\n",
+            c->common_dir[0] ? c->common_dir : "(none)",
+            c->private_dir[0] ? c->private_dir : "(none)",
+            c->resume_timeout_ms, gm[c->gate_mode],
+            c->cold_start_on_boot, c->initial_node);
+        return;
+    }
+    if (!val) {
+        monitor_printf(mon, "sf: sf_config <key> <val> (or no args to show)\n");
+        return;
+    }
+    Error *err = NULL;
+    if (sf_config_set(key, val, &err) < 0) {
+        monitor_printf(mon, "sf: config set failed: %s\n", error_get_pretty(err));
+        error_free(err);
+    } else {
+        monitor_printf(mon, "sf: config %s=%s\n", key, val);
+    }
 }
 
 void hmp_sf_cold_start(Monitor *mon, const QDict *qdict)

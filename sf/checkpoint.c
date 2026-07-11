@@ -31,9 +31,13 @@
 #include "system/address-spaces.h"
 #include "system/system.h"
 #include "hw/core/cpu.h"
+#include "qemu/error-report.h"
+#include "system/runstate.h"     /* vm_stop/vm_start/runstate_is_running */
 #include "sf/sf.h"
 #include "sf/checkpoint.h"
 #include "sf/control/gate.h"
+#include "sf/control/config.h"   /* sf_config: startup config + boot cold-start */
+#include "sf/snap/cold.h"        /* sf_cold_start (boot cold-start) */
 #include "sf/kvm_tsc.h"        /* sf_kvm_put_rax (outl reply in %rax, Nyx-style) */
 #include "sf/snap/node.h"      /* sf_gpa_to_host */
 #include "sf/snap/exclude.h"   /* sf_exclude_add / sf_exclude_count */
@@ -260,8 +264,43 @@ static const MemoryRegionOps sf_nr_ops = {
 
 static MemoryRegion sf_nr_io;
 
+/* One-shot main-loop BH (aio_bh_schedule_oneshot auto-frees it): perform the
+ * configured boot cold-start once machine creation is complete (see the
+ * scheduling site for why a BH, not inline). Mirrors hmp_sf_cold_start
+ * (vm_stop while restoring, generation bump, vm_start). */
+static void sf_boot_cold_start_bh(void *opaque)
+{
+    const char *dir = sf_config_boot_dir();
+    Error *err = NULL;
+    bool was_running = runstate_is_running();
+
+    if (dir[0] == '\0') {
+        error_report("sf-config: cold_start_on_boot set but no "
+                     "SF_COMMON_DIR/SF_PRIVATE_DIR");
+        exit(1);
+    }
+    if (was_running) {
+        vm_stop(RUN_STATE_RESTORE_VM);
+    }
+    if (sf_cold_start(dir, sf_config()->initial_node, true, true, &err) < 0) {
+        error_report("sf-config: boot cold-start failed: %s",
+                     error_get_pretty(err));
+        exit(1);
+    }
+    sf_cp_generation_inc();
+    fprintf(stderr, "sf-config: boot cold-start ok dir=%s node=%u\n",
+            dir, sf_config()->initial_node);
+    if (was_running) {
+        vm_start();
+    }
+}
+
 static void sf_cp_machine_done(Notifier *n, void *unused)
 {
+    /* Read startup config first: sf_control_init()->sf_gate_init() seeds gate
+     * mode + resume timeout from it, and the boot cold-start below reads it. */
+    sf_config_load();
+
     memory_region_init_io(&sf_cp_io, NULL, &sf_cp_ops, NULL,
                           "sf-checkpoint", SF_CP_PORT_SIZE);
     /* BQL-free dispatch: without this, prepare_mmio_access() would auto-take the
@@ -286,6 +325,21 @@ static void sf_cp_machine_done(Notifier *n, void *unused)
     /* Attach the host control channel if a -chardev id "sfctl" is present; when
      * absent the port keeps its standalone guest-driven behavior. */
     sf_control_init();
+
+    /* Boot cold-start (§2.3): schedule it on a main-loop BH rather than inline.
+     * This notifier fires from qdev_machine_creation_done() BEFORE
+     * register_global_state() (hw/core/machine.c) — inline cold-start would
+     * re-preparse the .dev stream with the 'globalstate' VMSD not yet
+     * registered ("no VMSD for section globalstate"). The BH runs after machine
+     * creation completes (globalstate registered) and after autostart's vm_start,
+     * so it mirrors the proven hmp_sf_cold_start path (vm_stop→cold_start→
+     * vm_start). A few instructions of -kernel boot before the BH are discarded
+     * by cold_start's RAM remap; that's the intended "resume restored guest, not
+     * the kernel". Single-dir in S1; two-dir common/private lands in S3. */
+    if (sf_config()->cold_start_on_boot) {
+        aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                                sf_boot_cold_start_bh, NULL);
+    }
 }
 
 static Notifier sf_cp_notifier = { .notify = sf_cp_machine_done };

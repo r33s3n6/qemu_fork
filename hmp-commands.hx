@@ -419,6 +419,14 @@ ERST
     },
 
     {
+        .name       = "sf_config",
+        .args_type  = "key:s?,val:s?",
+        .params     = "[key val]",
+        .help       = "sf (v2): show host-control config, or set one key at runtime",
+        .cmd        = hmp_sf_config,
+    },
+
+    {
         .name       = "loadvm",
         .args_type  = "name:s",
         .params     = "tag",

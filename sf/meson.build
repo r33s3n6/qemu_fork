@@ -3,6 +3,7 @@ system_ss.add(files(
   'checkpoint.c',
   'control/channel.c',
   'control/gate.c',
+  'control/config.c',
   'vmstate_replay/buffer.c',
   'vmstate_replay/preparse.c',
   'vmstate_replay/replay.c',

@@ -60,10 +60,63 @@ static uint64_t sf_now_thread_ns(void)
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
+/* Pure guest-mode CPU time summed over vCPU threads, in ns. Reads gtime
+ * (field 43 of /proc/self/task/<tid>/stat) — the kernel's separate accounting
+ * of non-root guest execution. Within a KVM_RUN bracket, guest_active_cpu =
+ * gtime(pure guest) + in-kernel KVM exit handling (npf/dirty/mmu) + halt-poll
+ * spin; so guest_active_cpu - guest_only - halt_poll isolates the "kvm 相关逻辑".
+ * Tick-resolution (USER_HZ): noisy per-round, exact once aggregated over a wave.
+ * ponytail: /proc read on the restore boundary (not the guest hot path); returns
+ * 0 if unreadable, which the runner surfaces as "gtime not populated". */
+static uint64_t sf_restore_guest_time_ns(void)
+{
+    static long hz;
+    if (hz == 0) {
+        hz = sysconf(_SC_CLK_TCK);
+    }
+    if (hz <= 0) {
+        return 0;
+    }
+    uint64_t ticks = 0;
+    CPUState *cpu;
+    CPU_FOREACH(cpu) {
+        char path[64], buf[1024];
+        snprintf(path, sizeof(path), "/proc/self/task/%d/stat", cpu->thread_id);
+        FILE *f = fopen(path, "re");
+        if (!f) {
+            continue;
+        }
+        size_t got = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        if (got == 0) {
+            continue;
+        }
+        buf[got] = '\0';
+        /* comm (field 2) may hold spaces/parens; skip past its closing ')'. */
+        char *p = strrchr(buf, ')');
+        if (!p) {
+            continue;
+        }
+        int field = 2;  /* ')' closed comm; next token is field 3 (state) */
+        char *save = NULL;
+        for (char *tok = strtok_r(p + 1, " ", &save); tok;
+             tok = strtok_r(NULL, " ", &save)) {
+            if (++field == 43) {  /* guest_time */
+                ticks += strtoull(tok, NULL, 10);
+                break;
+            }
+        }
+    }
+    return ticks * (1000000000ULL / (uint64_t)hz);
+}
+
 static bool sf_restore_exec_base_valid;
 static uint64_t sf_restore_last_guest_active_wall_ns;
 static uint64_t sf_restore_last_guest_active_cpu_ns;
 static uint64_t sf_restore_last_pf_taken;
+static uint64_t sf_restore_last_halt_wait_ns;
+static uint64_t sf_restore_last_halt_poll_ns;
+static uint64_t sf_restore_last_guest_time_ns;
 
 /* ---- test knobs (teeth for the phase1.5 gates) ---- */
 bool sf_skip_tsc(void)   /* exposed for the terminal snapshot path's refreeze */
@@ -868,6 +921,7 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
     uint64_t t_cpusync = 0, t_tsc = 0, t_reprotect = 0;  /* cpusync/tsc = accum durations */
     uint64_t c_reprotect = 0;
     uint64_t guest_active_wall_us = 0, guest_active_cpu_us = 0, pf_taken = 0;
+    uint64_t halt_wait_us = 0, halt_poll_us = 0, guest_only_cpu_us = 0;
     SfRestoreSrcStat src_stat = {0};
 
     if (timing) {
@@ -880,6 +934,10 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
         uint64_t wall_now = sf_kvm_guest_active_wall_ns();
         uint64_t cpu_now = sf_kvm_guest_active_cpu_ns();
         uint64_t pf_now = sf_kvm_vcpu_stat_sum("pf_taken");
+        uint64_t halt_now = sf_kvm_vcpu_stat_sum("halt_wait_ns");
+        uint64_t poll_now = sf_kvm_vcpu_stat_sum("halt_poll_success_ns")
+                          + sf_kvm_vcpu_stat_sum("halt_poll_fail_ns");
+        uint64_t gtime_now = sf_restore_guest_time_ns();
 
         if (sf_restore_exec_base_valid) {
             guest_active_wall_us =
@@ -887,10 +945,16 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
             guest_active_cpu_us =
                 (cpu_now - sf_restore_last_guest_active_cpu_ns) / 1000;
             pf_taken = pf_now - sf_restore_last_pf_taken;
+            halt_wait_us = (halt_now - sf_restore_last_halt_wait_ns) / 1000;
+            halt_poll_us = (poll_now - sf_restore_last_halt_poll_ns) / 1000;
+            guest_only_cpu_us = (gtime_now - sf_restore_last_guest_time_ns) / 1000;
         }
         sf_restore_last_guest_active_wall_ns = wall_now;
         sf_restore_last_guest_active_cpu_ns = cpu_now;
         sf_restore_last_pf_taken = pf_now;
+        sf_restore_last_halt_wait_ns = halt_now;
+        sf_restore_last_halt_poll_ns = poll_now;
+        sf_restore_last_guest_time_ns = gtime_now;
         sf_restore_exec_base_valid = true;
     }
     sf_track_drain();
@@ -961,7 +1025,9 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
                 "total=%.1fus total_cpu=%.1fus (W=%zu) reprotect_pages=%zu "
                 "src_root=%zu src_shared=%zu src_private=%zu src_null=%zu "
                 "guest_active_wall=%" PRIu64 "us guest_active_cpu=%" PRIu64 "us "
-                "pf_taken=%" PRIu64 "\n",
+                "pf_taken=%" PRIu64 " "
+                "halt_wait=%" PRIu64 "us halt_poll=%" PRIu64 "us "
+                "guest_only_cpu=%" PRIu64 "us\n",
                 dst->id, src == dst ? "inplace" : "cross",
                 (t1 - t0) / 1000.0, (c1 - c0) / 1000.0,
                 (t2 - t1) / 1000.0,
@@ -971,7 +1037,8 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
                 (t_reprotect - t0) / 1000.0, (c_reprotect - c0) / 1000.0,
                 n, reprotect_pages,
                 src_stat.root, src_stat.shared, src_stat.private, src_stat.null_src,
-                guest_active_wall_us, guest_active_cpu_us, pf_taken);
+                guest_active_wall_us, guest_active_cpu_us, pf_taken,
+                halt_wait_us, halt_poll_us, guest_only_cpu_us);
     }
     monitor_printf(NULL, "sf: restore ok: dst=%u device=%s ram W=%zu\n",
                    dst->id, dst->dev.have ? "replayed" : "SKIPPED", n);

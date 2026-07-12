@@ -30,56 +30,7 @@ static int sf_write_file(const char *path, const void *buf, size_t len,
 }
 
 static int sf_write_all(int fd, const void *buf, size_t len);  /* defined below */
-
-/* root.ram = root node backing: each block concatenated in block_id order (raw,
- * no header — the layout lives in the manifest). File-backed root created in
- * the target dir seals in place; anon/debug root falls back to one O(RAM) write. */
-static int sf_persist_root_ram(SfSnapNode *root, const char *dir,
-                               uint64_t *out_len, Error **errp)
-{
-    char *path;
-    int ret;
-
-    if (!root->ram.data || root->ram.map_len != sf_blocks_root_len()) {
-        error_setg(errp, "sf_persist: root backing missing/short");
-        return -1;
-    }
-    *out_len = root->ram.map_len;
-    path = g_build_filename(dir, "root.ram", NULL);
-    if (root->ram.backing == SF_BACKING_FILE && root->ram.path &&
-        !strcmp(root->ram.path, path)) {
-        ret = sf_rootstore_seal(&root->ram, errp);
-    } else {
-        ret = sf_write_file(path, root->ram.data, root->ram.map_len, errp);
-    }
-    g_free(path);
-    return ret;
-}
-
-/* Copy a node's (anon) diff store into nodes/<id>.ram in FILE format + seal. */
-static int sf_persist_node_ram(const char *dir, SfSnapNode *n, Error **errp)
-{
-    size_t psize = qemu_real_host_page_size();
-    char name[32];
-    char *path;
-    SfRamStore fs;
-    int ret;
-
-    snprintf(name, sizeof(name), "nodes/%u.ram", n->id);
-    path = g_build_filename(dir, name, NULL);
-    ret = sf_ramstore_create_file(&fs, n->ram.n_pages, path, errp);
-    if (ret == 0) {
-        if (n->ram.n_pages) {
-            memcpy(fs.index, n->ram.index,
-                   (size_t)n->ram.n_pages * sizeof(SfPageKey));
-            memcpy(fs.data, n->ram.data, (size_t)n->ram.n_pages * psize);
-        }
-        ret = sf_ramstore_seal(&fs, errp);
-        sf_ramstore_destroy(&fs);
-    }
-    g_free(path);
-    return ret;
-}
+static int sf_persist_ensure_dirs(const char *dir, Error **errp);  /* defined below */
 
 /* Write a device stream (方案 B) to <dir>/<name> and fsync it. The fsync is the
  * commit-point ordering guarantee for promote: the .dev must be durable BEFORE
@@ -306,110 +257,52 @@ static void sf_manifest_put_exclude(QDict *man)
     qdict_put(man, "exclude", ex);
 }
 
-/* Walk @n's subtree pre-order: write each non-root diff store + device stream,
- * and append the node record to nodes.log (@log_fd). Parent is always written
- * before its children, so the log is loadable in file order. Sets *ret on first
- * failure. */
-static void sf_persist_walk(SfSnapNode *n, int log_fd, const char *dir,
-                            bool skip_common, Error **errp, int *ret)
+/* Promote (file-back + record) every not-yet-PERSISTED node in @n's subtree, parent
+ * before child so sf_snap_promote's persisted-ancestor invariant holds. Common-prefix
+ * nodes are already PERSISTED (loaded read-only from common_dir) → skipped, but we
+ * still recurse so private descendants hanging off them are flushed. */
+static int sf_persist_promote_subtree(SfSnapNode *n, const char *dir,
+                                      const char *common_ref, Error **errp)
 {
     SfSnapNode *child;
-    char line[192];
-    int llen;
-    char dname[32];
 
-    if (*ret) {
-        return;
+    if (n->state != SF_SNAP_PERSISTED &&
+        sf_snap_promote(n, dir, common_ref, errp) < 0) {
+        return -1;
     }
-    /* Two-dir private persist: the common prefix (worker-0 nodes) already lives
-     * read-only in common_dir — don't re-copy it. Skip writing this node but
-     * still recurse so private descendants hanging off it are written; their
-     * records reference the common parent id, resolved via the loaded common
-     * tree at cold-start (plan 04 §2.2/§2.4). */
-    if (skip_common && SF_NODE_IS_COMMON(n)) {
-        QLIST_FOREACH(child, &n->children, sibling) {
-            sf_persist_walk(child, log_fd, dir, skip_common, errp, ret);
-        }
-        return;
-    }
-    if (n->parent && sf_persist_node_ram(dir, n, errp) < 0) {
-        *ret = -1;
-        return;
-    }
-    if (n->parent) {
-        snprintf(dname, sizeof(dname), "nodes/%u.dev", n->id);
-    } else {
-        /* root's device stream lives next to root.ram (cold start feeds it to
-         * qemu_load_device_state / sf_preparse_stream). */
-        snprintf(dname, sizeof(dname), "root.dev");
-    }
-    if (sf_persist_dev(dir, dname, &n->dev, errp) < 0) {
-        *ret = -1;
-        return;
-    }
-
-    llen = sf_node_record_line(n, line, sizeof(line));
-    if (sf_write_all(log_fd, line, llen) < 0) {
-        error_setg_errno(errp, errno, "sf_snap_persist: write nodes.log");
-        *ret = -1;
-        return;
-    }
-
     QLIST_FOREACH(child, &n->children, sibling) {
-        sf_persist_walk(child, log_fd, dir, skip_common, errp, ret);
+        if (sf_persist_promote_subtree(child, dir, common_ref, errp) < 0) {
+            return -1;
+        }
     }
+    return 0;
 }
 
+/* persist = flush the whole private subtree by promoting every node not yet on disk
+ * (idempotent — already-PERSISTED nodes, including the common prefix, are skipped).
+ * Replaces the old whole-tree truncate-and-rewrite: snapshot nodes are immutable, so
+ * re-serializing already-persisted nodes was pure waste, and the two paths' divergent
+ * bookkeeping forced the "don't mix persist/promote in one workdir" rule
+ * (snapshot-tree.md §4). One mechanism now — promote — so that rule is gone. */
 int sf_snap_persist(SfSnapNode *root, const char *dir,
                     const char *common_ref, Error **errp)
 {
-    bool skip_common = (common_ref != NULL);
-    uint64_t root_len = 0;
-    char *ndir, *lpath;
-    int log_fd = -1;
-    int ret = -1;
-
     if (!root || root->parent) {
         error_setg(errp, "sf_snap_persist: need the root node");
         return -EINVAL;
     }
-    if (g_mkdir_with_parents(dir, 0700) < 0) {
-        error_setg_errno(errp, errno, "sf_snap_persist: mkdir %s", dir);
+    if (sf_persist_ensure_dirs(dir, errp) < 0) {
         return -1;
     }
-    ndir = g_build_filename(dir, "nodes", NULL);
-    ret = g_mkdir_with_parents(ndir, 0700);
-    g_free(ndir);
-    if (ret < 0) {
-        error_setg_errno(errp, errno, "sf_snap_persist: mkdir nodes/");
+    /* Two-dir: the common root is already PERSISTED (skipped below), so no promote
+     * writes this private dir's manifest header. Write it once (records @common_ref)
+     * so a single-dir cold-start of this private dir resolves its common base.
+     * Single-dir: sf_snap_promote(root) below writes the header itself. */
+    if (common_ref &&
+        sf_manifest_write_header(dir, sf_blocks_root_len(), common_ref, errp) < 0) {
         return -1;
     }
-    /* Two-dir private persist skips the common root.ram (it stays read-only in
-     * common_dir); the header records @common_ref instead. */
-    if (!skip_common && sf_persist_root_ram(root, dir, &root_len, errp) < 0) {
-        return -1;
-    }
-    /* Header (no nodes) first; nodes go to a fresh nodes.log below. */
-    if (sf_manifest_write_header(dir, root_len, common_ref, errp) < 0) {
-        return -1;
-    }
-
-    lpath = sf_node_log_path(dir);
-    log_fd = open(lpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    g_free(lpath);
-    if (log_fd < 0) {
-        error_setg_errno(errp, errno, "sf_snap_persist: open nodes.log");
-        return -1;
-    }
-
-    ret = 0;
-    sf_persist_walk(root, log_fd, dir, skip_common, errp, &ret);
-    if (ret == 0 && (fsync(log_fd) < 0)) {
-        error_setg_errno(errp, errno, "sf_snap_persist: fsync nodes.log");
-        ret = -1;
-    }
-    close(log_fd);
-    return ret;
+    return sf_persist_promote_subtree(root, dir, common_ref, errp);
 }
 
 /* ---- promote side (connected prefix, in-place backing switch) ---- */

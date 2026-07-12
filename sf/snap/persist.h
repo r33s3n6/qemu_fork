@@ -30,7 +30,7 @@
  * read-only in @common_ref — and only the worker's private nodes are written,
  * with a 'common' back-reference recorded in the manifest. NULL = a
  * self-contained single-dir tree (the whole tree, root.ram included). */
-int  sf_snap_persist(SfSnapNode *root, const char *dir, bool save_exclude,
+int  sf_snap_persist(SfSnapNode *root, const char *dir,
                      const char *common_ref, Error **errp);
 
 /* Promote one node into @dir's append-only log. Root may be promoted first; a
@@ -69,6 +69,6 @@ void sf_snap_free_loaded(SfSnapNode *root);
 /* Cold-start only: re-read @dir/manifest.json's exclude list and rebuild the
  * live NO_RESTORE table from block-relative offsets (host = live block base +
  * off). Requires the live block registry to be enumerated first. §4.2-3. */
-int  sf_exclude_reload(const char *dir, bool restore_content, Error **errp);
+int  sf_exclude_reload(const char *dir, Error **errp);
 
 #endif /* SF_SNAP_PERSIST_H */

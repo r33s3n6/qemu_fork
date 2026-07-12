@@ -1388,7 +1388,7 @@ static void sf_selftest_persist(Monitor *mon, bool *all_ok)
     root = sf_active;
     while (root->parent) { root = root->parent; }
 
-    if (sf_snap_persist(root, dir, false, NULL, &err) < 0) {
+    if (sf_snap_persist(root, dir, NULL, &err) < 0) {
         report(mon, all_ok, "G persist", false, error_get_pretty(err));
         error_free(err); goto out;
     }
@@ -1534,12 +1534,12 @@ static void sf_selftest_persist(Monitor *mon, bool *all_ok)
                 if (sf_snap_promote(fC, fdir, NULL, &err) < 0) {
                     prom_ok = false; error_free(err); err = NULL; break;
                 }
-                if (sf_cold_start(fdir, NULL, b_id, false, false, &err) < 0) {
+                if (sf_cold_start(fdir, NULL, b_id, false, &err) < 0) {
                     error_free(err); err = NULL; break;
                 }
                 cold_b = (sf_rd32(SF_ST_BASE) == vB);
                 if (!cold_b) { break; }
-                if (sf_cold_start(fdir, NULL, c_id, false, false, &err) < 0) {
+                if (sf_cold_start(fdir, NULL, c_id, false, &err) < 0) {
                     error_free(err); err = NULL; break;
                 }
                 cold_c = (sf_rd32(SF_ST_BASE) == vC);
@@ -1666,18 +1666,26 @@ static void sf_selftest_cold_start(Monitor *mon, bool *all_ok)
     while (root->parent) {
         root = root->parent;
     }
-    /* §4.2-3 teeth: a NO_RESTORE range must survive persist → cold-start. Use a
-     * page other than the marker page so it does not perturb the RAM
-     * equivalence assert below. */
+    /* §4.2-3 teeth: a NO_RESTORE range must survive persist → cold-start, with its
+     * content flowing from the file-backed shared buffer (bufs/<id>.buf), not from a
+     * persisted exclude.ram (deleted in S7). Use a page other than the marker page so
+     * it does not perturb the RAM equivalence assert below. */
     sf_exclude_clear();
     {
         void *hx = sf_gpa_to_host(SF_ST_BASE + SF_ST_PAGE);
         if (hx) {
             sf_exclude_add((uint64_t)(uintptr_t)hx, SF_ST_PAGE, 7);
-            *(uint32_t *)hx = 0x4e525346U;
+            /* Back it with bufs/7.buf (MAP_SHARED), as a real REGISTER_BUF does. */
+            if (sf_buf_remap((uint64_t)(uintptr_t)hx, SF_ST_PAGE, 7, dir,
+                             true, true, &err) < 0) {
+                report(mon, all_ok, "8 buf-remap", false, error_get_pretty(err));
+                error_free(err);
+                goto out;
+            }
+            *(uint32_t *)hx = 0x4e525346U;   /* lands in the shared file */
         }
     }
-    if (sf_snap_persist(root, dir, true, NULL, &err) < 0) {
+    if (sf_snap_persist(root, dir, NULL, &err) < 0) {
         report(mon, all_ok, "8 cold-start", false, error_get_pretty(err));
         error_free(err);
         goto out;
@@ -1689,6 +1697,10 @@ static void sf_selftest_cold_start(Monitor *mon, bool *all_ok)
         goto out;
     }
     hot = sf_rd32(SF_ST_BASE);
+    /* Write the buffer AFTER persist: the page is still MAP_SHARED to bufs/7.buf so
+     * this 0xdeadbeef lands in the file. root.ram (captured at persist) holds the
+     * pre-write value, so reading it back post cold-start proves content came from
+     * the file (sf_cold_remap_bufs), not the persisted RAM. */
     {
         void *hx = sf_gpa_to_host(SF_ST_BASE + SF_ST_PAGE);
         if (hx) {
@@ -1696,7 +1708,7 @@ static void sf_selftest_cold_start(Monitor *mon, bool *all_ok)
         }
     }
 
-    if (sf_cold_start(dir, NULL, L1->id, true, false, &err) < 0) {
+    if (sf_cold_start(dir, NULL, L1->id, false, &err) < 0) {
         report(mon, all_ok, "8 cold-start", false, error_get_pretty(err));
         error_free(err);
         goto out;
@@ -1715,14 +1727,17 @@ static void sf_selftest_cold_start(Monitor *mon, bool *all_ok)
         snprintf(buf, sizeof(buf), "count=%zu hit=%d",
                  sf_exclude_count(), (hx && sf_excluded(hx)));
         report(mon, all_ok, "8 exclude-zone rebuilt from manifest", excl_ok, buf);
-        bool content_ok = hx && *(uint32_t *)hx == 0x4e525346U;
+        /* Content flows from the file-backed buffer: the post-persist 0xdeadbeef went
+         * to bufs/7.buf and cold-start's sf_cold_remap_bufs re-mmaps it. */
+        bool content_ok = hx && *(uint32_t *)hx == 0xdeadbeefU;
         snprintf(buf, sizeof(buf), "value=0x%08x",
                  hx ? *(uint32_t *)hx : 0);
-        report(mon, all_ok, "8 exclude content optional restore", content_ok, buf);
+        report(mon, all_ok, "8 file-backed buffer content restored from bufs file",
+               content_ok, buf);
     }
 
     {
-        bool rejected = (sf_cold_start(dir, NULL, 0x7ffffffeU, false, false, &err) < 0);
+        bool rejected = (sf_cold_start(dir, NULL, 0x7ffffffeU, false, &err) < 0);
         snprintf(buf, sizeof(buf), "invalid-id rejected=%d", rejected);
         report(mon, all_ok, "8-neg cold-start bad-id teeth", rejected, buf);
         error_free(err);
@@ -1783,7 +1798,7 @@ static void sf_selftest_cold_start_twodir(Monitor *mon, bool *all_ok)
     while (root->parent) {
         root = root->parent;
     }
-    if (sf_snap_persist(root, cdir, false, NULL, &err) < 0) {
+    if (sf_snap_persist(root, cdir, NULL, &err) < 0) {
         report(mon, all_ok, "2dir common persist", false, error_get_pretty(err));
         error_free(err);
         goto out;
@@ -1803,7 +1818,7 @@ static void sf_selftest_cold_start_twodir(Monitor *mon, bool *all_ok)
         goto out;
     }
     /* Two-dir persist: skip_common → only P1 written to private_dir. */
-    if (sf_snap_persist(root, pdir, false, cdir, &err) < 0) {
+    if (sf_snap_persist(root, pdir, cdir, &err) < 0) {
         report(mon, all_ok, "2dir private persist", false, error_get_pretty(err));
         error_free(err);
         goto out;
@@ -1831,7 +1846,7 @@ static void sf_selftest_cold_start_twodir(Monitor *mon, bool *all_ok)
         goto out;
     }
 
-    if (sf_cold_start(cdir, pdir, p1_id, false, false, &err) < 0) {
+    if (sf_cold_start(cdir, pdir, p1_id, false, &err) < 0) {
         report(mon, all_ok, "2dir cold-start", false, error_get_pretty(err));
         error_free(err);
         goto out;
@@ -1842,7 +1857,7 @@ static void sf_selftest_cold_start_twodir(Monitor *mon, bool *all_ok)
 
     /* Teeth (b): a private id never persisted must be rejected. */
     {
-        bool rejected = (sf_cold_start(cdir, pdir, SF_ID(1, 99), false, false,
+        bool rejected = (sf_cold_start(cdir, pdir, SF_ID(1, 99), false,
                                        &err) < 0);
         snprintf(buf, sizeof(buf), "missing-private rejected=%d", rejected);
         report(mon, all_ok, "2dir missing-private teeth", rejected, buf);

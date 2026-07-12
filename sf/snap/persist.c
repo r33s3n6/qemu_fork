@@ -238,8 +238,7 @@ out:
 
 /* NO_RESTORE table → manifest as block-relative offsets (defined below; forward
  * declared so the header writer can call it). */
-static int sf_manifest_put_exclude(QDict *man, const char *dir,
-                                   bool save_content, Error **errp);
+static void sf_manifest_put_exclude(QDict *man);
 
 /* manifest.json header (NO nodes — those are in nodes.log). Written atomically
  * (tmp+rename via g_file_set_contents). Used by sf_snap_persist and by promote
@@ -248,8 +247,7 @@ static int sf_manifest_put_exclude(QDict *man, const char *dir,
  * the read-only common base dir instead of a self-contained root.ram, so a
  * cold-start given only this private_dir can still find its common base. */
 static int sf_manifest_write_header(const char *dir, uint64_t root_ram_len,
-                                    bool save_exclude, const char *common_ref,
-                                    Error **errp)
+                                    const char *common_ref, Error **errp)
 {
     QDict *man = qdict_new();
     GString *json;
@@ -264,10 +262,7 @@ static int sf_manifest_write_header(const char *dir, uint64_t root_ram_len,
         qdict_put_int(man, "root_ram_len", (int64_t)root_ram_len);
     }
     sf_manifest_put_blocks(man);
-    if (sf_manifest_put_exclude(man, dir, save_exclude, errp) < 0) {
-        qobject_unref(man);
-        return -1;
-    }
+    sf_manifest_put_exclude(man);
 
     json = qobject_to_json_pretty(QOBJECT(man), true);
     mpath = g_build_filename(dir, "manifest.json", NULL);
@@ -278,15 +273,16 @@ static int sf_manifest_write_header(const char *dir, uint64_t root_ram_len,
     return ret;
 }
 
-/* NO_RESTORE table → manifest as block-relative offsets. Host bases differ per
- * process, so a cold-started worker rebuilds host addresses from (block,off).
- * §4.2-3: without this a worker resuming from snapshot X has an empty exclude
- * table and restore rolls back its task buffer. */
-static int sf_manifest_put_exclude(QDict *man, const char *dir,
-                                   bool save_content, Error **errp)
+/* NO_RESTORE table → manifest as block-relative offsets (block,off,size,buf_id).
+ * Content is NOT persisted here: every registered NO_RESTORE buffer is file-backed
+ * (bufs/<buf_id>.buf via sf_buf_remap) and its content is restored from that shared
+ * file by sf_cold_remap_bufs after reload. Host bases differ per process, so a
+ * cold-started worker rebuilds host addresses from (block,off). §4.2-3: without the
+ * table a worker resuming from snapshot X has an empty exclude set and restore rolls
+ * back its task buffer. */
+static void sf_manifest_put_exclude(QDict *man)
 {
     QList *ex = qlist_new();
-    GByteArray *content = save_content ? g_byte_array_new() : NULL;
     size_t psize = qemu_real_host_page_size();
     size_t n = sf_exclude_count();
 
@@ -300,41 +296,14 @@ static int sf_manifest_put_exclude(QDict *man, const char *dir,
             !sf_host_to_key_safe((void *)(uintptr_t)host_start, &key)) {
             continue;
         }
-        if (content &&
-            (size > G_MAXUINT || content->len > G_MAXUINT - (guint)size)) {
-            error_setg(errp, "sf_persist: NO_RESTORE content exceeds 4GiB");
-            qobject_unref(ex);
-            g_byte_array_unref(content);
-            return -1;
-        }
         e = qdict_new();
         qdict_put_int(e, "block", SF_KEY_BLOCK(key));
         qdict_put_int(e, "off", (int64_t)(SF_KEY_PFN(key) * psize));
         qdict_put_int(e, "size", (int64_t)size);
         qdict_put_int(e, "buf_id", buf_id);
-        if (content) {
-            qdict_put_int(e, "data_off", (int64_t)content->len);
-            g_byte_array_append(content, (const uint8_t *)(uintptr_t)host_start,
-                                size);
-        }
         qlist_append_obj(ex, QOBJECT(e));
     }
     qdict_put(man, "exclude", ex);
-    if (content) {
-        char *path = g_build_filename(dir, "exclude.ram", NULL);
-        int ret = sf_write_file(path, content->data, content->len, errp);
-        g_free(path);
-        g_byte_array_unref(content);
-        if (ret < 0) {
-            return -1;
-        }
-        qdict_put_bool(man, "exclude_content", true);
-    } else {
-        char *path = g_build_filename(dir, "exclude.ram", NULL);
-        unlink(path);
-        g_free(path);
-    }
-    return 0;
 }
 
 /* Walk @n's subtree pre-order: write each non-root diff store + device stream,
@@ -391,7 +360,7 @@ static void sf_persist_walk(SfSnapNode *n, int log_fd, const char *dir,
     }
 }
 
-int sf_snap_persist(SfSnapNode *root, const char *dir, bool save_exclude,
+int sf_snap_persist(SfSnapNode *root, const char *dir,
                     const char *common_ref, Error **errp)
 {
     bool skip_common = (common_ref != NULL);
@@ -421,8 +390,7 @@ int sf_snap_persist(SfSnapNode *root, const char *dir, bool save_exclude,
         return -1;
     }
     /* Header (no nodes) first; nodes go to a fresh nodes.log below. */
-    if (sf_manifest_write_header(dir, root_len, save_exclude, common_ref,
-                                 errp) < 0) {
+    if (sf_manifest_write_header(dir, root_len, common_ref, errp) < 0) {
         return -1;
     }
 
@@ -605,7 +573,7 @@ int sf_snap_promote(SfSnapNode *node, const char *dir, const char *common_ref,
         /* Root promote establishes the workdir: write the header (manifest.json)
          * once. Non-root promotes inherit it — the header is tree-level and
          * stable, so they only append their node record. */
-        if (sf_manifest_write_header(dir, sf_blocks_root_len(), false, NULL,
+        if (sf_manifest_write_header(dir, sf_blocks_root_len(), NULL,
                                      errp) < 0) {
             return -1;
         }
@@ -1119,26 +1087,7 @@ void sf_snap_free_loaded(SfSnapNode *root)
     g_free(root);
 }
 
-/* A file-backed registered buffer (buf_id != 0 with a bufs/<id>.buf in dir) gets
- * its content from sf_cold_remap_bufs (mmap the shared file) right after reload,
- * so it needs no persisted exclude.ram content. Plain NO_RESTORE state pages
- * (buf_id 0, or no file) still require it. */
-static bool sf_exclude_entry_filebacked(const char *dir, QDict *ed)
-{
-    uint32_t buf_id = (uint32_t)qdict_get_try_int(ed, "buf_id", 0);
-    char *bp;
-    bool have;
-
-    if (buf_id == 0) {
-        return false;
-    }
-    bp = sf_buf_path(dir, buf_id);
-    have = g_file_test(bp, G_FILE_TEST_IS_REGULAR);
-    g_free(bp);
-    return have;
-}
-
-int sf_exclude_reload(const char *dir, bool restore_content, Error **errp)
+int sf_exclude_reload(const char *dir, Error **errp)
 {
     char *mpath = g_build_filename(dir, "manifest.json", NULL);
     gchar *jstr = NULL;
@@ -1148,8 +1097,6 @@ int sf_exclude_reload(const char *dir, bool restore_content, Error **errp)
     QDict *man;
     QList *ex;
     const QListEntry *e;
-    gchar *content = NULL;
-    gsize content_len = 0;
     int ret = -1;
 
     if (!g_file_get_contents(mpath, &jstr, &jlen, &gerr)) {
@@ -1171,34 +1118,11 @@ int sf_exclude_reload(const char *dir, bool restore_content, Error **errp)
         goto out;
     }
     ex = qobject_to(QList, qdict_get(man, "exclude"));
-    /* Demand persisted exclude.ram only when a *non-file-backed* NO_RESTORE page
-     * exists. File-backed buffers get content from sf_cold_remap_bufs (the shared
-     * file) after this reload, so a pipe `p` base with only registered buffers
-     * (save_exclude=false) cold-starts fine. Empty exclude → no-op. */
-    if (restore_content && ex) {
-        QLIST_FOREACH_ENTRY(ex, e) {
-            QDict *ed = qobject_to(QDict, qlist_entry_obj(e));
-            if (ed && !sf_exclude_entry_filebacked(dir, ed)) {
-                char *path;
-                if (!qdict_get_try_bool(man, "exclude_content", false)) {
-                    error_setg(errp, "sf_exclude_reload: content was not persisted");
-                    goto out;
-                }
-                path = g_build_filename(dir, "exclude.ram", NULL);
-                if (!g_file_get_contents(path, &content, &content_len, &gerr)) {
-                    error_setg(errp, "sf_exclude_reload: read %s: %s", path,
-                               gerr->message);
-                    g_error_free(gerr);
-                    g_free(path);
-                    goto out;
-                }
-                g_free(path);
-                break;
-            }
-        }
-    }
 
-    /* Rebuild from a clean slate: block-relative (block,off) → live host base. */
+    /* Rebuild the exclude table from a clean slate: block-relative (block,off) →
+     * live host base. Content is NOT restored here — every registered buffer is
+     * file-backed and sf_cold_remap_bufs mmaps it from bufs/<buf_id>.buf right
+     * after this reload. Empty exclude → no-op. */
     sf_exclude_clear();
     if (ex) {
         QLIST_FOREACH_ENTRY(ex, e) {
@@ -1219,21 +1143,10 @@ int sf_exclude_reload(const char *dir, bool restore_content, Error **errp)
             }
             sf_exclude_add((uint64_t)(uintptr_t)((uint8_t *)sf_blocks[bid].host + off),
                            size, (uint32_t)qdict_get_try_int(ed, "buf_id", 0));
-            /* File-backed buffers restore via sf_cold_remap_bufs, not exclude.ram. */
-            if (restore_content && content && !sf_exclude_entry_filebacked(dir, ed)) {
-                uint64_t data_off = (uint64_t)qdict_get_try_int(ed, "data_off", -1);
-                if (data_off > content_len || size > content_len - data_off) {
-                    error_setg(errp, "sf_exclude_reload: content range out of bounds");
-                    goto out;
-                }
-                memcpy((uint8_t *)sf_blocks[bid].host + off,
-                       content + data_off, size);
-            }
         }
     }
     ret = 0;
 out:
-    g_free(content);
     qobject_unref(o);
     return ret;
 }

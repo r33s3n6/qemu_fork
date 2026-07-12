@@ -246,7 +246,7 @@ static void sf_gate_do_persist(void)
     for (root = sf_active; root->parent; root = root->parent) {
         /* walk to root */
     }
-    if (sf_snap_persist(root, dir, false, common_ref, &err) < 0) {
+    if (sf_snap_persist(root, dir, common_ref, &err) < 0) {
         fprintf(stderr, "sf-gate: persist %s failed: %s\n",
                 dir, error_get_pretty(err));
         error_free(err);

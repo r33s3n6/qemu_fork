@@ -302,7 +302,7 @@ static void sf_boot_cold_start_bh(void *opaque)
         vm_stop(RUN_STATE_RESTORE_VM);
     }
     if (sf_cold_start(c->common_dir, c->private_dir, c->initial_node,
-                      true, true, &err) < 0) {
+                      true, &err) < 0) {
         error_report("sf-config: boot cold-start failed: %s",
                      error_get_pretty(err));
         exit(1);

@@ -26,8 +26,11 @@ typedef enum {
     SF_CTL_CONTINUE = 'c',   /* resume to next boundary */
     SF_CTL_SNAPSHOT = 's',   /* save here, stay parked; reply s <id> */
     SF_CTL_RESTORE  = 'r',   /* restore [arg=id, 0xFFFFFFFF=active] + resume */
-    SF_CTL_PERSIST  = 'p',   /* persist tree to configured private_dir; stay parked */
-    SF_CTL_PROMOTE  = 'P',   /* promote [arg=id/active] to private_dir; stay parked */
+    /* v2.1 letter swap: promote is the hot single-node op → lowercase; persist is
+     * the low-frequency batch op → uppercase. Enum value IS the wire byte, so the
+     * dispatch (by enum name) follows automatically. */
+    SF_CTL_PROMOTE  = 'p',   /* promote [arg=id/active] to private_dir; stay parked */
+    SF_CTL_PERSIST  = 'P',   /* persist tree to configured private_dir; stay parked */
     SF_CTL_BAD      = 0,     /* unknown op */
 } SfCtlCmdKind;
 

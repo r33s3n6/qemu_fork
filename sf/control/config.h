@@ -15,6 +15,10 @@
  *   SF_PRIVATE_DIR         worker's writable dir (persist/promote target)
  *   SF_RESUME_TIMEOUT_MS   next-resume timeout, 0 = infinite (default 0)
  *   SF_GATE                a=ALLOW (default) / d=DISABLE / s=STRICT
+ *   SF_RESTORE_FAIL_POLICY panic (default) / notify / pause — how a restore
+ *                          failure (bad id / engine error) is handled. A failed
+ *                          restore is never papered over with a guest sentinel:
+ *                          the guest is powerless, so fail loud at the host level.
  *   SF_COLD_START_ON_BOOT  1 = auto cold-start at boot; 0 = fresh boot (default 0)
  *   SF_INITIAL_NODE        cold-start restore target node id (default 0)
  *
@@ -25,11 +29,20 @@
 
 #include "sf/control/channel.h"   /* SfCtlGateMode */
 
+/* How a restore failure is handled (SF_RESTORE_FAIL_POLICY). A failed restore
+ * (bad id / engine error) is fatal to the run — never a guest-visible sentinel. */
+typedef enum {
+    SF_RFP_PANIC = 0,   /* default: error_report + abort */
+    SF_RFP_NOTIFY,      /* reply SF_ST_ERROR to the host pipe + park; no chardev -> panic */
+    SF_RFP_PAUSE,       /* vm_stop(PAUSED) — freeze the VM for manual triage (HMP/gdb) */
+} SfRestoreFailPolicy;
+
 typedef struct {
     char          common_dir[1024];
     char          private_dir[1024];
     int64_t       resume_timeout_ms;   /* 0 = infinite */
     SfCtlGateMode gate_mode;
+    SfRestoreFailPolicy restore_fail_policy;
     bool          cold_start_on_boot;
     uint32_t      initial_node;
 } SfConfig;

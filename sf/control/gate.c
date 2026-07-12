@@ -19,6 +19,7 @@
 #include "qemu/thread.h"
 #include "qemu/main-loop.h"      /* bql_lock/bql_unlock */
 #include "qemu/timer.h"
+#include "qemu/error-report.h"   /* error_report */
 #include "system/runstate.h"
 #include "qapi/error.h"
 #include "sf/sf.h"                /* sf_checkpoint_snapshot */
@@ -110,6 +111,40 @@ static void sf_gate_begin_resume_locked(void)
     sf_gate_state = SF_CS_RUNNING;
     sf_gate_pending = false;
     sf_gate_arm_locked();
+}
+
+/* ---- restore-failure policy (shared by every restore-failure site) ---- */
+
+bool sf_restore_fail(uint32_t id, const char *reason)
+{
+    SfRestoreFailPolicy pol = sf_config()->restore_fail_policy;
+
+    error_report("sf-restore: restore(id=%u) failed: %s", id, reason);
+
+    switch (pol) {
+    case SF_RFP_NOTIFY:
+        /* notify needs the host pipe; without a chardev there is no one to tell,
+         * so a silent continue is impossible — fall through to panic. */
+        if (sf_control_active()) {
+            sf_control_reply(SF_ST_ERROR, SF_ERR_RESTORE_FAILED);
+            return false;   /* stay parked; host decides next */
+        }
+        break;
+    case SF_RFP_PAUSE:
+        /* A direct vm_stop from the vcpu io-exit boundary (or a timer) self-
+         * deadlocks pause_all_vcpus; request it on the main loop (same pattern as
+         * sf_gate_timer_fire). Return true so a gate-boundary caller leaves its
+         * park loop and the vcpu re-enters KVM_RUN where the deferred stop lands. */
+        qemu_system_vmstop_request_prepare();
+        qemu_system_vmstop_request(RUN_STATE_PAUSED);
+        return true;
+    case SF_RFP_PANIC:
+        break;
+    }
+
+    error_report("sf-restore: fatal — aborting (policy=panic%s)",
+                 pol == SF_RFP_NOTIFY ? ", notify without chardev" : "");
+    abort();
 }
 
 /* ---- vcpu-thread boundary primitives ---- */
@@ -353,8 +388,7 @@ bool sf_gate_boundary_cmd(const SfCtlCmd *cmd)
     case SF_CTL_RESTORE: {
         uint32_t id = cmd->has_id ? cmd->id : (sf_active ? sf_active->id : 0);
         if (!sf_snap_have_snapshot()) {
-            sf_control_reply(SF_ST_ERROR, SF_ERR_NO_SNAPSHOT);
-            return false;
+            return sf_restore_fail(id, "no snapshot");
         }
         Error *err = NULL;
         bql_lock();
@@ -364,8 +398,7 @@ bool sf_gate_boundary_cmd(const SfCtlCmd *cmd)
             fprintf(stderr, "sf-gate: restore %u failed: %s\n",
                     id, error_get_pretty(err));
             error_free(err);
-            sf_control_reply(SF_ST_ERROR, SF_ERR_RESTORE_FAILED);
-            return false;
+            return sf_restore_fail(id, "restore engine error");
         }
         sf_cp_generation_inc();
         qemu_mutex_lock(&sf_gate_mtx);
@@ -405,8 +438,8 @@ static bool sf_gate_stopped_resume(const SfCtlCmd *cmd)
 
     if (cmd->kind == SF_CTL_RESTORE) {
         if (!sf_snap_have_snapshot()) {
-            sf_control_reply(SF_ST_ERROR, SF_ERR_NO_SNAPSHOT);
-            return false;
+            sf_restore_fail(cmd->has_id ? cmd->id : 0, "no snapshot");
+            return false;   /* stopped stays stopped; pause is already the state */
         }
         uint32_t id = cmd->has_id ? cmd->id : (sf_active ? sf_active->id : 0);
         Error *err = NULL;
@@ -417,8 +450,8 @@ static bool sf_gate_stopped_resume(const SfCtlCmd *cmd)
             fprintf(stderr, "sf-gate: stopped restore %u failed: %s\n",
                     id, error_get_pretty(err));
             error_free(err);
-            sf_control_reply(SF_ST_ERROR, SF_ERR_RESTORE_FAILED);
-            return false;
+            sf_restore_fail(id, "restore engine error");
+            return false;   /* stopped stays stopped */
         }
         sf_cp_generation_inc();
         /* vm_start with the BQL held (matches HMP); release before the gate

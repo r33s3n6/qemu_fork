@@ -27,7 +27,8 @@
 
 /* inl readback (single slot, meaning depends on the cmd the guest just sent):
  *   SNAPSHOT → the new node id (driver learns the id it must later restore to)
- *   RESTORE  → generation counter (++ per restore); 0xFFFFFFFF on bad id
+ *   RESTORE  → generation counter (++ per restore); a failed restore is fatal
+ *              (SF_RESTORE_FAIL_POLICY), never a readback
  *   NOP      → generation counter
  * The guest knows which it sent, so it interprets the one slot accordingly. */
 
@@ -40,7 +41,8 @@ void sf_cp_generation_inc(void);     /* gen++ (after a restore / cold-start) */
 /* Terminal restore to an explicit node id (plan 2026-07-08 T1 §2.1). The engine
  * sf_snap_restore(dst_id) already supports any id; this wrapper replaces the
  * old fixed-`sf_active->id` call. Returns true on success, false on bad id /
- * restore error (caller sets the 0xFFFFFFFF readback). */
+ * restore error (the caller routes failure through sf_restore_fail — a failed
+ * restore is fatal, never a guest sentinel). */
 bool sf_checkpoint_restore(uint32_t id);
 
 #endif /* SF_CHECKPOINT_H */

@@ -42,6 +42,20 @@ typedef enum {
  * sf_control_init once the chardev is attached. */
 void sf_gate_init(void);
 
+/* Handle a restore failure (bad id / engine error) per SF_RESTORE_FAIL_POLICY.
+ * A failed restore is never a guest-visible sentinel — the guest is powerless.
+ *   panic  (default): error_report + abort — never returns.
+ *   notify: reply SF_ST_ERROR to the host pipe, return false (caller stays
+ *           parked; host decides). Without a chardev it degrades to panic.
+ *   pause : request a deferred vm_stop(PAUSED), return true (the caller must
+ *           leave any park loop so the vcpu re-enters KVM_RUN where the deferred
+ *           stop can actually pause it — a vcpu asleep in the gate condvar is
+ *           unreachable by pause_all_vcpus).
+ * The return value only matters to the gate-boundary callers that run a park
+ * loop; the standalone checkpoint.c path always returns to KVM_RUN and ignores
+ * it. Called from every restore-failure site. */
+bool sf_restore_fail(uint32_t id, const char *reason);
+
 /* Block the vcpu boundary loop until a command is delivered by sf_gate_route.
  * Called from sf/checkpoint.c. */
 void sf_gate_recv(SfCtlCmd *out);

@@ -131,8 +131,8 @@ static void sf_cp_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 
     /* Standalone ABI: eax = command, ebx = the full 32-bit composite node id.
      * The reply is returned in %eax on the SAME outl (Nyx-style; pushed to
-     * KVM below): SNAPSHOT → new node id, RESTORE → generation (0xFFFFFFFF on
-     * bad id), NOP → generation. No inl needed. */
+     * KVM below): SNAPSHOT → new node id, RESTORE → generation (a failed restore
+     * is fatal via sf_restore_fail, no reply), NOP → generation. No inl needed. */
     uint32_t cmd = val;
     uint32_t id = (current_cpu && kvm_enabled()) ?
                   (uint32_t)sf_kvm_get_rbx(current_cpu) : 0;
@@ -149,13 +149,21 @@ static void sf_cp_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         break;
     case SF_CP_RESTORE: {
         /* Restore rolls the vcpu (incl. RIP) back to the snapshot's outl site;
-         * bump the generation the guest reads via inl so it can tell it was
+         * bump the generation the guest reads back so it can tell it was
          * restored (gen k) apart from the first snapshot (gen 0 / new id). */
         g_sf_cp_generation++;
         if (take_bql) { bql_lock(); }
         bool ok = sf_checkpoint_restore(id);
         if (take_bql) { bql_unlock(); }
-        g_sf_cp_reply = ok ? g_sf_cp_generation : 0xFFFFFFFFu;
+        if (!ok) {
+            /* A failed restore is never papered over with a guest sentinel — the
+             * guest is powerless. Fail per SF_RESTORE_FAIL_POLICY. On notify/pause
+             * this returns and the vcpu leaves the handler with no reply (the VM is
+             * parked/paused); panic aborts. Either way no RAX is pushed. */
+            sf_restore_fail(id, "bad id or restore engine error");
+            return;
+        }
+        g_sf_cp_reply = g_sf_cp_generation;
         break;
     }
     case SF_CP_NOP:

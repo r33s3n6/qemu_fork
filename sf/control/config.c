@@ -39,6 +39,21 @@ static SfCtlGateMode parse_gate(const char *v)
     }
 }
 
+static SfRestoreFailPolicy parse_fail_policy(const char *v)
+{
+    if (!v || !v[0] || !strcmp(v, "panic")) {
+        return SF_RFP_PANIC;
+    }
+    if (!strcmp(v, "notify")) {
+        return SF_RFP_NOTIFY;
+    }
+    if (!strcmp(v, "pause")) {
+        return SF_RFP_PAUSE;
+    }
+    error_report("sf-config: SF_RESTORE_FAIL_POLICY=%s invalid (panic|notify|pause)", v);
+    exit(1);
+}
+
 void sf_config_load(void)
 {
     if (sf_cfg_loaded) {
@@ -54,6 +69,7 @@ void sf_config_load(void)
     }
 
     sf_cfg.gate_mode = parse_gate(getenv("SF_GATE"));
+    sf_cfg.restore_fail_policy = parse_fail_policy(getenv("SF_RESTORE_FAIL_POLICY"));
 
     const char *cs = getenv("SF_COLD_START_ON_BOOT");
     sf_cfg.cold_start_on_boot = (cs && cs[0] == '1');
@@ -92,6 +108,12 @@ int sf_config_set(const char *key, const char *val, Error **errp)
             return -1;
         }
         sf_cfg.gate_mode = parse_gate(val);
+    } else if (!strcmp(key, "restore_fail_policy")) {
+        if (strcmp(val, "panic") && strcmp(val, "notify") && strcmp(val, "pause")) {
+            error_setg(errp, "restore_fail_policy must be panic|notify|pause");
+            return -1;
+        }
+        sf_cfg.restore_fail_policy = parse_fail_policy(val);
     } else if (!strcmp(key, "cold_start_on_boot")) {
         sf_cfg.cold_start_on_boot = (val[0] == '1');
     } else if (!strcmp(key, "initial_node")) {

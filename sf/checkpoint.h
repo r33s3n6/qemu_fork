@@ -38,6 +38,17 @@
 void sf_cp_generation_reset(void);   /* gen = 0 (after a snapshot) */
 void sf_cp_generation_inc(void);     /* gen++ (after a restore / cold-start) */
 
+/* Execute a guest SNAPSHOT/RESTORE/NOP on the vcpu thread and push the reply the
+ * guest reads back in %rax (SNAPSHOT → new node id, RESTORE → generation, NOP →
+ * generation). THE single shared execution path: the standalone port write and
+ * the gate ALLOW self-execute both call it, so a gate=ALLOW guest with the control
+ * chardev attached is indistinguishable from no host. A failed restore never
+ * returns a guest sentinel — it routes through sf_restore_fail (fatal per policy);
+ * the return is that policy's resume decision (true = guest resumes; false = a
+ * notify-policy restore failure left the vcpu parked — only the gate caller cares,
+ * the standalone path always returns to KVM_RUN). */
+bool sf_cp_execute_and_reply(uint32_t val);
+
 /* Terminal restore to an explicit node id (plan 2026-07-08 T1 §2.1). The engine
  * sf_snap_restore(dst_id) already supports any id; this wrapper replaces the
  * old fixed-`sf_active->id` call. Returns true on success, false on bad id /

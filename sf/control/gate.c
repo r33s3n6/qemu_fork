@@ -198,37 +198,21 @@ bool sf_gate_boundary_enter(uint64_t val)
 
     switch (mode) {
     case SF_CTL_GATE_ALLOW:
-        if (val == SF_CP_SNAPSHOT) {
-            bql_lock();
-            sf_checkpoint_snapshot();
-            bql_unlock();
-            sf_cp_generation_reset();
-            sf_gate_park(SF_CS_PARKED_SNAPSHOT, SF_ST_SNAPSHOT,
-                         sf_active ? sf_active->id : 0);
-        } else if (val == SF_CP_RESTORE) {
-            if (!sf_snap_have_snapshot()) {
-                sf_gate_park(SF_CS_PARKED_CHECKPOINT, SF_ST_ERROR,
-                             SF_ERR_NO_SNAPSHOT);
-            } else {
-                Error *err = NULL;
-                uint32_t id = sf_active ? sf_active->id : 0;
-                bql_lock();
-                int r = sf_snap_restore(id, NULL, &err);
-                bql_unlock();
-                if (r < 0) {
-                    fprintf(stderr, "sf-gate: self-restore %u failed: %s\n",
-                            id, error_get_pretty(err));
-                    error_free(err);
-                    sf_gate_park(SF_CS_PARKED_CHECKPOINT, SF_ST_ERROR,
-                                 SF_ERR_RESTORE_FAILED);
-                } else {
-                    sf_cp_generation_inc();
-                    qemu_mutex_lock(&sf_gate_mtx);
-                    sf_gate_begin_resume_locked();
-                    qemu_mutex_unlock(&sf_gate_mtx);
-                    resume = true;
-                }
+        /* Guest agency: snapshot/restore self-execute exactly like the standalone
+         * path (id/gen pushed to %rax, self-return, restore failure → policy) so an
+         * ALLOW guest with the chardev attached is indistinguishable from no host.
+         * Only a STOP/yield parks, so the host still gets that boundary. The timer
+         * was disarmed above; begin_resume re-arms it, so a host-set deadline still
+         * fires during the next spin. */
+        if (val == SF_CP_SNAPSHOT || val == SF_CP_RESTORE) {
+            if (sf_cp_execute_and_reply(val)) {
+                qemu_mutex_lock(&sf_gate_mtx);
+                sf_gate_begin_resume_locked();
+                qemu_mutex_unlock(&sf_gate_mtx);
+                resume = true;
             }
+            /* else: a notify-policy restore failure already replied 'e' and left
+             * the vcpu parked (resume stays false → command loop). */
         } else {
             /* stop (0) or any unrecognized value: park as a checkpoint */
             sf_gate_park(SF_CS_PARKED_CHECKPOINT, SF_ST_CHECKPOINT, 0);

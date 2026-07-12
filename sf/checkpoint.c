@@ -101,6 +101,63 @@ out:
     }
 }
 
+bool sf_cp_execute_and_reply(uint32_t val)
+{
+    /* The region is lockless_io (see sf_cp_machine_done): under KVM this runs
+     * WITHOUT the BQL so the boundary can later block on a control-channel command
+     * without freezing the main loop (Nyx model). save/restore still need the BQL,
+     * so take it just around them — but the TCG I/O path already holds it (cputlb
+     * BQL_LOCK_GUARD), so only take it when not already held. The generation
+     * counter is a plain host word, no lock needed. */
+    bool take_bql = !bql_locked();
+
+    /* ABI: eax = command (val), ebx = the full 32-bit composite node id (RESTORE).
+     * The reply goes back in %rax on the SAME outl (Nyx +a model): no inl, no
+     * second vmexit; TCG reads g_sf_cp_reply via the inl read handler instead. */
+    uint32_t id = kvm_enabled() ? (uint32_t)sf_kvm_get_rbx(current_cpu) : 0;
+
+    switch (val) {
+    case SF_CP_SNAPSHOT:
+        if (take_bql) { bql_lock(); }
+        sf_checkpoint_snapshot();
+        if (take_bql) { bql_unlock(); }
+        g_sf_cp_generation = 0;
+        /* Reply = the just-created node id (sf_active was updated in sf_snap_save);
+         * the driver learns the id it must later restore to. */
+        g_sf_cp_reply = sf_active ? sf_active->id : 0;
+        break;
+    case SF_CP_RESTORE: {
+        /* Restore rolls the vcpu (incl. RIP) back to the snapshot outl site; bump
+         * the generation the guest reads back so it tells restore (gen k) from the
+         * first snapshot (gen 0 / new id). */
+        g_sf_cp_generation++;
+        if (take_bql) { bql_lock(); }
+        bool ok = sf_checkpoint_restore(id);
+        if (take_bql) { bql_unlock(); }
+        if (!ok) {
+            /* A failed restore is never papered over with a guest sentinel — the
+             * guest is powerless. Fail per SF_RESTORE_FAIL_POLICY (no RAX pushed);
+             * return the policy's resume decision for the gate caller. */
+            return sf_restore_fail(id, "bad id or restore engine error");
+        }
+        g_sf_cp_reply = g_sf_cp_generation;
+        break;
+    }
+    case SF_CP_NOP:
+        g_sf_cp_reply = g_sf_cp_generation;   /* boundary probe reads the generation */
+        break;
+    default:
+        fprintf(stderr, "sf-cp: unknown cmd %u\n", val);
+        g_sf_cp_reply = 0xFFFFFFFFu;
+        break;
+    }
+
+    if (kvm_enabled()) {
+        sf_kvm_put_rax(current_cpu, g_sf_cp_reply);
+    }
+    return true;
+}
+
 static void sf_cp_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     /* current_cpu is non-NULL only on a vcpu thread inside its exit handler —
@@ -111,80 +168,15 @@ static void sf_cp_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         return;
     }
 
-    /* Channel attached → host-driven boundary (slice 6b/7); the guest command
-     * value routes through the gate. Otherwise fall through to the standalone
-     * guest-driven path. */
+    /* Channel attached → the gate decides (host-driven for DISABLE/STRICT, and
+     * ALLOW self-executes snapshot/restore via sf_cp_execute_and_reply from the
+     * gate boundary — see gate.c). Otherwise the standalone guest-driven path
+     * executes directly here. */
     if (sf_control_active()) {
         sf_control_boundary(val);
         return;
     }
-
-    /* The region is lockless_io (see sf_cp_machine_done): under KVM this handler runs
-     * WITHOUT the BQL, so the boundary can later block waiting for a control-channel
-     * command without freezing the main loop (plan 2026-07-07-m3-control-channel §5.6,
-     * Nyx model). save/restore still need the BQL, so take it just around them. But
-     * the TCG I/O path already holds the BQL (cputlb BQL_LOCK_GUARD), so only take it
-     * when not already held — an unconditional bql_lock would recurse. Mirrors
-     * prepare_mmio_access's own release_lock logic. The generation counter is a plain
-     * host word, no lock needed. */
-    bool take_bql = !bql_locked();
-
-    /* Standalone ABI: eax = command, ebx = the full 32-bit composite node id.
-     * The reply is returned in %eax on the SAME outl (Nyx-style; pushed to
-     * KVM below): SNAPSHOT → new node id, RESTORE → generation (a failed restore
-     * is fatal via sf_restore_fail, no reply), NOP → generation. No inl needed. */
-    uint32_t cmd = val;
-    uint32_t id = (current_cpu && kvm_enabled()) ?
-                  (uint32_t)sf_kvm_get_rbx(current_cpu) : 0;
-
-    switch (cmd) {
-    case SF_CP_SNAPSHOT:
-        if (take_bql) { bql_lock(); }
-        sf_checkpoint_snapshot();
-        if (take_bql) { bql_unlock(); }
-        g_sf_cp_generation = 0;
-        /* Reply = the just-created node's id (sf_active was updated inside
-         * sf_snap_save); the driver learns the id it must later restore to. */
-        g_sf_cp_reply = sf_active ? sf_active->id : 0;
-        break;
-    case SF_CP_RESTORE: {
-        /* Restore rolls the vcpu (incl. RIP) back to the snapshot's outl site;
-         * bump the generation the guest reads back so it can tell it was
-         * restored (gen k) apart from the first snapshot (gen 0 / new id). */
-        g_sf_cp_generation++;
-        if (take_bql) { bql_lock(); }
-        bool ok = sf_checkpoint_restore(id);
-        if (take_bql) { bql_unlock(); }
-        if (!ok) {
-            /* A failed restore is never papered over with a guest sentinel — the
-             * guest is powerless. Fail per SF_RESTORE_FAIL_POLICY. On notify/pause
-             * this returns and the vcpu leaves the handler with no reply (the VM is
-             * parked/paused); panic aborts. Either way no RAX is pushed. */
-            sf_restore_fail(id, "bad id or restore engine error");
-            return;
-        }
-        g_sf_cp_reply = g_sf_cp_generation;
-        break;
-    }
-    case SF_CP_NOP:
-        /* boundary only (channel-mode uses this); no save/restore, no id. */
-        g_sf_cp_reply = g_sf_cp_generation;
-        break;
-    default:
-        fprintf(stderr, "sf-cp: unknown cmd %" PRIu64 "\n", val);
-        g_sf_cp_reply = 0xFFFFFFFFu;
-        break;
-    }
-
-    /* Return the reply in %RAX on the SAME outl that carried the command (Nyx
-     * NO_PT_NYX model): the guest reads it back via a `+a` outl constraint, no
-     * inl, no second vmexit. Push directly (KVM_GET_REGS→rax→KVM_SET_REGS) so it
-     * sticks regardless of the lazy dirty path — for restore, post_init already
-     * pushed the snapshot CPU; this overwrites only rax. Under KVM only (TCG
-     * reads g_sf_cp_reply via the inl read handler if it ever does one). */
-    if (kvm_enabled()) {
-        sf_kvm_put_rax(current_cpu, g_sf_cp_reply);
-    }
+    sf_cp_execute_and_reply(val);
 }
 
 static const MemoryRegionOps sf_cp_ops = {

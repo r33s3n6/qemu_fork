@@ -45,6 +45,11 @@ typedef struct {
     SfRestoreFailPolicy restore_fail_policy;
     bool          cold_start_on_boot;
     uint32_t      initial_node;
+    /* sf-param HEADER source (single-source: QEMU stamps these into the region).
+     * SF_TSC_KHZ = guest-believed TSC kHz; SF_TSC_SCALE = perceived-time scale. */
+    uint64_t      tsc_khz;
+    uint32_t      scale_ppm;      /* scale ×1e6 (1e6 = 1x), numeric for real_sleep */
+    char          scale_str[16];  /* raw SF_TSC_SCALE string, for shell dd */
 } SfConfig;
 
 /* Load config from the environment (once, at machine_init_done). Idempotent. */

@@ -39,8 +39,8 @@
 #include "sf/control/config.h"   /* sf_config: startup config + boot cold-start */
 #include "sf/snap/cold.h"        /* sf_cold_start (boot cold-start) */
 #include "sf/kvm_tsc.h"        /* sf_kvm_put_rax (outl reply in %rax, Nyx-style) */
-#include "sf/snap/node.h"      /* sf_gpa_to_host */
-#include "sf/snap/exclude.h"   /* sf_exclude_add / sf_exclude_count */
+#include "sf/snap/node.h"      /* sf_active */
+#include "sf/param.h"          /* sf_param_setup / sf_param_stamp_header */
 
 /* Host-side restore generation: 0 after snapshot, +1 per restore. Lives outside
  * guest RAM so a RAM rollback does not reset it — this is how the guest probe
@@ -189,100 +189,6 @@ static const MemoryRegionOps sf_cp_ops = {
 
 static MemoryRegion sf_cp_io;
 
-/* ---- NO_RESTORE register ABI (plan 2026-07-08 T1 §2.2) ----------------------
- * A guest outl to SF_NR_PORT carries the GPA of a 24-byte request struct in
- * guest RAM:
- *   struct { uint64_t gpa; uint64_t size; uint32_t flags; } __attribute__((packed));
- * QEMU reads it, translates gpa→host (sf_gpa_to_host — the same host pointer
- * save/restore walks), and registers an excluded range so the buffer survives
- * restore (not diffed, not rolled back). inl returns sf_exclude_count() so the
- * guest can confirm the range landed. This is the guest→QEMU trigger path the
- * exclude table previously lacked (it was host-internal only). */
-typedef struct __attribute__((packed)) SfNrReq {
-    uint64_t gpa;
-    uint64_t size;
-    uint32_t flags;
-} SfNrReq;
-
-static void sf_nr_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
-{
-    SfNrReq req;
-    /* 64-bit request-struct GPA: low 32 in %eax (the outl data @val), high 32 in
-     * %rbx (the guest sets it before the outl). One outl only carries 32 bits,
-     * and a >4GB guest (phase2 6GB) can have the req page above 4GB. */
-    uint64_t hi = (current_cpu && kvm_enabled()) ? sf_kvm_get_rbx(current_cpu) : 0;
-    hwaddr req_gpa = ((hwaddr)hi << 32) | (uint32_t)val;
-
-    /* The request struct lives in guest RAM; read it via its host pointer
-     * (sf_gpa_to_host returns the same host address save/restore walks). A
-     * bogus struct GPA just won't resolve — drop it. */
-    void *req_host = sf_gpa_to_host(req_gpa);
-    if (!req_host) {
-        fprintf(stderr, "sf-nr: req gpa 0x%" HWADDR_PRIx " not in RAM — ignored\n",
-                req_gpa);
-        return;
-    }
-    memcpy(&req, req_host, sizeof(req));
-
-    /* Translate the target range's GPA → host and register it as excluded. The
-     * gpa must be page-aligned by the guest; size is page-aligned by the guest
-     * (sf_exclude_add rejects unaligned). flags low 16 bits → buf_id (0→1). */
-    void *host = sf_gpa_to_host((hwaddr)req.gpa);
-    if (!host) {
-        fprintf(stderr, "sf-nr: target gpa 0x%" PRIx64 " not in RAM — ignored\n",
-                (uint64_t)req.gpa);
-        return;
-    }
-    uint32_t buf_id = req.flags & 0xffffu;
-    if (buf_id == 0) {
-        buf_id = 1;
-    }
-    sf_exclude_add((uint64_t)(uintptr_t)host, req.size, buf_id);
-    uint32_t cnt = (uint32_t)sf_exclude_count();
-
-    /* Remap the excluded buffer onto a named MAP_SHARED file in the workdir so a
-     * control process can write the guest's task buffer zero-copy (plan §2.4).
-     * Only when a workdir is configured — the standalone idrestore path has no
-     * private_dir and keeps the plain guest-writes-survive-restore behavior.
-     * SF_BUF_NO_REMAP is the S5 tooth: create+seed the file but skip MAP_FIXED,
-     * so a host write cannot reach the guest page (proves the remap is load-
-     * bearing, not exclusion alone). */
-    const char *workdir = sf_config()->private_dir;
-    if (workdir[0]) {
-        Error *err = NULL;
-        bool map_fixed = !getenv("SF_BUF_NO_REMAP");
-        if (sf_buf_remap((uint64_t)(uintptr_t)host, req.size, buf_id, workdir,
-                         true, map_fixed, &err) < 0) {
-            fprintf(stderr, "sf-nr: buf remap failed: %s\n",
-                    error_get_pretty(err));
-            error_free(err);
-        }
-    }
-    fprintf(stderr, "sf-nr: registered gpa=0x%" PRIx64 " size=%" PRIu64
-            " → host=%p buf_id=%u (count=%u)\n",
-            (uint64_t)req.gpa, (uint64_t)req.size, host, buf_id, cnt);
-    /* Return the new exclude count in %eax on the same outl (Nyx-style), so the
-     * guest confirms the range landed without an inl. */
-    if (kvm_enabled() && current_cpu) {
-        sf_kvm_put_rax(current_cpu, cnt);
-    }
-}
-
-static uint64_t sf_nr_read(void *opaque, hwaddr addr, unsigned size)
-{
-    return (uint64_t)sf_exclude_count();
-}
-
-static const MemoryRegionOps sf_nr_ops = {
-    .read = sf_nr_read,
-    .write = sf_nr_write,
-    .valid.min_access_size = 1,
-    .valid.max_access_size = 4,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-};
-
-static MemoryRegion sf_nr_io;
-
 /* One-shot main-loop BH (aio_bh_schedule_oneshot auto-frees it): perform the
  * configured boot cold-start once machine creation is complete (see the
  * scheduling site for why a BH, not inline). vm_stop while restoring, generation
@@ -308,6 +214,10 @@ static void sf_boot_cold_start_bh(void *opaque)
         exit(1);
     }
     sf_cp_generation_inc();
+    /* Backfill the sf-param HEADER with THIS worker's scale: cold_remap_live_ram
+     * loaded the base RAM (setup's HEADER) and cold_remap_bufs re-established the
+     * region; stamp the worker's own scale over it so real_sleep reads it. */
+    sf_param_stamp_header();
     fprintf(stderr, "sf-config: boot cold-start ok common=%s private=%s node=%u\n",
             c->common_dir[0] ? c->common_dir : "(none)",
             c->private_dir[0] ? c->private_dir : "(none)", c->initial_node);
@@ -333,19 +243,18 @@ static void sf_cp_machine_done(Notifier *n, void *unused)
     fprintf(stderr, "sf-cp: channel registered at port 0x%x (size %d)\n",
             SF_CP_PORT, SF_CP_PORT_SIZE);
 
-    /* NO_RESTORE register port: a guest outl carrying a request-struct GPA.
-     * Not lockless (sf_exclude_add touches a glib table; register is a one-off
-     * cold path, not a per-boundary hot path) — the default BQL-by-prepare_mmio
-     * is fine here. */
-    memory_region_init_io(&sf_nr_io, NULL, &sf_nr_ops, NULL,
-                          "sf-no-restore", SF_NR_PORT_SIZE);
-    memory_region_add_subregion(get_system_io(), SF_NR_PORT, &sf_nr_io);
-    fprintf(stderr, "sf-nr: NO_RESTORE register port at 0x%x (size %d)\n",
-            SF_NR_PORT, SF_NR_PORT_SIZE);
-
     /* Attach the host control channel if a -chardev id "sfctl" is present; when
      * absent the port keeps its standalone guest-driven behavior. */
     sf_control_init();
+
+    /* sf-param region: on the setup/builder run (no boot cold-start) establish
+     * the predefined no_restore region host-side (exclude + file remap + stamp
+     * HEADER) so it persists into the base snapshot and phase2/real_sleep read
+     * it. Workers (cold_start_on_boot) get the region back via exclude reload +
+     * cold_remap_bufs and the boot cold-start BH backfills its HEADER. */
+    if (!sf_config()->cold_start_on_boot) {
+        sf_param_setup();
+    }
 
     /* Boot cold-start (§2.3): schedule it on a main-loop BH rather than inline.
      * This notifier fires from qdev_machine_creation_done() BEFORE

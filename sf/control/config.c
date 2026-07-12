@@ -77,6 +77,26 @@ void sf_config_load(void)
     const char *n = getenv("SF_INITIAL_NODE");
     sf_cfg.initial_node = (n && n[0]) ? (uint32_t)g_ascii_strtoull(n, NULL, 10) : 0;
 
+    /* sf-param HEADER values (SF_TSC_KHZ default matches controller/run.sh 2449999). */
+    const char *khz = getenv("SF_TSC_KHZ");
+    sf_cfg.tsc_khz = (khz && khz[0]) ? g_ascii_strtoull(khz, NULL, 10) : 2449999;
+    const char *sc = getenv("SF_TSC_SCALE");
+    if (!sc || !sc[0]) {
+        sc = "1";
+    }
+    if (strlen(sc) >= sizeof(sf_cfg.scale_str)) {
+        error_report("sf-config: SF_TSC_SCALE=%s too long (>= %zu)",
+                     sc, sizeof(sf_cfg.scale_str));
+        exit(1);
+    }
+    g_strlcpy(sf_cfg.scale_str, sc, sizeof(sf_cfg.scale_str));
+    double scale = g_ascii_strtod(sc, NULL);
+    if (scale <= 0.0) {
+        error_report("sf-config: SF_TSC_SCALE=%s invalid (want > 0)", sc);
+        exit(1);
+    }
+    sf_cfg.scale_ppm = (uint32_t)(scale * 1e6 + 0.5);
+
     sf_cfg_loaded = true;
 }
 

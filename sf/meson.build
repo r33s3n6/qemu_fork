@@ -1,6 +1,7 @@
 system_ss.add(files(
   'sf.c',
   'checkpoint.c',
+  'param.c',
   'control/channel.c',
   'control/gate.c',
   'control/config.c',

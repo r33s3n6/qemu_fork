@@ -11,13 +11,6 @@
 #define SF_CP_PORT       0x520
 #define SF_CP_PORT_SIZE  4
 
-/* NO_RESTORE register port (plan 2026-07-08 T1 §2.2): a guest outl to this port
- * carries the GPA of a 24-byte request struct {gpa,size,flags} in guest RAM;
- * QEMU reads it, translates gpa→host and calls sf_exclude_add. inl returns the
- * current sf_exclude_count() so the guest can confirm the range landed. */
-#define SF_NR_PORT       0x530
-#define SF_NR_PORT_SIZE  4
-
 /* Commands written to SF_CP_PORT (outl): eax carries the command and ebx the
  * full 32-bit composite node id. Keeping them separate preserves worker_id.
  * The single-site outl address remains the terminal-restore foundation. */

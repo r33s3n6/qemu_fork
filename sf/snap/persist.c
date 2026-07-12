@@ -32,6 +32,12 @@ static int sf_write_file(const char *path, const void *buf, size_t len,
 static int sf_write_all(int fd, const void *buf, size_t len);  /* defined below */
 static int sf_persist_ensure_dirs(const char *dir, Error **errp);  /* defined below */
 
+/* Bytes copied by promote's anon-diff → file materialization (memcpy②). A snapshot
+ * built straight into its file store (op `S`) seals in place and adds nothing here;
+ * a plain `s` then `P`/`p` copies the whole diff. The S7.4 gate reads this to prove
+ * `S` skips the second copy. */
+uint64_t sf_promote_copy_bytes;
+
 /* Write a device stream (方案 B) to <dir>/<name> and fsync it. The fsync is the
  * commit-point ordering guarantee for promote: the .dev must be durable BEFORE
  * its nodes.log line is appended (snapshot-tree.md §5.2), otherwise a crash after
@@ -278,6 +284,24 @@ static int sf_persist_promote_subtree(SfSnapNode *n, const char *dir,
     return 0;
 }
 
+/* Prepare @dir to receive promoted nodes: create dir + nodes/, and in two-dir mode
+ * write the private manifest header (records @common_ref) once so a single-dir
+ * cold-start of @dir resolves its common base — no promote writes it there, since the
+ * common root is already PERSISTED. Single-dir: sf_snap_promote(root) writes the
+ * header itself, so this only needs the dirs. Shared by persist (P) and durable
+ * snapshot (S). */
+int sf_snap_persist_prepare(const char *dir, const char *common_ref, Error **errp)
+{
+    if (sf_persist_ensure_dirs(dir, errp) < 0) {
+        return -1;
+    }
+    if (common_ref &&
+        sf_manifest_write_header(dir, sf_blocks_root_len(), common_ref, errp) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
 /* persist = flush the whole private subtree by promoting every node not yet on disk
  * (idempotent — already-PERSISTED nodes, including the common prefix, are skipped).
  * Replaces the old whole-tree truncate-and-rewrite: snapshot nodes are immutable, so
@@ -291,15 +315,7 @@ int sf_snap_persist(SfSnapNode *root, const char *dir,
         error_setg(errp, "sf_snap_persist: need the root node");
         return -EINVAL;
     }
-    if (sf_persist_ensure_dirs(dir, errp) < 0) {
-        return -1;
-    }
-    /* Two-dir: the common root is already PERSISTED (skipped below), so no promote
-     * writes this private dir's manifest header. Write it once (records @common_ref)
-     * so a single-dir cold-start of this private dir resolves its common base.
-     * Single-dir: sf_snap_promote(root) below writes the header itself. */
-    if (common_ref &&
-        sf_manifest_write_header(dir, sf_blocks_root_len(), common_ref, errp) < 0) {
+    if (sf_snap_persist_prepare(dir, common_ref, errp) < 0) {
         return -1;
     }
     return sf_persist_promote_subtree(root, dir, common_ref, errp);
@@ -392,6 +408,7 @@ static int sf_promote_node_ram(SfSnapNode *n, const char *dir, Error **errp)
             memcpy(fs.index, n->ram.index,
                    (size_t)n->ram.n_pages * sizeof(SfPageKey));
             memcpy(fs.data, n->ram.data, (size_t)n->ram.n_pages * psize);
+            sf_promote_copy_bytes += (uint64_t)n->ram.n_pages * psize;
         }
         ret = sf_ramstore_seal(&fs, errp);
     }

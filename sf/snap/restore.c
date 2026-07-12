@@ -36,6 +36,7 @@
 #include "sf/vmstate_replay/replay.h"
 #include "sf/snap/node.h"
 #include "sf/snap/exclude.h"
+#include "sf/snap/persist.h"   /* sf_snap_promote (op `S` durable snapshot) */
 #include "sf/snap/tripwire.h"
 #include "sf/sf.h"          /* sf_skip_tsc declaration (defined here) */
 
@@ -432,6 +433,7 @@ SfSnapNode *sf_snap_ram_root(Error **errp)
  * caller decides — production save does, after device capture; selftest controls it).
  */
 SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, bool activate,
+                               const char *persist_dir,
                                SfSnapDiffTiming *timing_out, Error **errp)
 {
     size_t psize = qemu_real_host_page_size();
@@ -514,10 +516,26 @@ SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, bool activat
     qsort(keys, nk, sizeof(SfPageKey), sf_key_cmp);
     if (timing) { t_mc1 = sf_now_ns(); }
 
-    /* save = ramstore create + page copies. */
+    /* save = ramstore create + page copies. When @persist_dir is set (op `S`) the
+     * store is created FILE-backed straight in nodes/<id>.ram, so pages are copied
+     * host→file once here and a later sf_snap_promote seals it in place (no second
+     * copy — memcpy②). @persist_dir NULL = anon store (plain `s`). */
     node = sf_node_new(parent, kind);
-    if (sf_ramstore_create_anon(&node->ram, (uint32_t)nk) < 0) {
-        error_setg(errp, "sf_snap_build_diff: ramstore oom");
+    int rc;
+    if (persist_dir) {
+        char name[40];
+        char *path;
+        snprintf(name, sizeof(name), "nodes/%u.ram", node->id);
+        path = g_build_filename(persist_dir, name, NULL);
+        rc = sf_ramstore_create_file(&node->ram, (uint32_t)nk, path, errp);
+        g_free(path);
+    } else {
+        rc = sf_ramstore_create_anon(&node->ram, (uint32_t)nk);
+        if (rc < 0) {
+            error_setg(errp, "sf_snap_build_diff: ramstore oom");
+        }
+    }
+    if (rc < 0) {
         sf_node_destroy(node);
         g_free(keys);
         return NULL;
@@ -796,7 +814,8 @@ static int sf_snap_dev_capture(SfSnapNode *node, bool keep_stream)
     return 0;
 }
 
-int sf_snap_save(SfSnapKind kind, Error **errp)
+int sf_snap_save(SfSnapKind kind, const char *persist_dir,
+                 const char *common_ref, Error **errp)
 {
     Error *err = NULL;
     SfSnapNode *node;
@@ -863,7 +882,8 @@ int sf_snap_save(SfSnapKind kind, Error **errp)
     uint64_t t0_tsc = (kvm_enabled() && current_cpu) ? sf_kvm_read_tsc(current_cpu) : 0;
 
     SfSnapDiffTiming diff_t = {0};
-    node = sf_snap_build_diff(sf_active, kind, true, timing ? &diff_t : NULL, &err);
+    node = sf_snap_build_diff(sf_active, kind, true, persist_dir,
+                              timing ? &diff_t : NULL, &err);
     if (!node) {
         error_propagate(errp, err);
         return -EIO;
@@ -878,6 +898,14 @@ int sf_snap_save(SfSnapKind kind, Error **errp)
         return -EIO;
     }
     sf_snap_set_active_node(node);
+    /* Op `S`: the diff was built straight into nodes/<id>.ram, so sf_snap_promote
+     * hits its in-place-seal branch (no memcpy②) and records dev + nodes.log,
+     * leaving the node PERSISTED. Root header is written by the gate (two-dir) or by
+     * promote (single-dir); this node is non-root so it just appends. */
+    if (persist_dir &&
+        sf_snap_promote(node, persist_dir, common_ref, errp) < 0) {
+        return -EIO;
+    }
     if (timing) {
         tc = sf_now_ns();
         fprintf(stderr,

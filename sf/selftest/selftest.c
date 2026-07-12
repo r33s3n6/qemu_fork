@@ -739,7 +739,7 @@ static void sf_selftest_tsc(Monitor *mon, bool *all_ok)
 static SfSnapNode *sf_make_layer(Monitor *mon, bool *all_ok)
 {
     Error *err = NULL;
-    SfSnapNode *n = sf_snap_build_diff(sf_active, SF_SNAP_RUN, true, NULL, &err);
+    SfSnapNode *n = sf_snap_build_diff(sf_active, SF_SNAP_RUN, true, NULL, NULL, &err);
     if (!n) {
         monitor_printf(mon, "sf: selftest[snap] build_diff FAILED: %s\n",
                        error_get_pretty(err));
@@ -1925,6 +1925,98 @@ static bool sf_tables_eq(const SfReplayTables *a, const SfReplayTables *b)
     return true;
 }
 
+/* ---- durable snapshot skips memcpy② (selftest S7.4) --------------------------
+ * Op `S` builds a snapshot's diff straight into its file store, so the later promote
+ * seals in place (no second full copy). Prove it with numbers: a plain s+P copies the
+ * whole diff (sf_promote_copy_bytes > 0), while S copies nothing (== 0). Then check the
+ * S node is PERSISTED+file-backed and cold-starts back to the same RAM. */
+static void sf_selftest_durable_snapshot(Monitor *mon, bool *all_ok)
+{
+    char buf[192];
+    Error *err = NULL;
+    char *dir;
+    SfSnapNode *root, *n_sp, *n_s;
+    uint64_t bytes_sp, bytes_s;
+    uint32_t v_ref, v_cold;
+
+    if (!kvm_enabled() || !sf_kvm_dirty_ring_enabled()) {
+        monitor_printf(mon, "sf: selftest[S durable-snapshot]: SKIPPED "
+                       "(needs KVM + dirty ring)\n");
+        return;
+    }
+    dir = g_dir_make_tmp("sf-Sdur-XXXXXX", NULL);
+    if (!dir) {
+        report(mon, all_ok, "S durable-snapshot", false, "g_dir_make_tmp failed");
+        return;
+    }
+
+    setenv("SF_ROOT_DIR", dir, 1);
+    if (!sf_snap_root(mon)) { unsetenv("SF_ROOT_DIR"); *all_ok = false; goto out; }
+    unsetenv("SF_ROOT_DIR");
+    root = sf_active;
+    /* Persist the root so promote's persisted-ancestor invariant holds below. */
+    if (sf_snap_persist(root, dir, NULL, &err) < 0) {
+        report(mon, all_ok, "S durable-snapshot persist-root", false,
+               error_get_pretty(err));
+        error_free(err); goto out;
+    }
+
+    /* Reference s+P: anon diff, then promote copies the whole diff (memcpy②). */
+    sf_run_guest_ms(20);
+    n_sp = sf_snap_build_diff(sf_active, SF_SNAP_RUN, true, NULL, NULL, &err);
+    if (!n_sp) {
+        report(mon, all_ok, "S durable-snapshot s+P build", false, error_get_pretty(err));
+        error_free(err); goto out;
+    }
+    sf_active = n_sp;
+    sf_promote_copy_bytes = 0;
+    if (sf_snap_promote(n_sp, dir, NULL, &err) < 0) {
+        report(mon, all_ok, "S durable-snapshot s+P promote", false, error_get_pretty(err));
+        error_free(err); goto out;
+    }
+    bytes_sp = sf_promote_copy_bytes;
+
+    /* Durable S: build straight into the file store, then promote seals in place. */
+    sf_run_guest_ms(20);
+    v_ref = sf_rd32(SF_ST_BASE);
+    n_s = sf_snap_build_diff(sf_active, SF_SNAP_RUN, true, dir, NULL, &err);
+    if (!n_s) {
+        report(mon, all_ok, "S durable-snapshot S build", false, error_get_pretty(err));
+        error_free(err); goto out;
+    }
+    sf_active = n_s;
+    sf_promote_copy_bytes = 0;
+    if (sf_snap_promote(n_s, dir, NULL, &err) < 0) {
+        report(mon, all_ok, "S durable-snapshot S promote", false, error_get_pretty(err));
+        error_free(err); goto out;
+    }
+    bytes_s = sf_promote_copy_bytes;
+
+    /* MEASUREMENT: S skips the second full copy that s+P pays. */
+    snprintf(buf, sizeof(buf),
+             "s+P copied %llu B, S copied %llu B (S saves %llu B/durable-node)",
+             (unsigned long long)bytes_sp, (unsigned long long)bytes_s,
+             (unsigned long long)bytes_sp);
+    report(mon, all_ok, "S durable-snapshot skips memcpy2 (S=0 < s+P)",
+           bytes_s == 0 && bytes_sp > 0, buf);
+
+    snprintf(buf, sizeof(buf), "state=%d backing=%d", n_s->state, n_s->ram.backing);
+    report(mon, all_ok, "S durable-snapshot node persisted+file-backed",
+           n_s->state == SF_SNAP_PERSISTED && n_s->ram.backing == SF_BACKING_FILE, buf);
+
+    if (sf_cold_start(dir, NULL, n_s->id, false, &err) < 0) {
+        report(mon, all_ok, "S durable-snapshot cold-start", false, error_get_pretty(err));
+        error_free(err); goto out;
+    }
+    v_cold = sf_rd32(SF_ST_BASE);
+    snprintf(buf, sizeof(buf), "ref=%u cold=%u", v_ref, v_cold);
+    report(mon, all_ok, "S durable-snapshot cold-start RAM matches", v_cold == v_ref, buf);
+
+out:
+    sf_rmrf_persist_dir(dir);
+    g_free(dir);
+}
+
 static void sf_selftest_dev_stream(Monitor *mon, bool *all_ok)
 {
     char buf[192];
@@ -2128,6 +2220,7 @@ bool sf_selftest_all(Monitor *mon, Error **errp)
     sf_selftest_persist(mon, &all_ok);          /* needs KVM + dirty ring */
     sf_selftest_cold_start(mon, &all_ok);       /* needs KVM + dirty ring; destructive */
     sf_selftest_cold_start_twodir(mon, &all_ok); /* S3 闸① common/private; destructive */
+    sf_selftest_durable_snapshot(mon, &all_ok); /* S7.4 op S skips memcpy②; needs KVM */
     sf_selftest_dev_stream(mon, &all_ok);       /* TCG only (reparse re-load) */
 
     monitor_printf(mon, "sf: selftest overall: %s\n",

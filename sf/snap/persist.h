@@ -33,6 +33,15 @@
 int  sf_snap_persist(SfSnapNode *root, const char *dir,
                      const char *common_ref, Error **errp);
 
+/* Create @dir + nodes/ and (two-dir) write its private manifest header. Shared by
+ * persist and durable snapshot (op `S`) so both leave a single-dir-cold-startable dir. */
+int  sf_snap_persist_prepare(const char *dir, const char *common_ref, Error **errp);
+
+/* Bytes copied by promote's anon-diff → file materialization (memcpy②). Op `S`
+ * (snapshot straight into its file store) seals in place and adds nothing; plain
+ * `s`+`P`/`p` copies the whole diff. S7.4 measurement reads this. */
+extern uint64_t sf_promote_copy_bytes;
+
 /* Promote one node into @dir's append-only log. Root may be promoted first; a
  * non-root node is accepted only after its parent is already PERSISTED. The
  * node's RAM store is switched to file backing, its device stream is written,

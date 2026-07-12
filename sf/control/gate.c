@@ -308,6 +308,48 @@ bool sf_gate_boundary_cmd(const SfCtlCmd *cmd)
         return false;
     }
 
+    case SF_CTL_SNAPSHOT_PERSIST: {
+        /* Durable snapshot: build the diff straight into private_dir + promote in one
+         * pass (skips promote's 2nd copy). Non-root only — needs an active base. */
+        const SfConfig *c = sf_config();
+        const char *dir = c->private_dir;
+        const char *common_ref = (c->common_dir[0] && strcmp(c->common_dir, dir))
+                                 ? c->common_dir : NULL;
+        Error *err = NULL;
+        qemu_mutex_lock(&sf_gate_mtx);
+        bool ok = sf_gate_snapshot_ok_locked();
+        qemu_mutex_unlock(&sf_gate_mtx);
+        if (!ok || !sf_active) {
+            sf_control_reply(SF_ST_ERROR, SF_ERR_INVALID_STATE);
+            return false;
+        }
+        if (!dir[0]) {
+            sf_control_reply(SF_ST_ERROR, SF_ERR_PERSIST_FAILED);
+            return false;
+        }
+        int r = sf_snap_persist_prepare(dir, common_ref, &err);  /* dirs+header, no bql */
+        if (r == 0) {
+            bql_lock();   /* ponytail: promote disk I/O runs under bql (guest parked,
+                           * single-vcpu); split out if bql contention ever matters */
+            r = sf_checkpoint_snapshot_persist(dir, common_ref);
+            bql_unlock();
+        }
+        if (r < 0) {
+            if (err) {
+                fprintf(stderr, "sf-gate: snapshot-persist %s failed: %s\n",
+                        dir, error_get_pretty(err));
+                error_free(err);
+            }
+            sf_control_reply(SF_ST_ERROR, SF_ERR_PERSIST_FAILED);
+            return false;
+        }
+        sf_cp_generation_reset();
+        sf_gate_park(SF_CS_PARKED_SNAPSHOT, SF_ST_SNAPSHOT,
+                     sf_active ? sf_active->id : 0);
+        sf_gate_flush();
+        return false;
+    }
+
     case SF_CTL_RESTORE: {
         uint32_t id = cmd->has_id ? cmd->id : (sf_active ? sf_active->id : 0);
         if (!sf_snap_have_snapshot()) {

@@ -224,7 +224,11 @@ uint32_t sf_node_worker_id(void);
 uint8_t *sf_resolve(SfSnapNode *dst, SfPageKey key);
 
 /* ---- Top-level save/restore (HMP + terminal route here) ---- */
-int   sf_snap_save(SfSnapKind kind, Error **errp);
+/* @persist_dir != NULL (op `S`, non-root only) builds the diff straight into its
+ * file store and promotes it (durable in one pass, skipping promote's second copy);
+ * @common_ref threads through to that promote. NULL/NULL = plain in-RAM `s`. */
+int   sf_snap_save(SfSnapKind kind, const char *persist_dir,
+                   const char *common_ref, Error **errp);
 /* @debug is an optional device-replay skip-knob (HMP debug=/terminal SF_CP_SKIP);
  * NULL for a normal restore. */
 int   sf_snap_restore(uint32_t dst_id, const SfReplayDebug *debug, Error **errp);
@@ -252,6 +256,7 @@ typedef struct {
 } SfSnapDiffTiming;
 
 SfSnapNode *sf_snap_build_diff(SfSnapNode *parent, SfSnapKind kind, bool activate,
+                               const char *persist_dir,
                                SfSnapDiffTiming *timing_out, Error **errp);
                                /* collect ∪ HOT → non-root diff node (RAM only);
                                 * activate=re-baseline tracker to the new node */

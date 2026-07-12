@@ -51,6 +51,7 @@ static void sf_ctl_decode(const uint8_t *frame, SfCtlCmd *c)
     switch (frame[0]) {
     case SF_CTL_CONTINUE:
     case SF_CTL_SNAPSHOT:
+    case SF_CTL_SNAPSHOT_PERSIST:
     case SF_CTL_RESTORE:
     case SF_CTL_PERSIST:
     case SF_CTL_PROMOTE:

@@ -207,7 +207,10 @@ void hmp_sf_remap_all(Monitor *mon, const QDict *qdict)
  * lease-sensitive workloads). The TSC refreeze uses sf_skip_tsc() so the
  * phase1.5 T-TSC gate proves teeth.
  */
-void sf_checkpoint_snapshot(void)
+/* Shared snapshot core. @persist_dir != NULL (op `S`) builds the diff straight into
+ * its file store and promotes it durable in one pass; NULL = plain in-RAM `s`. The
+ * TSC/kvmclock rewind around the save is identical either way. Returns 0 / -1. */
+static int sf_do_snapshot(const char *persist_dir, const char *common_ref)
 {
     Error *err = NULL;
     uint64_t clock0 = 0;
@@ -222,11 +225,11 @@ void sf_checkpoint_snapshot(void)
     /* save() builds a child of the active node (plan -04 §2): the first
      * CHECKPOINT builds root, subsequent ones build RUN diff layers on top. */
     SfSnapKind kind = sf_active ? SF_SNAP_RUN : SF_SNAP_ROOT;
-    ok = (sf_snap_save(kind, &err) == 0);
+    ok = (sf_snap_save(kind, persist_dir, common_ref, &err) == 0);
     if (!ok) {
         fprintf(stderr, "sf-cp: snapshot FAILED: %s\n", error_get_pretty(err));
         error_free(err);
-        return;
+        return -1;
     }
     if (current_cpu && kvm_enabled()) {
         cpu_synchronize_post_init(current_cpu);   /* re-put env (T0 back into vcpu) */
@@ -237,9 +240,22 @@ void sf_checkpoint_snapshot(void)
     if (clock0) {
         kvmclock_sf_clock_set(clock0);            /* rewind kvmclock to T0 */
     }
-    fprintf(stderr, "sf-cp: snapshot ok (id=%u %s)\n",
+    fprintf(stderr, "sf-cp: snapshot ok (id=%u %s%s)\n",
             sf_active ? sf_active->id : 0,
-            sf_active && sf_active->kind == SF_SNAP_ROOT ? "root" : "layer");
+            sf_active && sf_active->kind == SF_SNAP_ROOT ? "root" : "layer",
+            persist_dir ? " persisted" : "");
+    return 0;
+}
+
+void sf_checkpoint_snapshot(void)
+{
+    sf_do_snapshot(NULL, NULL);
+}
+
+/* Op `S`: snapshot the current boundary straight into @dir (durable, non-root). */
+int sf_checkpoint_snapshot_persist(const char *dir, const char *common_ref)
+{
+    return sf_do_snapshot(dir, common_ref);
 }
 
 /*

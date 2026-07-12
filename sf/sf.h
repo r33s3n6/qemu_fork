@@ -16,6 +16,9 @@
  * vm_stop — the single vCPU is already parked out of KVM_RUN with the BQL held.
  */
 void sf_checkpoint_snapshot(void);
+/* Op `S`: durable snapshot — build the diff straight into @dir + promote (non-root).
+ * @common_ref threads to that promote (two-dir). Returns 0 / -1. */
+int sf_checkpoint_snapshot_persist(const char *dir, const char *common_ref);
 /* sf_checkpoint_restore(uint32_t id) is declared in sf/checkpoint.h (it owns
  * the guest→host CHECKPOINT ABI, incl. the id-based restore contract). */
 

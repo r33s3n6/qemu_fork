@@ -24,7 +24,9 @@
  * cold-start is a boot action (§2.3), not a pipe command. */
 typedef enum {
     SF_CTL_CONTINUE = 'c',   /* resume to next boundary */
-    SF_CTL_SNAPSHOT = 's',   /* save here, stay parked; reply s <id> */
+    SF_CTL_SNAPSHOT = 's',   /* save here (RAM), stay parked; reply s <id> */
+    SF_CTL_SNAPSHOT_PERSIST = 'S', /* save here straight to disk (durable, non-root);
+                                    * skips promote's 2nd copy. stay parked; reply s <id> */
     SF_CTL_RESTORE  = 'r',   /* restore [arg=id, 0xFFFFFFFF=active] + resume */
     /* v2.1 letter swap: promote is the hot single-node op → lowercase; persist is
      * the low-frequency batch op → uppercase. Enum value IS the wire byte, so the

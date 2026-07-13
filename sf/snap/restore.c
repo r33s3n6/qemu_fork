@@ -965,7 +965,11 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
     if (timing) {
         t0 = sf_now_ns();
         c0 = sf_now_thread_ns();
-        if (!sf_hw_tried) {   /* first timed restore = we're on the vCPU thread */
+        /* perf_event_open(pid=0) binds to the *calling* thread. Open only once we
+         * are on a vCPU thread (current_cpu set): cold-start's boot restore runs on
+         * the main/init thread — opening there would bind the counters to a thread
+         * that goes idle, zeroing every later per-round delta. */
+        if (!sf_hw_tried && current_cpu) {
             sf_hw_guest = sf_hw_open(true);
             sf_hw_host = sf_hw_open(false);
             sf_hw_tried = true;

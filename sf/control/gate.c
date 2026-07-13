@@ -49,6 +49,12 @@ static uint32_t sf_gate_pending_payload;
 static bool sf_gate_pending;
 static bool sf_gate_connected;
 
+/* The guest's sf_cp intent at the current boundary (SNAPSHOT/RESTORE/NOP-park).
+ * Set on the vcpu thread in sf_gate_boundary_enter, read by the command loop on
+ * the same thread. Guards a host-driven (DISABLE) self-drive guest from having
+ * its setjmp assumptions silently broken (plan 2026-07-13-03 ①b). */
+static uint64_t sf_gate_guest_intent;
+
 /* ---- helpers (caller holds sf_gate_mtx) ---- */
 
 static void sf_gate_arm_locked(void)
@@ -194,6 +200,7 @@ bool sf_gate_boundary_enter(uint64_t val)
     mode = sf_config()->gate_mode;
     qemu_mutex_unlock(&sf_gate_mtx);
 
+    sf_gate_guest_intent = val;   /* what the guest asked for at this boundary (①b) */
     bool resume = false;
 
     switch (mode) {
@@ -304,6 +311,18 @@ bool sf_gate_boundary_cmd(const SfCtlCmd *cmd)
 {
     switch (cmd->kind) {
     case SF_CTL_CONTINUE:
+        /* ①b guest-intent guard: a bare continue must not break a self-drive
+         * guest's setjmp assumptions. If the guest asked to RESTORE it expects a
+         * longjmp (its code after the call is unreachable); if it asked to
+         * SNAPSHOT it expects a real node id back. Reject the continue unless the
+         * host already honored the intent (a SNAPSHOT leaves PARKED_SNAPSHOT).
+         * A NOP/park boundary carries no such expectation → free. */
+        if (sf_gate_guest_intent == SF_CP_RESTORE ||
+            (sf_gate_guest_intent == SF_CP_SNAPSHOT &&
+             sf_gate_state != SF_CS_PARKED_SNAPSHOT)) {
+            sf_control_reply(SF_ST_ERROR, SF_ERR_INVALID_STATE);
+            return false;   /* stay parked; host must snapshot/restore first */
+        }
         qemu_mutex_lock(&sf_gate_mtx);
         sf_gate_begin_resume_locked();
         qemu_mutex_unlock(&sf_gate_mtx);

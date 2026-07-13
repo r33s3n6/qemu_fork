@@ -36,6 +36,10 @@ typedef struct SfHwGroup SfHwGroup;
  * domain (true = exclude_host, false = exclude_guest). NULL on failure. */
 SfHwGroup *sf_hw_open(bool guest_only);
 
+/* Investigation-only (SF_HW_FILLSRC): host-side AMD data-cache-fill-by-source
+ * group. Slots: insns←mem_io_local, cycles←ext_cache_local, llc_miss←int_cache. */
+SfHwGroup *sf_hw_open_fillsrc(void);
+
 /* Read the group's running totals. Zeros @out if @g is NULL. */
 void sf_hw_read(SfHwGroup *g, SfHwCounts *out);
 

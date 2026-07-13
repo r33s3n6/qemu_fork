@@ -56,6 +56,34 @@ SfHwGroup *sf_hw_open(bool guest_only)
     return g;
 }
 
+/* Investigation group (SF_HW_FILLSRC): AMD Zen3 "any data-cache fills by source"
+ * on the HOST side (exclude_guest) — localizes where the restore memcpy's fills
+ * come from. Reuses the 3 SfHwCounts slots: insns←mem_io_local(DRAM 0x844),
+ * cycles←ext_cache_local(cross-CCX 0x444), llc_miss←int_cache(same-CCX 0x244).
+ * Answers whether shared-base restore's extra "misses" are DRAM traffic or just
+ * cross-CCX cache-to-cache coherence (which the coarse CACHE_MISSES conflates). */
+SfHwGroup *sf_hw_open_fillsrc(void)
+{
+    static const uint64_t cfg[SF_HW_N] = { 0x844, 0x444, 0x244 };
+    SfHwGroup *g = g_new(SfHwGroup, 1);
+    int i, ok = 0;
+    for (i = 0; i < SF_HW_N; i++) {
+        struct perf_event_attr a;
+        memset(&a, 0, sizeof(a));
+        a.type = PERF_TYPE_RAW;
+        a.size = sizeof(a);
+        a.config = cfg[i];
+        a.exclude_guest = 1;   /* host-mode only = the memcpy, not guest exec */
+        g->fd[i] = sf_perf_event_open(&a, 0, -1, -1, 0);
+        ok += (g->fd[i] >= 0);
+    }
+    if (!ok) {
+        g_free(g);
+        return NULL;
+    }
+    return g;
+}
+
 static uint64_t sf_hw_read_one(int fd)
 {
     uint64_t v = 0;

@@ -124,6 +124,7 @@ static uint64_t sf_restore_last_guest_time_ns;
  * Lazy-opened on the first timed restore, on the vCPU thread. */
 static SfHwGroup *sf_hw_guest;
 static SfHwGroup *sf_hw_host;
+static SfHwGroup *sf_hw_fill;   /* SF_HW_FILLSRC: host fill-by-source in memcpy window */
 static bool sf_hw_tried;
 static SfHwCounts sf_restore_last_hw_guest;
 
@@ -961,6 +962,7 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
     SfRestoreSrcStat src_stat = {0};
     SfHwCounts hw_guest = {0}, hw_rst = {0};   /* guest-run + restore-memcpy deltas */
     SfHwCounts hw_rst0 = {0};
+    SfHwCounts hw_fill = {0}, hw_fill0 = {0};  /* SF_HW_FILLSRC: memcpy fill-by-source */
 
     if (timing) {
         t0 = sf_now_ns();
@@ -970,8 +972,15 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
          * the main/init thread — opening there would bind the counters to a thread
          * that goes idle, zeroing every later per-round delta. */
         if (!sf_hw_tried && current_cpu) {
-            sf_hw_guest = sf_hw_open(true);
-            sf_hw_host = sf_hw_open(false);
+            if (getenv("SF_HW_FILLSRC")) {
+                /* Investigation: swap in host fill-by-source. Skip the guest group
+                 * so 3 host + 3 fill = 6 PMCs (no multiplex). Guest hw fields zero. */
+                sf_hw_host = sf_hw_open(false);
+                sf_hw_fill = sf_hw_open_fillsrc();
+            } else {
+                sf_hw_guest = sf_hw_open(true);
+                sf_hw_host = sf_hw_open(false);
+            }
             sf_hw_tried = true;
         }
     }
@@ -1027,14 +1036,17 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
         t2 = sf_now_ns();
         c2 = sf_now_thread_ns();  /* anchors ram_cpu start (device wall-only) */
         sf_hw_read(sf_hw_host, &hw_rst0);   /* restore-memcpy window start */
+        sf_hw_read(sf_hw_fill, &hw_fill0);
     }
 
     /* Step 3: RAM delta-restore — plan (+ cross-node path pages) → live guest. */
     n = sf_restore_apply_ram(dst, src, plan);
     if (timing) {
-        SfHwCounts hw_h_now;
+        SfHwCounts hw_h_now, hw_f_now;
         sf_hw_read(sf_hw_host, &hw_h_now);
         sf_hw_delta(&hw_rst, &hw_h_now, &hw_rst0);
+        sf_hw_read(sf_hw_fill, &hw_f_now);
+        sf_hw_delta(&hw_fill, &hw_f_now, &hw_fill0);
         t3 = sf_now_ns();
         c3 = sf_now_thread_ns();
         /* A2: outside ram bucket — does not pollute ram/ram_cpu. */
@@ -1084,7 +1096,8 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
                 "halt_wait=%" PRIu64 "us halt_poll=%" PRIu64 "us "
                 "guest_only_cpu=%" PRIu64 "us "
                 "g_insns=%" PRIu64 " g_cycles=%" PRIu64 " g_llcmiss=%" PRIu64 " "
-                "r_insns=%" PRIu64 " r_cycles=%" PRIu64 " r_llcmiss=%" PRIu64 "\n",
+                "r_insns=%" PRIu64 " r_cycles=%" PRIu64 " r_llcmiss=%" PRIu64 " "
+                "r_memio=%" PRIu64 " r_extcache=%" PRIu64 " r_intcache=%" PRIu64 "\n",
                 dst->id, src == dst ? "inplace" : "cross",
                 (t1 - t0) / 1000.0, (c1 - c0) / 1000.0,
                 (t2 - t1) / 1000.0,
@@ -1097,7 +1110,8 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
                 guest_active_wall_us, guest_active_cpu_us, pf_taken,
                 halt_wait_us, halt_poll_us, guest_only_cpu_us,
                 hw_guest.insns, hw_guest.cycles, hw_guest.llc_miss,
-                hw_rst.insns, hw_rst.cycles, hw_rst.llc_miss);
+                hw_rst.insns, hw_rst.cycles, hw_rst.llc_miss,
+                hw_fill.insns, hw_fill.cycles, hw_fill.llc_miss);
     }
     monitor_printf(NULL, "sf: restore ok: dst=%u device=%s ram W=%zu\n",
                    dst->id, dst->dev.have ? "replayed" : "SKIPPED", n);

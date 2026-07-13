@@ -59,15 +59,13 @@ SfHwGroup *sf_hw_open(bool guest_only)
     return g;
 }
 
-/* Investigation group (SF_HW_FILLSRC): AMD Zen3 "any data-cache fills by source"
- * on the HOST side (exclude_guest) — localizes where the restore memcpy's fills
- * come from. Reuses the 3 SfHwCounts slots: insns←mem_io_local(DRAM 0x844),
- * cycles←ext_cache_local(cross-CCX 0x444), dram_fill←int_cache(same-CCX 0x244).
- * Answers whether shared-base restore's extra "misses" are DRAM traffic or just
- * cross-CCX cache-to-cache coherence (which the coarse CACHE_MISSES conflates). */
-SfHwGroup *sf_hw_open_fillsrc(void)
+/* Host-side miss-HIERARCHY group (exclude_guest): AMD Zen3 "any data-cache fills
+ * by source" — where each restore-memcpy L2-miss was satisfied. fd order:
+ * [0] mem_io_local (DRAM, 0x844), [1] int_cache (same-CCX, 0x244),
+ * [2] ext_cache_local (cross-CCX, 0x444). Read into dram_fill/l3_fill/ccx_fill. */
+SfHwGroup *sf_hw_open_hier(void)
 {
-    static const uint64_t cfg[SF_HW_N] = { 0x844, 0x444, 0x244 };
+    static const uint64_t cfg[SF_HW_N] = { 0x844, 0x244, 0x444 };
     SfHwGroup *g = g_new(SfHwGroup, 1);
     int i, ok = 0;
     for (i = 0; i < SF_HW_N; i++) {
@@ -105,4 +103,15 @@ void sf_hw_read(SfHwGroup *g, SfHwCounts *out)
     out->insns     = sf_hw_read_one(g->fd[0]);
     out->cycles    = sf_hw_read_one(g->fd[1]);
     out->dram_fill = sf_hw_read_one(g->fd[2]);
+}
+
+void sf_hw_read_hier(SfHwGroup *g, SfHwCounts *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!g) {
+        return;
+    }
+    out->dram_fill = sf_hw_read_one(g->fd[0]);   /* mem_io_local */
+    out->l3_fill   = sf_hw_read_one(g->fd[1]);   /* int_cache (same-CCX) */
+    out->ccx_fill  = sf_hw_read_one(g->fd[2]);   /* ext_cache (cross-CCX) */
 }

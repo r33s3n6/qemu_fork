@@ -9,6 +9,8 @@
 
 struct SfHwGroup {
     int fd[SF_HW_N];   /* independent counters; fd < 0 = unsupported → 0 */
+    int aperf_fd;      /* msr PMU; guest group only, else -1 */
+    int mperf_fd;
 };
 
 static int sf_perf_event_open(struct perf_event_attr *a, pid_t pid, int cpu,
@@ -38,6 +40,38 @@ static int sf_hw_open_one(uint32_t type, uint64_t config, bool guest_only)
  * raw code; on non-Zen3 this event is unsupported → fd<0 → dram_fill reads 0. */
 #define SF_EV_DRAM_FILL 0x844
 
+/* msr PMU dynamic type (config 0x01=aperf, 0x02=mperf). Type is not a fixed
+ * PERF_TYPE_* — read it from sysfs. -1 if the PMU is absent. */
+static int sf_msr_pmu_type(void)
+{
+    int t = -1;
+    FILE *f = fopen("/sys/bus/event_source/devices/msr/type", "re");
+    if (f) {
+        if (fscanf(f, "%d", &t) != 1) {
+            t = -1;
+        }
+        fclose(f);
+    }
+    return t;
+}
+
+/* aperf/mperf on the calling thread, no exclude (total on-cpu cycles: aperf
+ * spans guest + in-kernel KVM, so aperf-guest_cycles = machinery). msr PMU is
+ * not a core PMC → free of the 6-counter budget. -1 if unsupported. */
+static int sf_msr_open_one(uint64_t config)
+{
+    int type = sf_msr_pmu_type();
+    struct perf_event_attr a;
+    if (type < 0) {
+        return -1;
+    }
+    memset(&a, 0, sizeof(a));
+    a.type = (uint32_t)type;
+    a.size = sizeof(a);
+    a.config = config;
+    return sf_perf_event_open(&a, 0 /* calling thread */, -1, -1, 0);
+}
+
 SfHwGroup *sf_hw_open(bool guest_only)
 {
     static const struct { uint32_t type; uint64_t config; } evs[SF_HW_N] = {
@@ -52,6 +86,9 @@ SfHwGroup *sf_hw_open(bool guest_only)
         g->fd[i] = sf_hw_open_one(evs[i].type, evs[i].config, guest_only);
         ok += (g->fd[i] >= 0);
     }
+    /* aperf/mperf only on the guest group (vCPU thread, spans the guest run). */
+    g->aperf_fd = guest_only ? sf_msr_open_one(0x01) : -1;
+    g->mperf_fd = guest_only ? sf_msr_open_one(0x02) : -1;
     if (!ok) {   /* nothing opened (denied?) → caller zeros */
         g_free(g);
         return NULL;
@@ -68,6 +105,7 @@ SfHwGroup *sf_hw_open_hier(void)
     static const uint64_t cfg[SF_HW_N] = { 0x844, 0x244, 0x444 };
     SfHwGroup *g = g_new(SfHwGroup, 1);
     int i, ok = 0;
+    g->aperf_fd = g->mperf_fd = -1;   /* host group: no aperf/mperf */
     for (i = 0; i < SF_HW_N; i++) {
         struct perf_event_attr a;
         memset(&a, 0, sizeof(a));
@@ -103,6 +141,8 @@ void sf_hw_read(SfHwGroup *g, SfHwCounts *out)
     out->insns     = sf_hw_read_one(g->fd[0]);
     out->cycles    = sf_hw_read_one(g->fd[1]);
     out->dram_fill = sf_hw_read_one(g->fd[2]);
+    out->aperf     = sf_hw_read_one(g->aperf_fd);
+    out->mperf     = sf_hw_read_one(g->mperf_fd);
 }
 
 void sf_hw_read_hier(SfHwGroup *g, SfHwCounts *out)

@@ -1087,6 +1087,7 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
                 "halt_wait=%" PRIu64 "us halt_poll=%" PRIu64 "us "
                 "guest_only_cpu=%" PRIu64 "us "
                 "g_insns=%" PRIu64 " g_cycles=%" PRIu64 " g_dram=%" PRIu64 " "
+                "a_aperf=%" PRIu64 " a_mperf=%" PRIu64 " "
                 "r_dram=%" PRIu64 " r_l3=%" PRIu64 " r_ccx=%" PRIu64 "\n",
                 dst->id, src == dst ? "inplace" : "cross",
                 (t1 - t0) / 1000.0, (c1 - c0) / 1000.0,
@@ -1100,6 +1101,7 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
                 guest_active_wall_us, guest_active_cpu_us, pf_taken,
                 halt_wait_us, halt_poll_us, guest_only_cpu_us,
                 hw_guest.insns, hw_guest.cycles, hw_guest.dram_fill,
+                hw_guest.aperf, hw_guest.mperf,
                 hw_rst.dram_fill, hw_rst.l3_fill, hw_rst.ccx_fill);
     }
     monitor_printf(NULL, "sf: restore ok: dst=%u device=%s ram W=%zu\n",

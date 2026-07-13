@@ -4,8 +4,11 @@
  * Two perf_event groups on the vCPU thread, split by domain so the two phases
  * that share the thread don't pollute each other:
  *   - guest group (exclude_host):  {insns, cycles, DRAM-fill}, read across the
- *     guest-run interval (last restore → this restore). IPC = insns/cycles, eff
- *     freq = cycles/wall, guest DRAM bandwidth = dram_fill×64/wall.
+ *     guest-run interval (last restore → this restore). IPC = insns/cycles,
+ *     guest DRAM bandwidth = dram_fill×64/wall. Plus {aperf, mperf} (msr PMU,
+ *     no-exclude → total on-cpu cycles): machinery time in the window is
+ *     guest_active_cpu×(aperf−cycles)/aperf (frequency-free, aperf≥cycles); the
+ *     aperf/mperf ratio also gives true eff-freq without the cycles/wall confound.
  *   - host group (exclude_guest):  {DRAM, same-CCX-L3, cross-CCX} MISS HIERARCHY,
  *     read t2→t3 isolates the restore memcpy (sf_restore_apply_ram). Total L2-miss
  *     = dram+l3+ccx; the split tells a full miss (DRAM, costs bandwidth) from a
@@ -39,6 +42,8 @@ typedef struct {
     uint64_t dram_fill;   /* DRAM read fills (ls_any_fills_from_sys.mem_io_local) */
     uint64_t l3_fill;     /* same-CCX cache fills (int_cache): L2-miss, on-die hit */
     uint64_t ccx_fill;    /* cross-CCX cache fills (ext_cache): another CCX's cache */
+    uint64_t aperf;       /* actual core cycles over on-cpu window (msr PMU, guest grp only) */
+    uint64_t mperf;       /* reference cycles (mperf ticks at host base rate) */
 } SfHwCounts;
 
 typedef struct SfHwGroup SfHwGroup;
@@ -70,6 +75,8 @@ static inline void sf_hw_delta(SfHwCounts *out,
     out->dram_fill = a->dram_fill - b->dram_fill;
     out->l3_fill   = a->l3_fill   - b->l3_fill;
     out->ccx_fill  = a->ccx_fill  - b->ccx_fill;
+    out->aperf     = a->aperf     - b->aperf;
+    out->mperf     = a->mperf     - b->mperf;
 }
 
 #endif /* SF_PERF_HWCOUNTERS_H */

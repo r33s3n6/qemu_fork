@@ -23,7 +23,7 @@
 #include "system/runstate.h"
 #include "qapi/error.h"
 #include "sf/sf.h"                /* sf_checkpoint_snapshot */
-#include "sf/checkpoint.h"        /* SF_CP_SNAPSHOT/RESTORE + sf_cp_generation_* */
+#include "sf/checkpoint.h"        /* SF_CP_SNAPSHOT/RESTORE */
 #include "sf/snap/node.h"         /* sf_snap_restore / sf_active / have_snapshot */
 #include "sf/snap/persist.h"      /* sf_snap_persist / sf_snap_promote */
 #include "sf/control/channel.h"   /* sf_control_reply */
@@ -339,7 +339,6 @@ bool sf_gate_boundary_cmd(const SfCtlCmd *cmd)
         bql_lock();
         sf_checkpoint_snapshot();
         bql_unlock();
-        sf_cp_generation_reset();
         sf_gate_park(SF_CS_PARKED_SNAPSHOT, SF_ST_SNAPSHOT,
                      sf_active ? sf_active->id : 0);
         sf_gate_flush();
@@ -381,7 +380,6 @@ bool sf_gate_boundary_cmd(const SfCtlCmd *cmd)
             sf_control_reply(SF_ST_ERROR, SF_ERR_PERSIST_FAILED);
             return false;
         }
-        sf_cp_generation_reset();
         sf_gate_park(SF_CS_PARKED_SNAPSHOT, SF_ST_SNAPSHOT,
                      sf_active ? sf_active->id : 0);
         sf_gate_flush();
@@ -403,7 +401,6 @@ bool sf_gate_boundary_cmd(const SfCtlCmd *cmd)
             error_free(err);
             return sf_restore_fail(id, "restore engine error");
         }
-        sf_cp_generation_inc();
         qemu_mutex_lock(&sf_gate_mtx);
         sf_gate_begin_resume_locked();
         qemu_mutex_unlock(&sf_gate_mtx);
@@ -456,7 +453,6 @@ static bool sf_gate_stopped_resume(const SfCtlCmd *cmd)
             sf_restore_fail(id, "restore engine error");
             return false;   /* stopped stays stopped */
         }
-        sf_cp_generation_inc();
         /* vm_start with the BQL held (matches HMP); release before the gate
          * mutex to keep sf_gate_mtx never nested under the BQL. */
         vm_start();

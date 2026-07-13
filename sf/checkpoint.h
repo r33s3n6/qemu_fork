@@ -18,22 +18,16 @@
 #define SF_CP_SNAPSHOT   1
 #define SF_CP_RESTORE    2
 
-/* inl readback (single slot, meaning depends on the cmd the guest just sent):
- *   SNAPSHOT → the new node id (driver learns the id it must later restore to)
- *   RESTORE  → generation counter (++ per restore); a failed restore is fatal
- *              (SF_RESTORE_FAIL_POLICY), never a readback
- *   NOP      → generation counter
- * The guest knows which it sent, so it interprets the one slot accordingly. */
-
-/* Host-side restore-generation accessors (kept in sf/checkpoint.c, updated by
- * sf/control/gate.c on snapshot/restore so the single-site probe still tells
- * gen 0 from gen k). */
-void sf_cp_generation_reset(void);   /* gen = 0 (after a snapshot) */
-void sf_cp_generation_inc(void);     /* gen++ (after a restore / cold-start) */
+/* Reply the guest reads back (in %rax on KVM, inl readback on TCG): the active
+ * node id for every cmd. It is baked into %rax before the snapshot capture, so
+ * snapshot() returns the id uniformly whether the guest just snapshotted, was
+ * restored, or cold-started — the guest can always-write its restore target with
+ * no first-arrival detection. A failed restore is fatal (SF_RESTORE_FAIL_POLICY),
+ * never a readback. */
 
 /* Execute a guest SNAPSHOT/RESTORE/NOP on the vcpu thread and push the reply the
- * guest reads back in %rax (SNAPSHOT → new node id, RESTORE → generation, NOP →
- * generation). THE single shared execution path: the standalone port write and
+ * guest reads back in %rax (always the active node id). THE single shared
+ * execution path: the standalone port write and
  * the gate ALLOW self-execute both call it, so a gate=ALLOW guest with the control
  * chardev attached is indistinguishable from no host. A failed restore never
  * returns a guest sentinel — it routes through sf_restore_fail (fatal per policy);

@@ -9,8 +9,8 @@
  *
  * ABI (single-site rule, see design doc): the guest issues both SNAPSHOT and
  * RESTORE from ONE outl instruction address (an inline sf_cp() helper). Writing
- * a command to SF_CP_PORT triggers it; reading returns the restore generation
- * counter (kept host-side, outside guest RAM, so restore does not roll it back).
+ * a command to SF_CP_PORT triggers it; the reply (node id) goes back in %rax on
+ * the same outl (KVM +a model), or via the inl readback (g_sf_cp_reply) on TCG.
  *
  * Slice 6: when a control channel is attached, a guest port write parks the
  * guest and lets the host drive. Slice 7: the guest's port-write value now
@@ -42,18 +42,12 @@
 #include "sf/snap/node.h"      /* sf_active */
 #include "sf/param.h"          /* sf_param_setup / sf_param_stamp_header */
 
-/* Host-side restore generation: 0 after snapshot, +1 per restore. Lives outside
- * guest RAM so a RAM rollback does not reset it — this is how the guest probe
- * tells "just snapshotted" (gen 0) from "just restored" (gen k) at the one site.
- * The standalone read path (sf_cp_read) returns g_sf_cp_reply, which carries the
- * new node id after a SNAPSHOT and the generation after a RESTORE; the channel
- * path does not read the port, so g_sf_cp_generation is what gate.c keeps in sync
- * for its own (unread) bookkeeping. */
-static uint32_t g_sf_cp_generation;
+/* sf_cp reply readback for the standalone (TCG) path: snapshot/restore/cold-start
+ * all return the node id now (baked into %rax before capture), so g_sf_cp_reply
+ * carries the active node id. The generation counter was retired — nothing read
+ * it (taskchan's park() ignores its return; the scenario dispatches on its own
+ * NO_RESTORE phase, not the sf_cp return). */
 static uint32_t g_sf_cp_reply;   /* last inl readback value (standalone path only) */
-
-void sf_cp_generation_reset(void)  { g_sf_cp_generation = 0; }
-void sf_cp_generation_inc(void)   { g_sf_cp_generation++; }
 
 static uint64_t sf_cp_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -70,8 +64,7 @@ static uint64_t sf_cp_read(void *opaque, hwaddr addr, unsigned size)
  * (cputlb BQL_LOCK_GUARD), so drop it for the duration and restore it on exit —
  * the caller's invariant is preserved either way. The guest cmd value routes
  * through the gate; continue/restore/cold-start resume, snapshot replies and
- * loops. The generation counter is kept in sync with the standalone path so the
- * single-site probe still tells snapshot (gen 0) from restore (gen k).
+ * loops.
  */
 static void sf_control_boundary(uint64_t val)
 {
@@ -107,8 +100,7 @@ bool sf_cp_execute_and_reply(uint32_t val)
      * WITHOUT the BQL so the boundary can later block on a control-channel command
      * without freezing the main loop (Nyx model). save/restore still need the BQL,
      * so take it just around them — but the TCG I/O path already holds it (cputlb
-     * BQL_LOCK_GUARD), so only take it when not already held. The generation
-     * counter is a plain host word, no lock needed. */
+     * BQL_LOCK_GUARD), so only take it when not already held. */
     bool take_bql = !bql_locked();
 
     /* ABI: eax = command (val), ebx = the full 32-bit composite node id (RESTORE).
@@ -121,16 +113,15 @@ bool sf_cp_execute_and_reply(uint32_t val)
         if (take_bql) { bql_lock(); }
         sf_checkpoint_snapshot();
         if (take_bql) { bql_unlock(); }
-        g_sf_cp_generation = 0;
-        /* Reply = the just-created node id (sf_active was updated in sf_snap_save);
-         * the driver learns the id it must later restore to. */
+        /* Reply = the just-created node id (sf_active was updated in sf_snap_save;
+         * also baked into %rax before the capture). The driver learns the id it
+         * must later restore to. */
         g_sf_cp_reply = sf_active ? sf_active->id : 0;
         break;
     case SF_CP_RESTORE: {
-        /* Restore rolls the vcpu (incl. RIP) back to the snapshot outl site; bump
-         * the generation the guest reads back so it tells restore (gen k) from the
-         * first snapshot (gen 0 / new id). */
-        g_sf_cp_generation++;
+        /* Restore rolls the vcpu (incl. RIP) back to the snapshot outl site. The
+         * baked %rax carries the node id, so the guest reads the same id back
+         * whether it just snapshotted, was restored, or cold-started. */
         if (take_bql) { bql_lock(); }
         bool ok = sf_checkpoint_restore(id);
         if (take_bql) { bql_unlock(); }
@@ -146,7 +137,9 @@ bool sf_cp_execute_and_reply(uint32_t val)
         break;
     }
     case SF_CP_NOP:
-        g_sf_cp_reply = g_sf_cp_generation;   /* boundary probe reads the generation */
+        /* park()/boundary probe: no save/restore. Its return is unread (taskchan
+         * ignores park()'s value); reply the active node id for consistency. */
+        g_sf_cp_reply = sf_active ? sf_active->id : 0;
         break;
     default:
         fprintf(stderr, "sf-cp: unknown cmd %u\n", val);
@@ -193,8 +186,7 @@ static MemoryRegion sf_cp_io;
 
 /* One-shot main-loop BH (aio_bh_schedule_oneshot auto-frees it): perform the
  * configured boot cold-start once machine creation is complete (see the
- * scheduling site for why a BH, not inline). vm_stop while restoring, generation
- * bump, vm_start. */
+ * scheduling site for why a BH, not inline). vm_stop while restoring, vm_start. */
 static void sf_boot_cold_start_bh(void *opaque)
 {
     const SfConfig *c = sf_config();
@@ -215,7 +207,6 @@ static void sf_boot_cold_start_bh(void *opaque)
                      error_get_pretty(err));
         exit(1);
     }
-    sf_cp_generation_inc();
     /* Backfill the sf-param HEADER with THIS worker's scale: cold_remap_live_ram
      * loaded the base RAM (setup's HEADER) and cold_remap_bufs re-established the
      * region; stamp the worker's own scale over it so real_sleep reads it. */

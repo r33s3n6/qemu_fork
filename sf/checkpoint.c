@@ -140,7 +140,9 @@ bool sf_cp_execute_and_reply(uint32_t val)
              * return the policy's resume decision for the gate caller. */
             return sf_restore_fail(id, "bad id or restore engine error");
         }
-        g_sf_cp_reply = g_sf_cp_generation;
+        /* snapshot() returns the node id uniformly (baked into the restored vcpu
+         * %rax); the restored node is now active, so reply its id (== baked). */
+        g_sf_cp_reply = sf_active ? sf_active->id : id;
         break;
     }
     case SF_CP_NOP:

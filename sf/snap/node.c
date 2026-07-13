@@ -92,6 +92,15 @@ void sf_node_observe_id(uint32_t id)
     }
 }
 
+/* The id sf_node_new WILL assign to the next non-root child (peek, no advance).
+ * The snapshot path bakes this into the vcpu %rax before capture so snapshot()
+ * returns the node id uniformly — live, restore-return, and cold-start resume. */
+uint32_t sf_node_peek_next_id(void)
+{
+    sf_id_init_once();
+    return SF_ID(g_worker_id, g_next_local);
+}
+
 /* ---- Node tree ---- */
 
 SfSnapNode *sf_node_new(SfSnapNode *parent, SfSnapKind kind)

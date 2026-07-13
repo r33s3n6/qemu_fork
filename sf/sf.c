@@ -221,6 +221,14 @@ static int sf_do_snapshot(const char *persist_dir, const char *common_ref)
     }
     if (current_cpu) {
         cpu_synchronize_state(current_cpu);   /* env->tsc = T0 for the node capture */
+        /* Bake the id-to-be into %rax BEFORE the capture, so snapshot() returns the
+         * node id uniformly: live (post_init pushes env->rax back to the vcpu),
+         * restore-return + cold-start (the serialized vcpu state carries it). Lets
+         * the guest always-write prefix_id without first-arrival detection. Root=0. */
+        if (kvm_enabled()) {
+            uint32_t next_id = sf_active ? sf_node_peek_next_id() : SF_ROOT_ID;
+            sf_kvm_put_rax(current_cpu, next_id);
+        }
     }
     /* save() builds a child of the active node (plan -04 §2): the first
      * CHECKPOINT builds root, subsequent ones build RUN diff layers on top. */

@@ -219,6 +219,8 @@ void  sf_node_observe_id(uint32_t id);
  * reserves local 0 for the root). */
 void     sf_node_set_worker_id(uint32_t wid);
 uint32_t sf_node_worker_id(void);
+/* Id the next non-root sf_node_new will assign (peek, no advance). */
+uint32_t sf_node_peek_next_id(void);
 
 /* Owner resolution (design §3): ≤dst 的最近 owner 的 data page; root 兜底. */
 uint8_t *sf_resolve(SfSnapNode *dst, SfPageKey key);

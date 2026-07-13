@@ -38,6 +38,7 @@
 #include "sf/snap/exclude.h"
 #include "sf/snap/persist.h"   /* sf_snap_promote (op `S` durable snapshot) */
 #include "sf/snap/tripwire.h"
+#include "sf/perf/hwcounters.h"   /* per-round guest/host hw counters (SF_TIME) */
 #include "sf/sf.h"          /* sf_skip_tsc declaration (defined here) */
 
 /* ---- timing probe (SF_TIME) ---- */
@@ -118,6 +119,13 @@ static uint64_t sf_restore_last_pf_taken;
 static uint64_t sf_restore_last_halt_wait_ns;
 static uint64_t sf_restore_last_halt_poll_ns;
 static uint64_t sf_restore_last_guest_time_ns;
+/* Per-round hw counters (SF_TIME). Guest group spans the guest-run interval
+ * (last restore → this restore); host group is read t2→t3 around the memcpy.
+ * Lazy-opened on the first timed restore, on the vCPU thread. */
+static SfHwGroup *sf_hw_guest;
+static SfHwGroup *sf_hw_host;
+static bool sf_hw_tried;
+static SfHwCounts sf_restore_last_hw_guest;
 
 /* ---- test knobs (teeth for the phase1.5 gates) ---- */
 bool sf_skip_tsc(void)   /* exposed for the terminal snapshot path's refreeze */
@@ -951,10 +959,17 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
     uint64_t guest_active_wall_us = 0, guest_active_cpu_us = 0, pf_taken = 0;
     uint64_t halt_wait_us = 0, halt_poll_us = 0, guest_only_cpu_us = 0;
     SfRestoreSrcStat src_stat = {0};
+    SfHwCounts hw_guest = {0}, hw_rst = {0};   /* guest-run + restore-memcpy deltas */
+    SfHwCounts hw_rst0 = {0};
 
     if (timing) {
         t0 = sf_now_ns();
         c0 = sf_now_thread_ns();
+        if (!sf_hw_tried) {   /* first timed restore = we're on the vCPU thread */
+            sf_hw_guest = sf_hw_open(true);
+            sf_hw_host = sf_hw_open(false);
+            sf_hw_tried = true;
+        }
     }
 
     /* Step 1: drain the ring + get the persistent plan, resolved to dst. */
@@ -966,6 +981,8 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
         uint64_t poll_now = sf_kvm_vcpu_stat_sum("halt_poll_success_ns")
                           + sf_kvm_vcpu_stat_sum("halt_poll_fail_ns");
         uint64_t gtime_now = sf_restore_guest_time_ns();
+        SfHwCounts hw_g_now;
+        sf_hw_read(sf_hw_guest, &hw_g_now);   /* guest-run interval endpoint */
 
         if (sf_restore_exec_base_valid) {
             guest_active_wall_us =
@@ -976,7 +993,9 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
             halt_wait_us = (halt_now - sf_restore_last_halt_wait_ns) / 1000;
             halt_poll_us = (poll_now - sf_restore_last_halt_poll_ns) / 1000;
             guest_only_cpu_us = (gtime_now - sf_restore_last_guest_time_ns) / 1000;
+            sf_hw_delta(&hw_guest, &hw_g_now, &sf_restore_last_hw_guest);
         }
+        sf_restore_last_hw_guest = hw_g_now;
         sf_restore_last_guest_active_wall_ns = wall_now;
         sf_restore_last_guest_active_cpu_ns = cpu_now;
         sf_restore_last_pf_taken = pf_now;
@@ -1003,11 +1022,15 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
     if (timing) {
         t2 = sf_now_ns();
         c2 = sf_now_thread_ns();  /* anchors ram_cpu start (device wall-only) */
+        sf_hw_read(sf_hw_host, &hw_rst0);   /* restore-memcpy window start */
     }
 
     /* Step 3: RAM delta-restore — plan (+ cross-node path pages) → live guest. */
     n = sf_restore_apply_ram(dst, src, plan);
     if (timing) {
+        SfHwCounts hw_h_now;
+        sf_hw_read(sf_hw_host, &hw_h_now);
+        sf_hw_delta(&hw_rst, &hw_h_now, &hw_rst0);
         t3 = sf_now_ns();
         c3 = sf_now_thread_ns();
         /* A2: outside ram bucket — does not pollute ram/ram_cpu. */
@@ -1055,7 +1078,9 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
                 "guest_active_wall=%" PRIu64 "us guest_active_cpu=%" PRIu64 "us "
                 "pf_taken=%" PRIu64 " "
                 "halt_wait=%" PRIu64 "us halt_poll=%" PRIu64 "us "
-                "guest_only_cpu=%" PRIu64 "us\n",
+                "guest_only_cpu=%" PRIu64 "us "
+                "g_insns=%" PRIu64 " g_cycles=%" PRIu64 " g_llcmiss=%" PRIu64 " "
+                "r_insns=%" PRIu64 " r_cycles=%" PRIu64 " r_llcmiss=%" PRIu64 "\n",
                 dst->id, src == dst ? "inplace" : "cross",
                 (t1 - t0) / 1000.0, (c1 - c0) / 1000.0,
                 (t2 - t1) / 1000.0,
@@ -1066,7 +1091,9 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
                 n, reprotect_pages,
                 src_stat.root, src_stat.shared, src_stat.private, src_stat.null_src,
                 guest_active_wall_us, guest_active_cpu_us, pf_taken,
-                halt_wait_us, halt_poll_us, guest_only_cpu_us);
+                halt_wait_us, halt_poll_us, guest_only_cpu_us,
+                hw_guest.insns, hw_guest.cycles, hw_guest.llc_miss,
+                hw_rst.insns, hw_rst.cycles, hw_rst.llc_miss);
     }
     monitor_printf(NULL, "sf: restore ok: dst=%u device=%s ram W=%zu\n",
                    dst->id, dst->dev.have ? "replayed" : "SKIPPED", n);

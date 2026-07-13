@@ -32,15 +32,18 @@ static int sf_hw_open_one(uint32_t type, uint64_t config, bool guest_only)
     return sf_perf_event_open(&a, 0 /* calling thread */, -1, -1, 0);
 }
 
+/* AMD Zen3 ls_any_fills_from_sys.mem_io_local — data-cache fills from local DRAM
+ * (incl. prefetch). TRUE DRAM read traffic; replaces the coarse CACHE_MISSES that
+ * conflated L3-hit L2-misses with real DRAM. See header. ponytail: AMD-specific
+ * raw code; on non-Zen3 this event is unsupported → fd<0 → dram_fill reads 0. */
+#define SF_EV_DRAM_FILL 0x844
+
 SfHwGroup *sf_hw_open(bool guest_only)
 {
     static const struct { uint32_t type; uint64_t config; } evs[SF_HW_N] = {
         { PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS },
         { PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES },
-        /* generic last-level-cache misses → DRAM traffic. The HW_CACHE_LL|READ|MISS
-         * encoding (perf's "LLC-load-misses") is <not supported> on this EPYC;
-         * PERF_COUNT_HW_CACHE_MISSES maps to a real LLC-miss event on AMD. */
-        { PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_MISSES },
+        { PERF_TYPE_RAW,      SF_EV_DRAM_FILL },
     };
     SfHwGroup *g = g_new(SfHwGroup, 1);
     int i, ok = 0;
@@ -59,7 +62,7 @@ SfHwGroup *sf_hw_open(bool guest_only)
 /* Investigation group (SF_HW_FILLSRC): AMD Zen3 "any data-cache fills by source"
  * on the HOST side (exclude_guest) — localizes where the restore memcpy's fills
  * come from. Reuses the 3 SfHwCounts slots: insns←mem_io_local(DRAM 0x844),
- * cycles←ext_cache_local(cross-CCX 0x444), llc_miss←int_cache(same-CCX 0x244).
+ * cycles←ext_cache_local(cross-CCX 0x444), dram_fill←int_cache(same-CCX 0x244).
  * Answers whether shared-base restore's extra "misses" are DRAM traffic or just
  * cross-CCX cache-to-cache coherence (which the coarse CACHE_MISSES conflates). */
 SfHwGroup *sf_hw_open_fillsrc(void)
@@ -99,7 +102,7 @@ void sf_hw_read(SfHwGroup *g, SfHwCounts *out)
     if (!g) {
         return;
     }
-    out->insns    = sf_hw_read_one(g->fd[0]);
-    out->cycles   = sf_hw_read_one(g->fd[1]);
-    out->llc_miss = sf_hw_read_one(g->fd[2]);
+    out->insns     = sf_hw_read_one(g->fd[0]);
+    out->cycles    = sf_hw_read_one(g->fd[1]);
+    out->dram_fill = sf_hw_read_one(g->fd[2]);
 }

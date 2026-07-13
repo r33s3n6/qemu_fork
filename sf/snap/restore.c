@@ -1095,8 +1095,8 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
                 "pf_taken=%" PRIu64 " "
                 "halt_wait=%" PRIu64 "us halt_poll=%" PRIu64 "us "
                 "guest_only_cpu=%" PRIu64 "us "
-                "g_insns=%" PRIu64 " g_cycles=%" PRIu64 " g_llcmiss=%" PRIu64 " "
-                "r_insns=%" PRIu64 " r_cycles=%" PRIu64 " r_llcmiss=%" PRIu64 " "
+                "g_insns=%" PRIu64 " g_cycles=%" PRIu64 " g_dram=%" PRIu64 " "
+                "r_insns=%" PRIu64 " r_cycles=%" PRIu64 " r_dram=%" PRIu64 " "
                 "r_memio=%" PRIu64 " r_extcache=%" PRIu64 " r_intcache=%" PRIu64 "\n",
                 dst->id, src == dst ? "inplace" : "cross",
                 (t1 - t0) / 1000.0, (c1 - c0) / 1000.0,
@@ -1109,9 +1109,9 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
                 src_stat.root, src_stat.shared, src_stat.private, src_stat.null_src,
                 guest_active_wall_us, guest_active_cpu_us, pf_taken,
                 halt_wait_us, halt_poll_us, guest_only_cpu_us,
-                hw_guest.insns, hw_guest.cycles, hw_guest.llc_miss,
-                hw_rst.insns, hw_rst.cycles, hw_rst.llc_miss,
-                hw_fill.insns, hw_fill.cycles, hw_fill.llc_miss);
+                hw_guest.insns, hw_guest.cycles, hw_guest.dram_fill,
+                hw_rst.insns, hw_rst.cycles, hw_rst.dram_fill,
+                hw_fill.insns, hw_fill.cycles, hw_fill.dram_fill);
     }
     monitor_printf(NULL, "sf: restore ok: dst=%u device=%s ram W=%zu\n",
                    dst->id, dst->dev.have ? "replayed" : "SKIPPED", n);

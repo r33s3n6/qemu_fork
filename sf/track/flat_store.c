@@ -135,11 +135,32 @@ static void flat_dbg_note(FlatStore *f)
     }
     double union_ratio = pc_this ? (double)pc_union / (double)pc_this : 0.0;
 
+    /* spatial clustering of this round's dirty set: run-length over consecutive
+     * page indexes = ceiling for a merged/large-copy apply (the plan array is
+     * drain-order, so merging would need an address-sorted view first). */
+    size_t runs = 0, run_max = 0, pages_ge8 = 0, singles = 0;
+    for (size_t b = find_next_bit(f->member, nbits, 0); b < nbits; ) {
+        size_t e = find_next_zero_bit(f->member, nbits, b);
+        size_t len = e - b;
+        runs++;
+        run_max = MAX(run_max, len);
+        if (len >= 8) {
+            pages_ge8 += len;
+        }
+        if (len == 1) {
+            singles++;
+        }
+        b = find_next_bit(f->member, nbits, e);
+    }
+
     fprintf(stderr,
             "sf-dirty-trace: round=%zu this=%zu common=%zu union=%zu "
-            "overlap_prev=%zu overlap_union=%zu union_per_round=%.3f\n",
+            "overlap_prev=%zu overlap_union=%zu union_per_round=%.3f "
+            "runs=%zu run_max=%zu run_mean=%.1f pages_in_runs_ge8=%zu singles=%zu\n",
             f->dbg_rounds, pc_this, pc_common, pc_union,
-            pc_overlap_prev, pc_overlap_union, union_ratio);
+            pc_overlap_prev, pc_overlap_union, union_ratio,
+            runs, run_max, runs ? (double)pc_this / runs : 0.0,
+            pages_ge8, singles);
     memcpy(f->dbg_prev, f->member, nwords * sizeof(long));
 }
 

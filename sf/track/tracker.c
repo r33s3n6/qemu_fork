@@ -6,6 +6,7 @@
  * stays independent of the snapshot tree. Clean-room: no Nyx code.
  */
 #include "qemu/osdep.h"
+#include <sched.h>
 #include "qapi/error.h"
 #include "qemu/thread.h"
 #include "system/kvm.h"
@@ -171,16 +172,63 @@ typedef struct {
     QemuCond   cond_done;
     const SfPlanPage *pages;
     size_t start, end;
+    uint64_t cpu_ns;            /* thread-CPU spent on the last slice (for ram_cpu) */
     bool have_work, done, started;
 } SfApplyWorker;
 
 static SfApplyWorker g_worker;
+static uint64_t g_last_bg_cpu_ns;   /* bg-thread CPU of the last apply (0 = single-thread) */
 
 #define SF_APPLY_PARALLEL_MIN 2048   /* below this the handoff isn't worth it */
+
+static uint64_t sf_thread_cpu_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
+
+/* SF_APPLY_SIBLING=1: pin the bg apply thread to the SMT sibling of the CPU the
+ * worker is pinned to, so the two apply halves land on 2 hardware threads of the
+ * same physical core instead of time-sharing one. Experiment knob (memcpy is
+ * memory-bound → SMT siblings share L2/mem ports, so expect little at a full
+ * machine). No-op if topology can't be read. */
+static void sf_apply_pin_sibling(void)
+{
+    int cpu = sched_getcpu();
+    if (cpu < 0) {
+        return;
+    }
+    char path[128], buf[128];
+    snprintf(path, sizeof(path),
+             "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return;
+    }
+    int sib = -1;
+    if (fgets(buf, sizeof(buf), f)) {
+        for (char *p = buf; *p; ) {
+            int v = (int)strtol(p, &p, 10);
+            if (v != cpu) { sib = v; break; }
+            while (*p == ',' || *p == '-') { p++; }
+        }
+    }
+    fclose(f);
+    if (sib >= 0) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(sib, &set);
+        sched_setaffinity(0, sizeof(set), &set);
+    }
+}
 
 static void *sf_apply_worker_fn(void *opaque)
 {
     SfApplyWorker *w = opaque;
+    if (getenv("SF_APPLY_SIBLING")) {
+        sf_apply_pin_sibling();
+    }
     qemu_mutex_lock(&w->mtx);
     for (;;) {
         while (!w->have_work) {
@@ -190,14 +238,24 @@ static void *sf_apply_worker_fn(void *opaque)
         size_t s = w->start, e = w->end;
         qemu_mutex_unlock(&w->mtx);
 
+        uint64_t c0 = sf_thread_cpu_ns();
         sf_copy_slice(pages, s, e);
+        uint64_t slice_cpu = sf_thread_cpu_ns() - c0;
 
         qemu_mutex_lock(&w->mtx);
+        w->cpu_ns = slice_cpu;
         w->have_work = false;
         w->done = true;
         qemu_cond_signal(&w->cond_done);
     }
     /* ponytail: never signalled to exit; lives for the process (blocked in wait). */
+}
+
+/* bg-thread CPU (ns) consumed by the most recent sf_track_apply; 0 if that apply
+ * ran single-threaded (caller CPU already covers it). */
+uint64_t sf_track_last_apply_bg_cpu_ns(void)
+{
+    return g_last_bg_cpu_ns;
 }
 
 void sf_track_apply(const SfPlanPage *pages, size_t n)
@@ -210,6 +268,7 @@ void sf_track_apply(const SfPlanPage *pages, size_t n)
     }
     /* SF_APPLY_THREADS=1: no background thread; always single-thread memcpy. */
     if (sf_apply_nthreads() == 1 || n < SF_APPLY_PARALLEL_MIN) {
+        g_last_bg_cpu_ns = 0;   /* caller-thread CPU already covers the whole apply */
         sf_copy_slice(pages, 0, n);
         return;
     }
@@ -235,5 +294,6 @@ void sf_track_apply(const SfPlanPage *pages, size_t n)
     while (!w->done) {
         qemu_cond_wait(&w->cond_done, &w->mtx);
     }
+    g_last_bg_cpu_ns = w->cpu_ns;   /* fold bg half into ram_cpu (see restore.c) */
     qemu_mutex_unlock(&w->mtx);
 }

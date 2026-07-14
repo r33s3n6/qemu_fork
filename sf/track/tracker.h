@@ -106,6 +106,7 @@ void sf_track_end(void);
 void sf_track_drain(void);                        /* ring → store->note_batch */
 const SfRestorePlan *sf_track_plan(void *target); /* store->plan (live-dirty set) */
 void sf_track_apply(const SfPlanPage *pages, size_t n);  /* memcpy; SF_APPLY_THREADS=1|2 */
+uint64_t sf_track_last_apply_bg_cpu_ns(void); /* bg-thread CPU of last apply (0=single) */
 size_t sf_track_after_restore(void *target);      /* store->after_restore; #reprotect */
 void sf_track_after_drain(void);                  /* store->after_drain (ring-full) */
 uint8_t *sf_track_resolve(void *target, void *host); /* for the snap layer's path pages */

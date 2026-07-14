@@ -955,7 +955,7 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
     uint64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0;
     uint64_t c0 = 0, c1 = 0, c2 = 0, c3 = 0, c4 = 0;
     uint64_t t_cpusync = 0, t_tsc = 0, t_reprotect = 0;  /* cpusync/tsc = accum durations */
-    uint64_t c_reprotect = 0;
+    uint64_t c_reprotect = 0, ram_bg_cpu = 0;  /* ram_bg_cpu = bg apply thread CPU */
     uint64_t guest_active_wall_us = 0, guest_active_cpu_us = 0, pf_taken = 0;
     uint64_t halt_wait_us = 0, halt_poll_us = 0, guest_only_cpu_us = 0;
     SfRestoreSrcStat src_stat = {0};
@@ -1040,6 +1040,9 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
         sf_hw_delta(&hw_rst, &hw_h_now, &hw_rst0);
         t3 = sf_now_ns();
         c3 = sf_now_thread_ns();
+        /* bg apply thread's CPU for this apply (0 if single-thread); folded into
+         * ram_cpu AND total_cpu so both count all apply threads, not just caller. */
+        ram_bg_cpu = sf_track_last_apply_bg_cpu_ns();
         /* A2: outside ram bucket — does not pollute ram/ram_cpu. */
         sf_src_stat_for_restore(dst, src, plan, &src_stat);
     }
@@ -1092,10 +1095,10 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
                 dst->id, src == dst ? "inplace" : "cross",
                 (t1 - t0) / 1000.0, (c1 - c0) / 1000.0,
                 (t2 - t1) / 1000.0,
-                (t3 - t2) / 1000.0, (c3 - c2) / 1000.0,
+                (t3 - t2) / 1000.0, (c3 - c2 + ram_bg_cpu) / 1000.0,
                 t_cpusync / 1000.0, t_tsc / 1000.0,
                 (t_reprotect - t4) / 1000.0, (c_reprotect - c4) / 1000.0,
-                (t_reprotect - t0) / 1000.0, (c_reprotect - c0) / 1000.0,
+                (t_reprotect - t0) / 1000.0, (c_reprotect - c0 + ram_bg_cpu) / 1000.0,
                 n, reprotect_pages,
                 src_stat.root, src_stat.shared, src_stat.private, src_stat.null_src,
                 guest_active_wall_us, guest_active_cpu_us, pf_taken,

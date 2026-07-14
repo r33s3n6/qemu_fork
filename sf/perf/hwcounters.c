@@ -102,7 +102,14 @@ SfHwGroup *sf_hw_open(bool guest_only)
  * [2] ext_cache_local (cross-CCX, 0x444). Read into dram_fill/l3_fill/ccx_fill. */
 SfHwGroup *sf_hw_open_hier(void)
 {
-    static const uint64_t cfg[SF_HW_N] = { 0x844, 0x244, 0x444 };
+    /* Default = miss hierarchy {mem_io_local, int_cache, ext_cache}. A3: with
+     * SF_STALL_PMC set, swap to Zen3 backend-stall on the restore memcpy window
+     * {host cycles 0x076, store_queue_rsrc_stall 0x4ae, load_queue_rsrc_stall
+     * 0x2ae} — reuses the dram_fill/l3_fill/ccx_fill fields (relabel offline).
+     * Per-window (t2..t3) isolation the system-wide perf proxy couldn't give. */
+    static const uint64_t cfg_fill[SF_HW_N]  = { 0x844, 0x244, 0x444 };
+    static const uint64_t cfg_stall[SF_HW_N] = { 0x076, 0x4ae, 0x2ae };
+    const uint64_t *cfg = getenv("SF_STALL_PMC") ? cfg_stall : cfg_fill;
     SfHwGroup *g = g_new(SfHwGroup, 1);
     int i, ok = 0;
     g->aperf_fd = g->mperf_fd = -1;   /* host group: no aperf/mperf */

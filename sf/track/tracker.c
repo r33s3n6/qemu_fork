@@ -7,6 +7,9 @@
  */
 #include "qemu/osdep.h"
 #include <sched.h>
+#ifdef __x86_64__
+#include <immintrin.h>
+#endif
 #include "qapi/error.h"
 #include "qemu/thread.h"
 #include "system/kvm.h"
@@ -137,9 +140,57 @@ void sf_track_invalidate(void *target)
  * (archive 2026-06-21-08). SF_APPLY_THREADS=1 = no background thread (all
  * memcpy on the caller). Two-pass (resolve-all in plan, then memcpy-all).
  */
+#ifdef __x86_64__
+/* SF_APPLY_NT=1: write the destination pages with non-temporal (streaming)
+ * stores instead of a temporal memcpy, skipping the write-allocate RFO read of
+ * every destination line (plan 2026-07-14-02 A/B knob; default off). */
+static bool sf_apply_nt(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("SF_APPLY_NT");
+        cached = (e && *e == '1');
+    }
+    return cached;
+}
+
+static void sf_copy_page_nt(void *dst, const uint8_t *src, size_t psize)
+{
+    /* psize is a power of two ≥ 64 and dst is page-aligned, so 16B-aligned
+     * movntdq never faults and there is no tail. */
+    for (size_t off = 0; off < psize; off += 64) {
+        __m128i a = _mm_loadu_si128((const __m128i *)(src + off));
+        __m128i b = _mm_loadu_si128((const __m128i *)(src + off + 16));
+        __m128i c = _mm_loadu_si128((const __m128i *)(src + off + 32));
+        __m128i d = _mm_loadu_si128((const __m128i *)(src + off + 48));
+        _mm_stream_si128((__m128i *)((uint8_t *)dst + off), a);
+        _mm_stream_si128((__m128i *)((uint8_t *)dst + off + 16), b);
+        _mm_stream_si128((__m128i *)((uint8_t *)dst + off + 32), c);
+        _mm_stream_si128((__m128i *)((uint8_t *)dst + off + 48), d);
+    }
+}
+#endif
+
 static void sf_copy_slice(const SfPlanPage *pages, size_t start, size_t end)
 {
     size_t psize = qemu_real_host_page_size();
+#ifdef __x86_64__
+    if (sf_apply_nt()) {
+        for (size_t i = start; i < end; i++) {
+            if (pages[i].dst && pages[i].src) {
+                sf_copy_page_nt(pages[i].dst, pages[i].src, psize);
+            }
+        }
+        /* NT stores are weakly ordered: fence before anyone (vCPU, or the
+         * caller joining the bg worker) may read these pages. Every apply path
+         * ends in this function on its own thread, so one sfence per slice
+         * covers single-thread, caller-half and worker-half (the worker fences
+         * before its done-signal; the mutex hand-off orders the rest). Missing
+         * this = silent stale guest pages, worse than a crash. */
+        _mm_sfence();
+        return;
+    }
+#endif
     for (size_t i = start; i < end; i++) {
         if (pages[i].dst && pages[i].src) {
             memcpy(pages[i].dst, pages[i].src, psize);

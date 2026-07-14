@@ -329,9 +329,9 @@ void sf_snap_tracker_disarm(void)
 
 int sf_snap_tracker_arm(SfSnapNode *active, Error **errp)
 {
-    if (!sf_kvm_dirty_ring_enabled()) {
+    if (!sf_kvm_dirty_ring_enabled() && !sf_kvm_dbit_mode()) {
         error_setg(errp, "KVM dirty ring not enabled "
-                   "(need -accel kvm,dirty-ring-size=N)");
+                   "(need -accel kvm,dirty-ring-size=N, or SF_DIRTY_DBIT=1)");
         return -ENOTSUP;
     }
     sf_snap_tracker_disarm();   /* idempotent: drop any prior session */

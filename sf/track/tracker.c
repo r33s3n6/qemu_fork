@@ -43,25 +43,47 @@ bool sf_track_active(void)
 void sf_track_begin(const SfBlockReg *blocks, size_t n_blocks,
                     SfResolveFn resolve, void *user, SfRestoreStore *store)
 {
-    size_t ring = sf_kvm_ring_capacity();
+    bool dbit = sf_kvm_dbit_mode();
+    size_t cap;
 
-    (void)blocks;      /* the store holds its own block table (host→idx); the */
-    (void)n_blocks;    /* tracker works in host pointers from the ring drain. */
     g_resolve = resolve;
     g_user = user;
     g_store = store;
 
-    /* Arm KVM dirty tracking from a clean slate (idempotent within a session). */
-    if (!g_armed) {
-        memory_global_dirty_log_start(GLOBAL_DIRTY_MIGRATION, &error_abort);
-        sf_kvm_dirty_ring_set_owned(true);
+    if (dbit) {
+        /* NPT D-bit mode (plan 2026-07-14-03): no write-protection at all — the
+         * guest keeps pages writable and hardware sets D on write (exit-free);
+         * the boundary drain harvests + clears D via the sf-kvm ioctl. No global
+         * dirty log, no ring. Batch is sized to every guest page (worst-case all
+         * dirty). blocks give the per-RAMBlock page counts. */
+        size_t psize = qemu_real_host_page_size();
+        cap = 0;
+        for (size_t b = 0; b < n_blocks; b++) {
+            cap += DIV_ROUND_UP(blocks[b].len, psize);
+        }
         g_armed = true;
+    } else {
+        (void)blocks;      /* the store holds its own block table (host→idx); the */
+        (void)n_blocks;    /* tracker works in host pointers from the ring drain. */
+        cap = sf_kvm_ring_capacity();
+        /* Arm KVM dirty tracking from a clean slate (idempotent within a session). */
+        if (!g_armed) {
+            memory_global_dirty_log_start(GLOBAL_DIRTY_MIGRATION, &error_abort);
+            sf_kvm_dirty_ring_set_owned(true);
+            g_armed = true;
+        }
+        sf_kvm_dirty_clean_slate();
     }
-    sf_kvm_dirty_clean_slate();
 
-    if (g_hostbuf_cap < ring) {
-        g_hostbuf_cap = ring;
+    if (g_hostbuf_cap < cap) {
+        g_hostbuf_cap = cap;
         g_hostbuf = g_renew(void *, g_hostbuf, g_hostbuf_cap);
+    }
+
+    /* dbit: discard one harvest to zero every D-bit set during boot/cold-start,
+     * so the first tracked round reflects only post-arm guest writes. */
+    if (dbit) {
+        (void)sf_kvm_harvest_dbit(g_hostbuf, g_hostbuf_cap);
     }
 }
 
@@ -71,7 +93,9 @@ void sf_track_end(void)
     g_store = NULL;
     g_resolve = NULL;
     if (g_armed) {
-        sf_kvm_dirty_ring_set_owned(false);
+        if (!sf_kvm_dbit_mode()) {
+            sf_kvm_dirty_ring_set_owned(false);
+        }
         g_armed = false;
     }
 }
@@ -83,7 +107,8 @@ void sf_track_drain(void)
     if (!g_store) {
         return;
     }
-    n = sf_kvm_drain_ring(g_hostbuf, g_hostbuf_cap);
+    n = sf_kvm_dbit_mode() ? sf_kvm_harvest_dbit(g_hostbuf, g_hostbuf_cap)
+                           : sf_kvm_drain_ring(g_hostbuf, g_hostbuf_cap);
     if (g_inject_drop) {   /* selftest: elide the injected page from the batch */
         size_t w = 0;
         for (size_t i = 0; i < n; i++) {

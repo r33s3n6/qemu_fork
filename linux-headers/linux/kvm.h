@@ -567,6 +567,15 @@ struct kvm_clear_dirty_log {
 	};
 };
 
+/* for KVM_SF_HARVEST_DIRTY (sf NPT D-bit dirty tracking, plan 2026-07-14-03) */
+struct kvm_sf_harvest {
+	__u64 buf;	/* in: user __u64[cap] receiving dirty-page host addrs */
+	__u32 cap;	/* in: capacity in entries */
+	__u32 count;	/* out: entries written */
+	__u32 flags;	/* out: bit0 = overflow (cap hit; call again) */
+	__u32 pad;
+};
+
 /* for KVM_SET_SIGNAL_MASK */
 struct kvm_signal_mask {
 	__u32 len;
@@ -1410,6 +1419,9 @@ struct kvm_enc_region {
 
 /* Available with KVM_CAP_MANUAL_DIRTY_LOG_PROTECT_2 */
 #define KVM_CLEAR_DIRTY_LOG          _IOWR(KVMIO, 0xc0, struct kvm_clear_dirty_log)
+
+/* sf NPT D-bit dirty harvest (plan 2026-07-14-03); vendor ioctl, 0xe8 free on x86 */
+#define KVM_SF_HARVEST_DIRTY         _IOWR(KVMIO, 0xe8, struct kvm_sf_harvest)
 
 /* Available with KVM_CAP_HYPERV_CPUID (vcpu) / KVM_CAP_SYS_HYPERV_CPUID (system) */
 #define KVM_GET_SUPPORTED_HV_CPUID _IOWR(KVMIO, 0xc1, struct kvm_cpuid2)

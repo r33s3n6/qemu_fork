@@ -187,6 +187,14 @@ static size_t flat_after_restore(SfRestoreStore *s, void *target)
     if (f->dbg_on) {
         flat_dbg_note(f);      /* A3: fold this round's member before FULL/periodic clear */
     }
+    /* NPT D-bit mode (plan 2026-07-14-03): the drain-time harvest already cleared
+     * every D-bit, and pages stay writable — no reprotect. Just drop this round's
+     * plan so the next generation reflects only post-restore guest writes. Policy
+     * (FULL/BLIND/reset_every_n) is a ring-mode concept and does not apply. */
+    if (sf_kvm_dbit_mode()) {
+        flat_clear_generation(f);
+        return 0;
+    }
     if (f->policy == SF_FLAT_BLIND) {
         f->inplace_since_reset++;
         /* Warmup-reset @K (plan 2026-07-10-02): one-shot full-reset after K
@@ -224,6 +232,9 @@ static size_t flat_after_restore(SfRestoreStore *s, void *target)
 static void flat_after_drain(SfRestoreStore *s)
 {
     (void)s;
+    if (sf_kvm_dbit_mode()) {
+        return;   /* D-bit harvest has no ring-full path */
+    }
     /* Forced (ring-full): reclaim slots; keep membership (pages still in the set,
      * they will re-fault and re-note after reprotect — correctness-safe). */
     (void)sf_kvm_reset_ring();
@@ -242,7 +253,12 @@ static void flat_set_active(SfRestoreStore *s, void *node)
      * reprotects each in-place after_restore, so this matters most for BLIND, whose
      * only re-baseline point is the switch: without it the old baseline's dirt (and
      * one-time setup pages) leak into @node's generation and its saved diff. */
-    (void)sf_kvm_reset_ring();
+    /* D-bit mode keeps pages writable (no ring to reprotect); the next drain's
+     * harvest naturally re-bases (any dirt relative to the old baseline is at
+     * worst over-reported, which the save memcmp / restore rollback absorbs). */
+    if (!sf_kvm_dbit_mode()) {
+        (void)sf_kvm_reset_ring();
+    }
     flat_clear_generation(f);
     f->active = node;
 }

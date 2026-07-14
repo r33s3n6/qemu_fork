@@ -1547,6 +1547,47 @@ size_t sf_kvm_drain_ring(void **host_out, size_t max)
     return n;
 }
 
+/* sf NPT D-bit dirty mode (plan 2026-07-14-03): SF_DIRTY_DBIT=1 flips the tracker
+ * from the write-fault dirty ring to exit-free NPT D-bit harvesting via the
+ * KVM_SF_HARVEST_DIRTY ioctl (needs the sf-kvm patch loaded). Read once. */
+bool sf_kvm_dbit_mode(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("SF_DIRTY_DBIT");
+        cached = (e && *e == '1');
+    }
+    return cached;
+}
+
+/* Harvest the currently-dirty guest pages' host addresses via the sf-kvm D-bit
+ * ioctl, clearing each D-bit (exit-free; the guest kept the pages writable and
+ * hardware set D on write). Mirrors sf_kvm_drain_ring's contract: fills
+ * host_out[] with up to max host pointers, returns the count. */
+size_t sf_kvm_harvest_dbit(void **host_out, size_t max)
+{
+    struct kvm_sf_harvest h = {
+        .buf = (uint64_t)(uintptr_t)host_out,
+        .cap = (uint32_t)max,
+    };
+    int r;
+
+    if (!kvm_state || !host_out || !max) {
+        return 0;
+    }
+    r = kvm_vm_ioctl(kvm_state, KVM_SF_HARVEST_DIRTY, &h);
+    if (r < 0) {
+        error_report("sf: KVM_SF_HARVEST_DIRTY failed: %s (sf-kvm patch loaded?)",
+                     strerror(-r));
+        return 0;
+    }
+    if (h.flags & 1) {
+        warn_report("sf: D-bit harvest hit cap %u (overflow) — sized too small",
+                    h.cap);
+    }
+    return h.count;
+}
+
 /* Total ring capacity across vCPUs — the max pages one drain can yield, so the
  * tracker sizes its host batch to never truncate. */
 size_t sf_kvm_ring_capacity(void)

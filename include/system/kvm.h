@@ -663,6 +663,11 @@ void sf_kvm_set_skip_flush(bool on);
 size_t sf_kvm_drain_ring(void **host_out, size_t max);
 size_t sf_kvm_ring_capacity(void);
 size_t sf_kvm_reset_ring(void);   /* reclaim + reprotect; returns #pages reprotected */
+
+/* NPT D-bit dirty mode (plan 2026-07-14-03, sf-kvm patch): exit-free harvest via
+ * the KVM_SF_HARVEST_DIRTY ioctl instead of the write-fault ring. */
+bool   sf_kvm_dbit_mode(void);                      /* SF_DIRTY_DBIT=1 */
+size_t sf_kvm_harvest_dbit(void **host_out, size_t max);  /* like drain_ring */
 bool sf_kvm_can_protect_set(void);
 void sf_kvm_protect(void *const *host, size_t n);
 /* Dual clocks around KVM_RUN (arch/perf-metrics.md §1): wall = throughput

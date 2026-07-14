@@ -135,10 +135,11 @@ void sf_track_invalidate(void *target)
     }
 }
 
-/* ---- apply memcpy: default 2-thread, SF_APPLY_THREADS=1 forces single-thread *
- * main + one persistent background worker = measured ~×2 sweet spot
- * (archive 2026-06-21-08). SF_APPLY_THREADS=1 = no background thread (all
- * memcpy on the caller). Two-pass (resolve-all in plan, then memcpy-all).
+/* ---- apply memcpy: threads auto by CPU affinity (≥2 CPUs → caller + one
+ * persistent bg worker = measured ~×2 at wide affinity, archive 2026-06-21-08;
+ * pinned to 1 CPU → single-thread, bg would only time-share the core — tag
+ * sf-restore-perf). SF_APPLY_THREADS=1|2 overrides. Two-pass (resolve-all in
+ * plan, then memcpy-all).
  */
 #ifdef __x86_64__
 /* SF_APPLY_NT=1: write the destination pages with non-temporal (streaming)
@@ -242,19 +243,27 @@ static void sf_copy_slice(const SfPlanPage *pages, size_t start, size_t end)
 #endif
 }
 
-/* 1 = single-thread (no bg worker); 2 = default dual-thread. Read once. */
+/* 1 = single-thread (no bg worker); 2 = dual-thread. Default auto by CPU
+ * affinity: the bg half only helps if this process may run on ≥2 CPUs —
+ * production workers are taskset-pinned to one logical CPU, where a second
+ * apply thread just time-shares the core (measured zero wall gain, doubled
+ * apply cpu; tag sf-restore-perf). SF_APPLY_THREADS=1|2 overrides. Read once. */
 static int sf_apply_nthreads(void)
 {
     static int cached = -1;
     if (cached < 0) {
         const char *e = getenv("SF_APPLY_THREADS");
-        cached = 2;
         if (e && *e) {
             char *end = NULL;
             long v = strtol(e, &end, 10);
             if (end != e && *end == '\0' && (v == 1 || v == 2)) {
                 cached = (int)v;
             }
+        }
+        if (cached < 0) {
+            cpu_set_t set;
+            cached = (sched_getaffinity(0, sizeof(set), &set) == 0 &&
+                      CPU_COUNT(&set) >= 2) ? 2 : 1;
         }
     }
     return cached;

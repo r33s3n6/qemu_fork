@@ -142,15 +142,17 @@ void sf_track_invalidate(void *target)
  * plan, then memcpy-all).
  */
 #ifdef __x86_64__
-/* SF_APPLY_NT=1: write the destination pages with non-temporal (streaming)
- * stores instead of a temporal memcpy, skipping the write-allocate RFO read of
- * every destination line (plan 2026-07-14-02 A/B knob; default off). */
+/* Non-temporal (streaming) stores for the destination pages, skipping the
+ * write-allocate RFO read of every destination line. Default ON — production
+ * is high-C where it nets races/s 1.30–1.50× (grid3); SF_APPLY_NT=0 opts out
+ * for low-C diagnostic runs, where the guest-first-read tax makes it a small
+ * net loss (plan 2026-07-14-02 / tag sf-restore-perf). */
 static bool sf_apply_nt(void)
 {
     static int cached = -1;
     if (cached < 0) {
         const char *e = getenv("SF_APPLY_NT");
-        cached = (e && *e == '1');
+        cached = !(e && *e == '0');
     }
     return cached;
 }

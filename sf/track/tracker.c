@@ -154,11 +154,11 @@ static bool sf_apply_nt(void)
     return cached;
 }
 
-static void sf_copy_page_nt(void *dst, const uint8_t *src, size_t psize)
+static void sf_copy_nt(void *dst, const uint8_t *src, size_t bytes)
 {
-    /* psize is a power of two ≥ 64 and dst is page-aligned, so 16B-aligned
-     * movntdq never faults and there is no tail. */
-    for (size_t off = 0; off < psize; off += 64) {
+    /* bytes is a multiple of the (power-of-two ≥ 64) page size and dst is
+     * page-aligned, so 16B-aligned movntdq never faults and there is no tail. */
+    for (size_t off = 0; off < bytes; off += 64) {
         __m128i a = _mm_loadu_si128((const __m128i *)(src + off));
         __m128i b = _mm_loadu_si128((const __m128i *)(src + off + 16));
         __m128i c = _mm_loadu_si128((const __m128i *)(src + off + 32));
@@ -171,16 +171,66 @@ static void sf_copy_page_nt(void *dst, const uint8_t *src, size_t psize)
 }
 #endif
 
+/* SF_APPLY_MERGE=1: sf_track_apply hands this function an address-sorted
+ * scratch copy of the plan; coalesce dst+src-contiguous neighbours into one
+ * larger copy each (experiment knob, plan 07-14-02 follow-up; default off). */
+static bool sf_apply_merge(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("SF_APPLY_MERGE");
+        cached = (e && *e == '1');
+    }
+    return cached;
+}
+
 static void sf_copy_slice(const SfPlanPage *pages, size_t start, size_t end)
 {
     size_t psize = qemu_real_host_page_size();
+    bool nt = false;
 #ifdef __x86_64__
-    if (sf_apply_nt()) {
+    nt = sf_apply_nt();
+#endif
+    if (sf_apply_merge()) {
+        for (size_t i = start; i < end; ) {
+            if (!pages[i].dst || !pages[i].src) {
+                i++;
+                continue;
+            }
+            size_t j = i + 1;
+            while (j < end && pages[j].dst && pages[j].src &&
+                   (uint8_t *)pages[j].dst ==
+                       (uint8_t *)pages[i].dst + (j - i) * psize &&
+                   pages[j].src == pages[i].src + (j - i) * psize) {
+                j++;
+            }
+#ifdef __x86_64__
+            if (nt) {
+                sf_copy_nt(pages[i].dst, pages[i].src, (j - i) * psize);
+            } else
+#endif
+            {
+                memcpy(pages[i].dst, pages[i].src, (j - i) * psize);
+            }
+            i = j;
+        }
+    } else if (nt) {
+#ifdef __x86_64__
         for (size_t i = start; i < end; i++) {
             if (pages[i].dst && pages[i].src) {
-                sf_copy_page_nt(pages[i].dst, pages[i].src, psize);
+                sf_copy_nt(pages[i].dst, pages[i].src, psize);
             }
         }
+#endif
+    } else {
+        for (size_t i = start; i < end; i++) {
+            if (pages[i].dst && pages[i].src) {
+                memcpy(pages[i].dst, pages[i].src, psize);
+            }
+        }
+    }
+#ifdef __x86_64__
+    if (nt) {
         /* NT stores are weakly ordered: fence before anyone (vCPU, or the
          * caller joining the bg worker) may read these pages. Every apply path
          * ends in this function on its own thread, so one sfence per slice
@@ -188,14 +238,8 @@ static void sf_copy_slice(const SfPlanPage *pages, size_t start, size_t end)
          * before its done-signal; the mutex hand-off orders the rest). Missing
          * this = silent stale guest pages, worse than a crash. */
         _mm_sfence();
-        return;
     }
 #endif
-    for (size_t i = start; i < end; i++) {
-        if (pages[i].dst && pages[i].src) {
-            memcpy(pages[i].dst, pages[i].src, psize);
-        }
-    }
 }
 
 /* 1 = single-thread (no bg worker); 2 = default dual-thread. Read once. */
@@ -309,6 +353,12 @@ uint64_t sf_track_last_apply_bg_cpu_ns(void)
     return g_last_bg_cpu_ns;
 }
 
+static int sf_plan_cmp_dst(const void *a, const void *b)
+{
+    const SfPlanPage *pa = a, *pb = b;
+    return pa->dst < pb->dst ? -1 : pa->dst > pb->dst;
+}
+
 void sf_track_apply(const SfPlanPage *pages, size_t n)
 {
     SfApplyWorker *w = &g_worker;
@@ -316,6 +366,36 @@ void sf_track_apply(const SfPlanPage *pages, size_t n)
 
     if (!n) {
         return;
+    }
+    if (sf_apply_merge()) {
+        /* Address-sort a scratch copy (the store's plan order carries the
+         * unsure_n carry semantics — don't touch it). Sort cost lands inside
+         * the caller's ram timing window, so measurements stay honest. */
+        static SfPlanPage *scratch;
+        static size_t scratch_cap;
+        if (n > scratch_cap) {
+            scratch_cap = n * 2;
+            scratch = g_renew(SfPlanPage, scratch, scratch_cap);
+        }
+        memcpy(scratch, pages, n * sizeof(*pages));
+        qsort(scratch, n, sizeof(*scratch), sf_plan_cmp_dst);
+        pages = scratch;
+        if (getenv("SF_DIRTY_TRACE")) {   /* achieved merge rate (diagnostic) */
+            size_t psize = qemu_real_host_page_size(), ext = 0;
+            for (size_t i = 0; i < n; ) {
+                size_t j = i + 1;
+                while (j < n && scratch[j].dst && scratch[j].src &&
+                       scratch[i].dst && scratch[i].src &&
+                       (uint8_t *)scratch[j].dst ==
+                           (uint8_t *)scratch[i].dst + (j - i) * psize &&
+                       scratch[j].src == scratch[i].src + (j - i) * psize) {
+                    j++;
+                }
+                ext++;
+                i = j;
+            }
+            fprintf(stderr, "sf-apply-merge: n=%zu extents=%zu\n", n, ext);
+        }
     }
     /* SF_APPLY_THREADS=1: no background thread; always single-thread memcpy. */
     if (sf_apply_nthreads() == 1 || n < SF_APPLY_PARALLEL_MIN) {

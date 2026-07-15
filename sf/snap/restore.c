@@ -1011,7 +1011,18 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
         sf_restore_last_guest_time_ns = gtime_now;
         sf_restore_exec_base_valid = true;
     }
+    /* Split the plan bucket: drain (harvest ioctl / ring drain + note_batch —
+     * in dbit this is the O(RAM) SPTE scan) vs resolve (sf_track_plan's lazy
+     * src resolve — the re-resolve tax dbit pays every round because
+     * flat_clear_generation nukes the cross-round src cache). */
+    uint64_t t_pre = 0, t_drain = 0;
+    if (timing) {
+        t_pre = sf_now_ns();
+    }
     sf_track_drain();
+    if (timing) {
+        t_drain = sf_now_ns();
+    }
     plan = sf_track_plan(dst);
     if (timing) {
         t1 = sf_now_ns();
@@ -1080,6 +1091,7 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
         c_reprotect = sf_now_thread_ns();
         fprintf(stderr,
                 "sf-time: restore dst=%u kind=%s plan=%.1fus plan_cpu=%.1fus "
+                "drain=%.1fus resolve=%.1fus "
                 "device=%.1fus ram=%.1fus ram_cpu=%.1fus "
                 "cpusync=%.1fus tsc_refreeze=%.1fus "
                 "reprotect=%.1fus reprotect_cpu=%.1fus "
@@ -1094,6 +1106,7 @@ static void sf_snap_restore_core(SfSnapNode *dst, SfReplayDebug *debug)
                 "r_dram=%" PRIu64 " r_l3=%" PRIu64 " r_ccx=%" PRIu64 "\n",
                 dst->id, src == dst ? "inplace" : "cross",
                 (t1 - t0) / 1000.0, (c1 - c0) / 1000.0,
+                (t_drain - t_pre) / 1000.0, (t1 - t_drain) / 1000.0,
                 (t2 - t1) / 1000.0,
                 (t3 - t2) / 1000.0, (c3 - c2 + ram_bg_cpu) / 1000.0,
                 t_cpusync / 1000.0, t_tsc / 1000.0,
